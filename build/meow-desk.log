@@ -1,9 +1,0 @@
---- start ---
-enum icons: 206 diag: ok count=206 spacing=75x98 iconSize=48
-icons ready: 206
-icon mem: 1854 KB, max=48x48, nonStd=0
-system icons hidden
-surface mode=layered 2560x1440
-surface created
-fences created: 2
-ready

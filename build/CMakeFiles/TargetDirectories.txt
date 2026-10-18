@@ -1,3 +1,0 @@
-C:/Users/22357/Desktop/meow-desk/meow-desk-core/build/CMakeFiles/meow-desk.dir
-C:/Users/22357/Desktop/meow-desk/meow-desk-core/build/CMakeFiles/edit_cache.dir
-C:/Users/22357/Desktop/meow-desk/meow-desk-core/build/CMakeFiles/rebuild_cache.dir
