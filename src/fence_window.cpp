@@ -27,6 +27,9 @@ const wchar_t* kClass = L"MeowDeskFence";
 
 const int kPad = 14;
 const int kCellWDefault = 74;
+// 图标列的额外内缩：两端对齐时首列不能真顶到 kPad 上，否则看起来「首列偏左、
+// 末列偏右」。只在「图标 / 列 / 文字盒」定位上用，卡片内边距（kPad）不受影响。
+const int kColInset = 10;
 
 // 四条边/四角可以拖拽改大小的判定宽度
 const int kEdgeMargin = 6;
@@ -228,17 +231,21 @@ int FenceWindow::CellCols() const {
 }
 
 // 两端对齐：以「图标宽度」为内容宽度做 space-between。
-// 第 0 列图标左边缘贴 kPad，最后一列右边缘贴 width_-kPad，中间等步长；
-// 所以每一排满的时候两端都顶到内边距，不满的最后一排从 kPad 起左对齐，
+// 第 0 列图标左边缘 = kPad + kColInset，最后一列右边缘 = width_ - kPad - kColInset，
+// 中间等步长；所以每一排满的时候两端都留出 kPad + kColInset 的空白，
+// 不满的最后一排从左边起（比首列再向左一点点，但仍在卡片内），
 // 而且列位置和上一排严丝合缝地对齐（步长相同）。
+int FenceWindow::ColLeft() const { return kPad + kColInset; }
+int FenceWindow::ColRight() const { return width_ - kPad - kColInset; }
+
 int FenceWindow::ColCenterX(int c, int cols) const {
     const int iw = iconPx();
-    if (cols <= 1) return kPad + iw / 2;
-    if (c <= 0) return kPad + iw / 2;
-    if (c >= cols) return width_ - kPad - iw / 2;
-    const int usable = width_ - kPad * 2;
-    const int span = usable - iw;   // 首列中心 → 末列中心
-    return kPad + iw / 2 + (int)std::lround((double)span * c / (cols - 1));
+    const int lo = ColLeft() + iw / 2;
+    const int hi = ColRight() - iw / 2;
+    if (cols <= 1) return lo;
+    if (c <= 0) return lo;
+    if (c >= cols) return hi;
+    return lo + (int)std::lround((double)(hi - lo) * c / (cols - 1));
 }
 
 void FenceWindow::ItemRect(int index, RECT& r) const {
@@ -250,16 +257,42 @@ void FenceWindow::ItemRect(int index, RECT& r) const {
     const int c = index % cols;
     const int row = index / cols;
     const int ch = cellH();
-    const int top = headerH_ + kPad + row * ch;
+    const int top = HeadH() + kPad + row * ch;
 
     if (IsListView()) {
         r = RECT{kPad, top, width_ - kPad, top + ch};
         return;
     }
+    // 命中区域：格子之间必须无缝铺满（否则图标之间那几像素的缝隙拖不进去），
+    // 所以边界取相邻两列中心的中点。左右两端夹到卡片内边距。
     const int cx = ColCenterX(c, cols);
     const int left = (c == 0) ? kPad : (ColCenterX(c - 1, cols) + cx) / 2;
     const int right = (c == cols - 1) ? (width_ - kPad) : (cx + ColCenterX(c + 1, cols)) / 2;
     r = RECT{left, top, right, top + ch};
+}
+
+// 悬停 / 选中 / 落点高亮用的矩形：以图标中心为准、固定格子宽度，左右对称。
+// 不能用 ItemRect —— 首列的左边界是 kPad，比「中心 ± 半格」更靠左，
+// 直接拿去画高亮会偏到图标右边去（图标看着就不在高亮框中间）。
+RECT FenceWindow::ItemHighlightRect(int index) const {
+    const int ch = cellH();
+    if (index < 0) return RECT{0, 0, 0, 0};
+    const int cols = CellCols();
+    if (IsListView()) {
+        RECT r{};
+        ItemRect(index, r);
+        return r;
+    }
+    const int row = index / cols;
+    const int c = index % cols;
+    const int top = HeadH() + kPad + row * ch;
+    const int cx = ColCenterX(c, cols);
+    const int half = cellW_ / 2;
+    int l = cx - half;
+    int rr = cx + half;
+    if (l < 2) l = 2;
+    if (rr > width_ - 2) rr = width_ - 2;
+    return RECT{l, top, rr, top + ch};
 }
 
 void FenceWindow::ItemLabelBox(int index, int& left, int& w) const {
@@ -270,11 +303,12 @@ void FenceWindow::ItemLabelBox(int index, int& left, int& w) const {
         w = std::min(cellW_ - 8, usable);
     } else {
         // 步长要扣掉 6px，相邻两列的文字盒才不会贴到一起
-        const double step = (double)(usable - iconPx()) / (cols - 1);
+        const double step = cols > 1 ? (double)(ColCenterX(1, cols) - ColCenterX(0, cols)) : 0.0;
         w = std::min(cellW_ - 8, std::max(24, (int)step - 6));
     }
     const int cx = ColCenterX(c, cols);
     left = cx - w / 2;
+    // 文字盒可以比图标列宽一点（夹到卡片内边距即可），但首末列不能把图标顶偏
     if (left < kPad) left = kPad;
     if (left + w > width_ - kPad) left = width_ - kPad - w;
 }
@@ -287,7 +321,7 @@ int FenceWindow::minW() const {
 }
 
 int FenceWindow::minH() const {
-    return headerH_ + 64;       // 头部 + 一行图标的空间
+    return HeadH() + 64;        // 头部 + 一行图标的空间
 }
 
 // 命中四条边/四个角（客户区坐标）。收起状态下不参与，避免和「拖头部移动」打架。
@@ -339,9 +373,9 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
         return;
     }
 
-    if (pt.y < headerH_ && pt.x > width_ - 40) {
+    if (pt.y < HeadH() && showTitle_ && pt.x > width_ - 40) {
         pressArrow_ = true;
-    } else if (pt.y < headerH_) {
+    } else if (pt.y < HeadH()) {
         pressHeader_ = true;
     } else if (!collapsed_) {
         pressBody_ = true;
@@ -733,7 +767,7 @@ bool FenceWindow::ItemOrigin(int index, int& x, int& y) const {
     } else {
         x = ColCenterX(c, cols) - iconPx() / 2;   // 图标以列中心居中对齐
     }
-    y = headerH_ + kPad + r * ch;
+    y = HeadH() + kPad + r * ch;
     return y + ch <= curH_ - kPad;
 }
 
@@ -745,7 +779,7 @@ RECT FenceWindow::rect() const {
 
 RECT FenceWindow::bodyRect() const {
     RECT r = rect();
-    r.top += headerH_;
+    r.top += HeadH();
     return r;
 }
 
@@ -870,7 +904,7 @@ void FenceWindow::UpdateDropHint(POINT screenPt) {
     POINT pt{screenPt.x - wr.left, screenPt.y - wr.top};
 
     // 拖到收起盒子的头部 → 自动展开，才能看清要插到哪
-    if (collapsed_ && pt.y < headerH_) {
+    if (collapsed_ && pt.y < HeadH()) {
         autoExpanded_ = true;
         SetCollapsed(false);
         return;
@@ -881,10 +915,11 @@ void FenceWindow::UpdateDropHint(POINT screenPt) {
     }
 
     DropHint d;
-    const int it = (pt.y >= headerH_) ? HitItem(pt) : -1;
+    const int it = (pt.y >= HeadH()) ? HitItem(pt) : -1;
     if (it >= 0) {
-        RECT ir{};
-        ItemRect(it, ir);
+        // 分区按「图标中心」算（ItemHighlightRect），不用命中用的无缝格子 ——
+        // 首列的命中格子被夹到 kPad，拿它切三段会让「左/右」偏掉
+        RECT ir = ItemHighlightRect(it);
         const int cw = ir.right - ir.left;
         const int third = cw / 3;
         const int rx = pt.x - ir.left;
@@ -1010,14 +1045,15 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         // 悬停自动展开：收起状态下鼠标移到头部就展开（移开整个盒子在 MOUSELEAVE 里收起）
-        if (g_config.autoExpandOnHover && collapsed_ && !suppressAutoExpand_ &&
-            pt.y < headerH_) {
+        // 关掉标题时头部只有 2px，没有别的展开入口，所以这时强制启用自动展开。
+        if ((g_config.autoExpandOnHover || !showTitle_) && collapsed_ && !suppressAutoExpand_ &&
+            pt.y < HeadH()) {
             autoExpanded_ = true;
             SetCollapsed(false);
         }
 
         int hot = -1;
-        if (!collapsed_ && pt.y >= headerH_) hot = HitItem(pt);
+        if (!collapsed_ && pt.y >= HeadH()) hot = HitItem(pt);
         if (hot != hot_) {
             hot_ = hot;
             Redraw();
@@ -1048,7 +1084,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         POINT sp = pt;
         ClientToScreen(h, &sp);
-        const int it = (pt.y >= headerH_ && !collapsed_) ? HitItem(pt) : -1;
+        const int it = (pt.y >= HeadH() && !collapsed_) ? HitItem(pt) : -1;
         if (onContextMenu) onContextMenu(it, sp);
         return 0;
     }
@@ -1105,7 +1141,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             // 单击只选中，双击（WM_LBUTTONDBLCLK）才打开
             sel_ = item;
             Redraw();
-        } else if (pt.y >= headerH_ && sel_ != -1) {
+        } else if (pt.y >= HeadH() && sel_ != -1) {
             sel_ = -1;   // 点空白处取消选中
             Redraw();
         }
@@ -1209,6 +1245,16 @@ void FenceWindow::Paint() {
     if (!bits_ || !memDC_ || !cfg_) return;
     std::memset(bits_, 0, (size_t)bufW_ * (size_t)bufH_ * 4);
 
+    // 关掉「显示盒子标题」并且已经收起：整个盒子就是一条 2px 的感应条。
+    // 填 alpha=1 —— 肉眼看不见，但 per-pixel alpha 分层窗口里 alpha>0 的像素
+    // 才能收到鼠标消息，悬停自动展开靠的就是它。
+    if (!showTitle_ && curH_ <= kHeadStripH + 1) {
+        auto* p = reinterpret_cast<uint32_t*>(bits_);
+        const size_t n = (size_t)bufW_ * (size_t)std::max(1, bufH_);
+        for (size_t i = 0; i < n; ++i) p[i] = 0x01000000u;
+        return;
+    }
+
     const COLORREF base = (COLORREF)cfg_->color;
     const int alpha = std::clamp(cfg_->alpha, 0, 255);
     const double rad = (double)std::max(0, cfg_->radius);
@@ -1246,35 +1292,41 @@ void FenceWindow::Paint() {
         }
 
         // ---- 头部：略亮、略实，做出层叠感 ----
-        const float headH = (float)headerH_;
-        GraphicsPath head;
-        {
-            const float d = (float)rad * 2.0f;
-            if (rad <= 0.5) {
-                head.AddRectangle(RectF(0.0f, 0.0f, (float)bufW_, headH));
-            } else {
-                head.AddArc(0.0f, 0.0f, d, d, 180.0f, 90.0f);
-                head.AddArc((float)bufW_ - d, 0.0f, d, d, 270.0f, 90.0f);
-                head.AddLine((float)bufW_, headH, 0.0f, headH);
+        // 关掉「显示盒子标题」时整个头部都不画（标题、箭头、分隔线一起消失），
+        // 卡片就是一整块圆角面板，顶部只保留 HeadH()=2px 的悬停感应区。
+        const float headH = (float)HeadH();
+        if (showTitle_) {
+            GraphicsPath head;
+            {
+                const float d = (float)rad * 2.0f;
+                if (rad <= 0.5) {
+                    head.AddRectangle(RectF(0.0f, 0.0f, (float)bufW_, headH));
+                } else {
+                    head.AddArc(0.0f, 0.0f, d, d, 180.0f, 90.0f);
+                    head.AddArc((float)bufW_ - d, 0.0f, d, d, 270.0f, 90.0f);
+                    head.AddLine((float)bufW_, headH, 0.0f, headH);
+                }
+                head.CloseFigure();
             }
-            head.CloseFigure();
+            const BYTE hA = hasBackdrop ? (BYTE)std::min(255, (int)(alpha * 0.72))
+                                        : (BYTE)std::min(255, alpha + 42);
+            SolidBrush headBrush{Color(hA, (BYTE)Lighten(r, 0.45), (BYTE)Lighten(g, 0.45),
+                                        (BYTE)Lighten(b, 0.45))};
+            gfx.FillPath(&headBrush, &head);
         }
-        const BYTE hA = hasBackdrop ? (BYTE)std::min(255, (int)(alpha * 0.72))
-                                    : (BYTE)std::min(255, alpha + 42);
-        SolidBrush headBrush{Color(hA, (BYTE)Lighten(r, 0.45), (BYTE)Lighten(g, 0.45),
-                                    (BYTE)Lighten(b, 0.45))};
-        gfx.FillPath(&headBrush, &head);
 
         // ---- 描边 / 分隔线 ----
         Pen border{Color(46, 0, 0, 0), 1.0f};
         gfx.DrawPath(&border, &shape);
-        Pen sep{Color(30, 0, 0, 0), 1.0f};
-        gfx.DrawLine(&sep, 0.0f, headH, (float)bufW_, headH);
+        if (showTitle_) {
+            Pen sep{Color(30, 0, 0, 0), 1.0f};
+            gfx.DrawLine(&sep, 0.0f, headH, (float)bufW_, headH);
+        }
 
         const ARGB fg = light ? 0xFF1B1B1F : 0xFFF2F2F5;
 
-        // ---- 标题（受「显示标题」开关控制）----
-        if (g_config.showLabels) {
+        // ---- 标题（受「显示图标标题」开关控制）----
+        if (showTitle_ && g_config.showLabels) {
             FontFamily family(L"Microsoft YaHei UI");
             const float fs = headerH_ >= 40 ? 14.0f : 12.5f;
             Font titleFont(&family, fs, FontStyleRegular, UnitPixel);
@@ -1289,25 +1341,35 @@ void FenceWindow::Paint() {
         }
 
         // ---- 收起 / 展开箭头 ----
-        {
+        // 收起/展开是有高度补间的，箭头按「展开程度」绕 90° 转过去，跟高度一起动。
+        // 展开程度直接由当前高度推出来，不用再单独维护一套动画状态。
+        if (showTitle_) {
+            float t = 1.0f;
+            if (height_ > headerH_)
+                t = (float)(curH_ - headerH_) / (float)(height_ - headerH_);
+            t = std::clamp(t, 0.0f, 1.0f);
+            const float ang = -(float)(3.14159265358979 / 2.0) * (1.0f - t);
+
             Pen pen{Color(fg), 1.8f};
             pen.SetStartCap(LineCapRound);
             pen.SetEndCap(LineCapRound);
             const float cx = (float)bufW_ - 21.0f;
             const float cy = headH * 0.5f;
-            if (collapsed_) {
-                gfx.DrawLine(&pen, cx - 2.5f, cy - 5.0f, cx + 2.5f, cy);
-                gfx.DrawLine(&pen, cx + 2.5f, cy, cx - 2.5f, cy + 5.0f);
-            } else {
-                gfx.DrawLine(&pen, cx - 5.0f, cy - 2.5f, cx, cy + 2.5f);
-                gfx.DrawLine(&pen, cx, cy + 2.5f, cx + 5.0f, cy - 2.5f);
-            }
+            const float ca = std::cos(ang), sa = std::sin(ang);
+            auto rot = [&](float x, float y) {
+                return PointF(cx + x * ca - y * sa, cy + x * sa + y * ca);
+            };
+            // 未旋转时是「朝下的 V」（展开态）；转 -90° 变成「朝右的 >」（收起态）
+            const PointF a = rot(-5.0f, -2.5f);
+            const PointF b = rot(0.0f, 2.5f);
+            const PointF c = rot(5.0f, -2.5f);
+            gfx.DrawLine(&pen, a, b);
+            gfx.DrawLine(&pen, b, c);
         }
 
         // ---- 悬停高亮（拖动中不画：被拖的那个已变成"空位"，再套一层高亮很乱）----
         if (!collapsed_ && hot_ >= 0 && !itemDragging_) {
-            RECT ir{};
-            ItemRect(hot_, ir);
+            RECT ir = ItemHighlightRect(hot_);
             if (ir.right > ir.left) {
                 GraphicsPath cell;
                 AddRoundRect(cell, RectF((float)ir.left + 2, (float)ir.top + 2,
@@ -1321,8 +1383,7 @@ void FenceWindow::Paint() {
 
         // ---- 单击选中高亮（双击才打开，所以要有可见的选中态）----
         if (!collapsed_ && sel_ >= 0 && !itemDragging_) {
-            RECT sr{};
-            ItemRect(sel_, sr);
+            RECT sr = ItemHighlightRect(sel_);
             if (sr.right > sr.left) {
                 GraphicsPath cell;
                 AddRoundRect(cell,
@@ -1338,36 +1399,20 @@ void FenceWindow::Paint() {
             }
         }
 
-        // ---- 拖拽落点提示 ----
-        if (!collapsed_ && drop_.item >= 0) {
-            RECT ir{};
-            ItemRect(drop_.item, ir);
+        // ---- 拖拽落点：中间区域的高亮（底色，画在图标下面才有"整格选中"的感觉）----
+        if (!collapsed_ && drop_.item >= 0 && drop_.zone == 0) {
+            RECT ir = ItemHighlightRect(drop_.item);
             if (ir.right > ir.left) {
-                const Color accentC(255, 0, 120, 215);
-                if (drop_.zone == 0) {
-                    // 中间：高亮整个格子 → 松手 = 用该图标对应的程序打开拖拽文件
-                    GraphicsPath cell;
-                    AddRoundRect(cell,
-                                 RectF((float)ir.left + 3.0f, (float)ir.top + 3.0f,
-                                       (float)(ir.right - ir.left) - 6.0f,
-                                       (float)cellH() - 6.0f),
-                                 8.0f);
-                    SolidBrush fill{Color(58, 0, 120, 215)};
-                    gfx.FillPath(&fill, &cell);
-                    Pen pen{accentC, 1.6f};
-                    gfx.DrawPath(&pen, &cell);
-                } else {
-                    // 左/右：画一条竖缝隙线，告诉用户松手会插在哪
-                    const float lx = (drop_.zone < 0) ? (float)ir.left + 0.5f
-                                                      : (float)ir.right - 3.5f;
-                    GraphicsPath bar;
-                    AddRoundRect(bar,
-                                 RectF(lx, (float)ir.top + 6.0f, 3.0f,
-                                       (float)cellH() - 12.0f),
-                                 1.5f);
-                    SolidBrush ab{accentC};
-                    gfx.FillPath(&ab, &bar);
-                }
+                GraphicsPath cell;
+                AddRoundRect(cell,
+                             RectF((float)ir.left + 3.0f, (float)ir.top + 3.0f,
+                                   (float)(ir.right - ir.left) - 6.0f,
+                                   (float)cellH() - 6.0f),
+                             8.0f);
+                SolidBrush fill{Color(58, 0, 120, 215)};
+                gfx.FillPath(&fill, &cell);
+                Pen pen{Color(255, 0, 120, 215), 1.6f};
+                gfx.DrawPath(&pen, &cell);
             }
         }
 
@@ -1390,26 +1435,31 @@ void FenceWindow::Paint() {
         gfx.Flush(FlushIntentionSync);
     }
 
-    // 本帧每个图标落在哪个槽位 / 横向缩放到多少（排序 flip 动画；平时 slot==i、scale==1）
+    // 本帧每个图标画在哪（客户区像素，可插值）。
+    // 改排序时从「旧槽位」平滑滑到「新槽位」——用户要的是位移过渡，不是原地翻转。
     std::vector<DesktopIconView*> mine;
     CollectVisible(mine);
-    std::vector<int> slotOf(mine.size());
-    std::vector<float> scaleOf(mine.size(), 1.0f);
+    std::vector<POINT> posOf(mine.size(), POINT{0, 0});
+    std::vector<bool> posOk(mine.size(), false);
+    std::vector<int> dxOf(mine.size(), 0);   // 相对目标槽位的横向偏移（标签跟着走）
     {
-        const float fp = FlipProgress();
+        const float raw = FlipProgress();
+        // easeInOutCubic：起步和收尾都柔，中间快，位移感最像「被推过去」
+        const float t = (raw < 0.5f) ? 4.0f * raw * raw * raw
+                                     : 1.0f - std::pow(-2.0f * raw + 2.0f, 3.0f) / 2.0f;
         for (size_t i = 0; i < mine.size(); ++i) {
-            slotOf[i] = (int)i;
+            int tx = 0, ty = 0;
+            if (!ItemOrigin((int)i, tx, ty)) continue;
+            posOk[i] = true;
+            posOf[i] = POINT{tx, ty};
             if (!flipActive_) continue;
             auto f = flipNodes_.find(mine[i]);
             if (f == flipNodes_.end()) continue;
-            const FlipNode& n = f->second;
-            if (fp < 0.5f) {
-                slotOf[i] = n.from;
-                scaleOf[i] = std::cos(fp / 0.5f * 1.5707963f);          // 1 → 0
-            } else {
-                slotOf[i] = n.to;
-                scaleOf[i] = std::sin((fp - 0.5f) / 0.5f * 1.5707963f);  // 0 → 1
-            }
+            int fx = 0, fy = 0;
+            if (!ItemOrigin(f->second.from, fx, fy)) continue;
+            posOf[i].x = (int)std::lround(fx + (tx - fx) * t);
+            posOf[i].y = (int)std::lround(fy + (ty - fy) * t);
+            dxOf[i] = posOf[i].x - tx;
         }
     }
 
@@ -1424,19 +1474,15 @@ void FenceWindow::Paint() {
 
         for (size_t i = 0; i < mine.size(); ++i) {
             DesktopIconView* e = mine[i];
-            int ix = 0, iy = 0;
-            if (!ItemOrigin(slotOf[i], ix, iy)) continue;
-            const float scaleX = scaleOf[i];
+            if (!posOk[i]) continue;
+            const int ix = posOf[i].x;
+            const int iy = posOf[i].y;
 
             // 正在被拖的那个留在原位当「空位」：变淡 + 变暗，松手后才重新排位
             const bool ghost = itemDragging_ && e == dragged_;
             const int ga = ghost ? 110 : 255;   // 图标不透明度
             const int gd = ghost ? 120 : 255;   // 额外压暗
-            // flip 时只有文字按翻转程度淡出/淡入；图标本身保持不透明，
-            // 靠横向压扁到 1px 来表现「翻过去」——两者一起淡会变成交叉淡化，不像翻转。
-            int gaLabel = ga;
-            if (!ghost && scaleX < 0.999f)
-                gaLabel = (int)std::lround(255.0f * scaleX);
+            const int gaLabel = ga;
 
             const IconBitmap& bm = e->bmp;
             const int iconW = bm.valid() ? bm.width : 32;
@@ -1459,22 +1505,9 @@ void FenceWindow::Paint() {
                 iconY = iy + (showLabels_ ? 4 : (ch - iconH) / 2);
             }
 
-            // flip 时绕图标中线横向压扁/张开
-            const bool squashed = scaleX < 0.999f;
-            int outW = iconW;
-            int drawX = iconX;
-            if (squashed) {
-                outW = std::max(1, (int)std::lround(iconW * scaleX));
-                drawX = iconX + (iconW - outW) / 2;
-            }
             if (bm.valid()) {
-                if (squashed) {
-                    BlendIntoDimScaledX(dst, bufW_, bufH_, bm.pixels.data(), bm.width,
-                                        bm.height, drawX, iconY, outW, ga, gd);
-                } else {
-                    BlendIntoDim(dst, bufW_, bufH_, bm.pixels.data(), bm.width, bm.height,
-                                 drawX, iconY, ga, gd);
-                }
+                BlendIntoDim(dst, bufW_, bufH_, bm.pixels.data(), bm.width, bm.height,
+                             iconX, iconY, ga, gd);
             }
 
             if (e->name.empty()) continue;
@@ -1507,7 +1540,8 @@ void FenceWindow::Paint() {
                     int th = ch - (textTop - iy);
                     if (th < 14) th = 14;
                     int labLeft = 0, labW = 0;
-                    ItemLabelBox(slotOf[i], labLeft, labW);
+                    ItemLabelBox((int)i, labLeft, labW);
+                    labLeft += dxOf[i];   // 排序过渡中文字跟着图标一起滑
                     LabelDib* lab = LabelOf(e, labW, th, glow);
                     if (lab && lab->valid()) {
                         int contentW = lab->w - lab->pad * 2;
@@ -1532,20 +1566,14 @@ void FenceWindow::Paint() {
             const int textH = LabelTextHeight();
 
             for (size_t i = 0; i < mine.size(); ++i) {
-                int ix = 0, iy = 0;
-                if (!ItemOrigin(slotOf[i], ix, iy)) continue;
+                if (!posOk[i]) continue;
+                const int iy = posOf[i].y;
                 auto d = detailInfo_.find(mine[i]);
                 if (d == detailInfo_.end()) continue;
 
                 const DetailCols dl = DetailLayoutFor(kPad, width_ - kPad * 2);
-                int ga = 255;
                 const bool ghost = itemDragging_ && mine[i] == dragged_;
-                if (ghost) ga = 110;
-                if (!ghost && scaleOf[i] < 0.999f) {
-                    const int fa = (int)std::lround(255.0f * scaleOf[i]);
-                    if (fa < ga) ga = fa;
-                }
-                if (ga <= 0) continue;
+                const int ga = ghost ? 110 : 255;
 
                 const int top = iy + (ch - textH) / 2;
                 auto drawCol = [&](const std::wstring& text, int cx, int cw) {
@@ -1564,6 +1592,39 @@ void FenceWindow::Paint() {
                 if (dl.showSize) drawCol(d->second.size, dl.sizeX, dl.sizeW);
             }
         }
+    }
+
+    // ---- 拖拽插入缝隙线：必须画在图标「上面」----
+    // 以前它跟其它高亮一起画在图标之前，落点位置恰好是图标的边缘，结果整条线被
+    // 图标盖住 —— 表现就是「拖到盒子里左右不再出现缝隙线」。
+    if (!collapsed_ && drop_.item >= 0 && drop_.zone != 0) {
+        const int cols = CellCols();
+        const int c = drop_.item % cols;
+        const int row = drop_.item / cols;
+        const int ch = cellH();
+        const int top = HeadH() + kPad + row * ch;
+        const int iw = iconPx();
+        const int cxi = ColCenterX(c, cols);
+        // 线落在两个图标之间的空隙中线：图标边缘往外半个空隙
+        int gap = cellW_;
+        if (cols > 1) gap = ColCenterX(1, cols) - ColCenterX(0, cols);
+        gap = std::max(6, (gap - iw) / 2);
+        float lx = (drop_.zone < 0) ? (float)(cxi - iw / 2 - gap)
+                                    : (float)(cxi + iw / 2 + gap);
+        lx -= 1.5f;   // 线宽 3px，往左挪半条让它落在中线上
+        if (lx < 2.0f) lx = 2.0f;
+        if (lx > (float)width_ - 5.0f) lx = (float)width_ - 5.0f;
+
+        Bitmap bmpLine(bufW_, bufH_, bufW_ * 4, PixelFormat32bppPARGB,
+                       reinterpret_cast<BYTE*>(bits_));
+        Graphics g2(&bmpLine);
+        g2.SetSmoothingMode(SmoothingModeAntiAlias);
+        g2.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        GraphicsPath bar;
+        AddRoundRect(bar, RectF(lx, (float)top + 6.0f, 3.0f, (float)ch - 12.0f), 1.5f);
+        SolidBrush ab{Color(255, 0, 120, 215)};
+        g2.FillPath(&ab, &bar);
+        g2.Flush(FlushIntentionSync);
     }
 }
 
@@ -1616,15 +1677,17 @@ void FenceWindow::ApplyConfig(bool recapture) {
 
     const int newHeader = std::clamp(g_config.headerHeight, 26, 80);
     const bool newLabels = g_config.showLabels != 0;
-    if (newHeader != headerH_ || newLabels != showLabels_) {
+    const bool newTitle = g_config.showFenceTitle != 0;
+    if (newHeader != headerH_ || newLabels != showLabels_ || newTitle != showTitle_) {
         headerH_ = newHeader;
         showLabels_ = newLabels;
+        showTitle_ = newTitle;
         labels_.clear();
         labelKeys_.clear();
-        // 收起高度跟着头部走
+        // 收起高度跟着头部走（关掉标题时头部只有 2px）
         if (collapsed_) {
-            targetH_ = headerH_;
-            curH_ = headerH_;
+            targetH_ = HeadH();
+            curH_ = HeadH();
             RECT r = rect();
             SetWindowPos(hwnd_, nullptr, r.left, r.top, width_, curH_,
                          SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1664,6 +1727,7 @@ bool FenceWindow::Create(int index, int x, int y, int w, int h) {
     width_ = w;
     height_ = h;
     headerH_ = std::clamp(g_config.headerHeight, 26, 80);
+    showTitle_ = g_config.showFenceTitle != 0;
     showLabels_ = g_config.showLabels != 0;
     cellW_ = CellWForMode(cfg_->viewMode);
     curH_ = h;
@@ -1698,7 +1762,7 @@ void FenceWindow::SetCollapsed(bool collapsed) {
     collapsed_ = collapsed;
     hot_ = -1;
     StopFlip();
-    targetH_ = collapsed ? headerH_ : height_;
+    targetH_ = collapsed ? HeadH() : height_;
     if (hwnd_) SetTimer(hwnd_, kAnimTimer, 16, nullptr);
     Redraw();
 }

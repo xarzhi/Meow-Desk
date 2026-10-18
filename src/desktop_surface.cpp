@@ -960,7 +960,9 @@ void DesktopSurface::PaintLayered() {
 }
 
 // 落点预览框：拖动时告诉用户「松手就放这里」。
-// 画两层圆角矩形 —— 外圈是描边色（盖满），内缩 2px 再填半透明底色，就是一个空心框。
+// 直角空心框（外圈 2px 描边 + 内缩 2px 的淡底）。
+// 以前用圆角，但这里是逐像素手写 alpha 填充、没有抗锯齿，圆角边缘一眼就是锯齿，
+// 直角反而干净利落，也和资源管理器的选中框一致。
 void DesktopSurface::DrawPreviewLayered() {
     if (!bits_) return;
     RECT r{previewCell_.x - origin_.x, previewCell_.y - origin_.y,
@@ -968,9 +970,16 @@ void DesktopSurface::DrawPreviewLayered() {
     InflateRect(&r, -2, -2);
     if (r.right <= 0 || r.bottom <= 0 || r.left >= bufW_ || r.top >= bufH_) return;
     auto* b = reinterpret_cast<BYTE*>(bits_);
-    const int rad = 8;
-    FillRoundRectAlpha(b, bufW_, bufH_, r, rad, 34, RGB(0, 120, 215));       // 淡淡的底
-    StrokeRoundRectAlpha(b, bufW_, bufH_, r, rad, 2, 190, RGB(0, 120, 215));  // 2px 边框
+
+    FillRectAlpha(b, bufW_, bufH_, r, 34, RGB(0, 120, 215));   // 淡淡的底
+    // 2px 边框（四条边分开画，避免整块填色叠两次）
+    RECT edge[4] = {
+        {r.left, r.top, r.right, r.top + 2},
+        {r.left, r.bottom - 2, r.right, r.bottom},
+        {r.left, r.top, r.left + 2, r.bottom},
+        {r.right - 2, r.top, r.right, r.bottom},
+    };
+    for (const auto& e : edge) FillRectAlpha(b, bufW_, bufH_, e, 190, RGB(0, 120, 215));
 }
 
 // per-pixel alpha 的分层窗口有个坑：alpha == 0 的像素不接收鼠标消息（点击直接穿透到

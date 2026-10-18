@@ -92,6 +92,7 @@ void LoadLegacyIni(AppConfig& c) {
             else if (k == L"headerHeight") c.headerHeight = ToInt(v, 44);
             else if (k == L"autoExpandOnHover") c.autoExpandOnHover = ToInt(v, 0);
             else if (k == L"sortAnim") c.sortAnim = ToInt(v, 1);
+            else if (k == L"showFenceTitle") c.showFenceTitle = ToInt(v, 1);
             continue;
         }
         if (k == L"x") cur.x = ToInt(v, 100);
@@ -126,6 +127,7 @@ bool ConfigFromDb(AppConfig& c) {
             else if (k == L"headerHeight") c.headerHeight = n;
             else if (k == L"autoExpandOnHover") c.autoExpandOnHover = n;
             else if (k == L"sortAnim") c.sortAnim = n;
+            else if (k == L"showFenceTitle") c.showFenceTitle = n;
         }
     }
     {
@@ -216,6 +218,7 @@ void AppConfig::Save() const {
         put(L"headerHeight", headerHeight);
         put(L"autoExpandOnHover", autoExpandOnHover);
         put(L"sortAnim", sortAnim);
+        put(L"showFenceTitle", showFenceTitle);
 
         storage::Stmt fs(
             "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title,"

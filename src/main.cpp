@@ -253,8 +253,8 @@ static void InsertIntoFence(DesktopIconView* e, int fi, int vis) {
 // 布局持久化
 //
 // owner（图标属于哪个盒子）以前只活在内存里，重启后盒子里空空如也。
-// 这里把「归属 + 盒内顺序 + 桌面坐标」写进 %APPDATA%\meow-desk\layout.ini，
-// 启动时按 path（解析名，唯一且稳定）还原。
+// 这里把「归属 + 盒内顺序 + 桌面坐标」写进 %APPDATA%\meow-desk\meow-desk.db
+// 的 icon_layout 表（老版本是 layout.ini，只用于迁移），启动时按 path 还原。
 // ---------------------------------------------------------------------------
 static void SaveIconLayout();
 

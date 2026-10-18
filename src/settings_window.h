@@ -74,12 +74,13 @@ private:
 
     // ---- 外观 ----
     RECT swatches_[8]{};
+    RECT rcCustomColor_{};
     RECT rcRadius_{};
     RECT rcAlpha_{};
     RECT rcHeaderH_{};
     RECT rcAcrylic_{};
     RECT rcShowLabels_{};
-
+    RECT rcShowFenceTitle_{};
     // ---- 交互 ----
     RECT rcHoverExpand_{};
     RECT rcSortAnim_{};

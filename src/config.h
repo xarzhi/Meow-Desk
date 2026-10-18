@@ -1,4 +1,5 @@
-// 配置：%APPDATA%\meow-desk\config.ini
+// 配置：%APPDATA%\meow-desk\meow-desk.db（SQLite 的 kv 表）
+// 老的 config.ini 只在「首次迁移」和「数据库打不开时的回退」里读，不再写。
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -39,7 +40,10 @@ struct AppConfig {
     int showLabels = 1;         // 显示图标标题（桌面 + 盒子）
     int headerHeight = 44;      // 盒子头部高度
     int autoExpandOnHover = 0;  // 鼠标移到收起盒子的头部时自动展开，移出整个盒子再收起
-    int sortAnim = 1;           // 改排序方式时，盒内图标播 flip 翻转动画
+    int sortAnim = 1;           // 改排序方式时，盒内图标播位移过渡动画
+    // 显示盒子标题：关掉后标题文字和右上角箭头都不画，头部只留 2px 透明条
+    // （仍然能收到鼠标，悬停自动展开照样有效）
+    int showFenceTitle = 1;
 
     std::vector<FenceConfig> fences;
 

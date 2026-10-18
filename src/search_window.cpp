@@ -35,6 +35,9 @@ const int kFooterH = 30;
 
 const int kEditId = 1001;
 
+// 「点到面板外面就关掉」的巡检定时器
+const UINT_PTR kWatchTimer = 31;
+
 enum : int { ID_NONE = -1 };
 
 bool AppsUseLightTheme() {
@@ -365,12 +368,15 @@ void SearchWindow::ShowPalette() {
     SetFocus(edit_);
     SendMessageW(edit_, EM_SETSEL, 0, -1);
     HookKeyboard();
+    // 开始巡检「有没有点到外面」。不能只靠 WM_ACTIVATE，理由见 WM_TIMER 那段。
+    SetTimer(hwnd_, kWatchTimer, 60, nullptr);
     Repaint();
 }
 
 void SearchWindow::Hide() {
     if (!hwnd_ || !visible_) return;
     visible_ = false;
+    if (hwnd_) KillTimer(hwnd_, kWatchTimer);
     UnhookKeyboard();   // 一定要卸，否则会吞掉全系统的 Esc
     imeComp_.clear();
     ShowWindow(hwnd_, SW_HIDE);
@@ -560,6 +566,28 @@ LRESULT SearchWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE) Hide();
         return 0;
+
+    case WM_TIMER:
+        if (wp == kWatchTimer) {
+            POINT c{};
+            GetCursorPos(&c);
+            RECT wr{};
+            GetWindowRect(hwnd_, &wr);
+            // 光标还在面板上：什么都不做（面板内部自己处理点击）
+            if (c.x >= wr.left && c.x < wr.right && c.y >= wr.top && c.y < wr.bottom) return 0;
+            // 面板外面按下任何鼠标键就关掉。
+            // 为什么不能只靠 WM_ACTIVATE：面板是「无边框工具窗口 + 全局快捷键唤出」，
+            // 唤出时那次 SetForegroundWindow 经常被系统拒掉（前台进程不是我们，
+            // 而热键又不算「真实输入」），于是面板根本没有前台资格，也永远收不到
+            // WA_INACTIVE —— 用户点外面那一下被桌面/别的窗口吃掉，面板就一直留在那。
+            // 这里直接查物理键态，跟窗口有没有焦点无关，是最可靠的一层兜底。
+            if (GetAsyncKeyState(VK_LBUTTON) < 0 || GetAsyncKeyState(VK_RBUTTON) < 0 ||
+                GetAsyncKeyState(VK_MBUTTON) < 0) {
+                Hide();
+            }
+            return 0;
+        }
+        break;
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { Hide(); return 0; }

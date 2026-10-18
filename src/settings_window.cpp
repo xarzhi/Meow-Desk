@@ -1,6 +1,7 @@
 #include "settings_window.h"
 
 #include <windowsx.h>
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <objidl.h>
 #include <propidl.h>
@@ -14,6 +15,7 @@
 #include "config.h"
 #include "icon_render.h"
 
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
@@ -44,6 +46,8 @@ enum : int {
     ID_SHOW_LABELS = 26,
     ID_HOVER_EXPAND = 27,
     ID_SORT_ANIM = 28,
+    ID_COLOR_PICK = 29,
+    ID_SHOW_FENCE_TITLE = 30,
     ID_RELOAD = 40,
     ID_SYSICONS = 41,
     ID_OPENFOLDER = 42,
@@ -174,6 +178,8 @@ void SettingsWindow::Layout() {
             swatches_[i] = RECT{kContentX + 112 + i * 38, c1 + 44, kContentX + 112 + i * 38 + 26,
                                 c1 + 70};
         }
+        // 第 9 个是「调色盘」，点开系统取色器选任意颜色
+        rcCustomColor_ = RECT{swatches_[7].right + 12, c1 + 44, swatches_[7].right + 38, c1 + 70};
         const int tl = kContentX + 112;
         const int tr = kContentX + kCardW - 24;
         rcRadius_ = RECT{tl, c1 + 100, tr, c1 + 130};
@@ -183,6 +189,7 @@ void SettingsWindow::Layout() {
 
         const int c2 = 436;
         rcShowLabels_ = RECT{tr - 36, c2 + 62, tr, c2 + 84};
+        rcShowFenceTitle_ = RECT{tr - 36, c2 + 116, tr, c2 + 138};
     }
 
     // ---- 交互页 ----
@@ -223,11 +230,13 @@ int SettingsWindow::HitTest(POINT pt) const {
         for (int i = 0; i < 8; ++i) {
             if (in(swatches_[i], 4, 4)) return ID_SWATCH0 + i;
         }
+        if (in(rcCustomColor_, 4, 4)) return ID_COLOR_PICK;
         if (in(rcRadius_, 0, 8)) return ID_RADIUS;
         if (in(rcAlpha_, 0, 8)) return ID_ALPHA;
         if (in(rcHeaderH_, 0, 8)) return ID_HEADER_H;
         if (in(rcAcrylic_, 150, 16)) return ID_ACRYLIC;
         if (in(rcShowLabels_, 150, 16)) return ID_SHOW_LABELS;
+        if (in(rcShowFenceTitle_, 150, 16)) return ID_SHOW_FENCE_TITLE;
         break;
     case Page::Interaction:
         if (in(rcHoverExpand_, 150, 18)) return ID_HOVER_EXPAND;
@@ -551,6 +560,29 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
             }
         }
 
+        // ---- 调色盘（第 9 格）：任意颜色 ----
+        {
+            const RECT& r = rcCustomColor_;
+            const RectF rr((float)r.left, (float)r.top, 26.0f, 26.0f);
+            GraphicsPath p;
+            AddRound(p, rr, 7.0f);
+            // 用一条多色渐变的彩虹条表示「自己挑颜色」，比画图标更好认
+            LinearGradientBrush lg(rr, C(RGB(255, 96, 96)), C(RGB(120, 120, 255)),
+                                   LinearGradientModeHorizontal);
+            Color cols[6] = {C(RGB(255, 96, 96)),  C(RGB(255, 190, 90)),
+                             C(RGB(250, 240, 110)), C(RGB(120, 220, 130)),
+                             C(RGB(100, 190, 245)), C(RGB(190, 130, 245))};
+            REAL pos[6] = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};
+            lg.SetInterpolationColors(cols, pos, 6);
+            g.FillPath(&lg, &p);
+            // 当前颜色不是 8 个预设之一 → 调色盘自己加一圈选中环
+            bool preset = false;
+            for (int i = 0; i < 8; ++i)
+                if (base == kSwatchColors[i]) preset = true;
+            Pen pen(preset ? C(t.cardBorder) : C(t.accent), preset ? 1.0f : 2.0f);
+            g.DrawPath(&pen, &p);
+        }
+
         g.DrawString(L"\u5706\u89d2", -1, &fBody,
                      RectF((float)kRowLeft, (float)rcRadius_.top, 90.0f, 30.0f), &sf,
                      &brText);
@@ -581,7 +613,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         drawToggle(rcAcrylic_, acrylic);
 
         const int c2 = 436;
-        drawCard(c2, 116);
+        drawCard(c2, 170);
         g.DrawString(L"\u6807\u9898", -1, &fSection,
                      RectF((float)kContentX + 20, (float)c2 + 14.0f, 200.0f, 22.0f), &sf,
                      &brText);
@@ -593,6 +625,16 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      RectF((float)kRowLeft, (float)(rcShowLabels_.top + 12), 360.0f, 16.0f),
                      &sf, &brSub);
         drawToggle(rcShowLabels_, g_config.showLabels != 0);
+
+        g.DrawString(L"\u663e\u793a\u76d2\u5b50\u6807\u9898", -1, &fBody,
+                     RectF((float)kRowLeft, (float)(rcShowFenceTitle_.top - 10), 300.0f, 26.0f),
+                     &sf, &brText);
+        g.DrawString(L"\u5173\u95ed\u540e\u6807\u9898\u548c\u53f3\u4e0a\u89d2\u7bad\u5934\u90fd\u4e0d\u663e\u793a\uff0c"
+                     L"\u9876\u90e8\u53ea\u7559 2px \u60ac\u505c\u533a",
+                     -1, &fSub,
+                     RectF((float)kRowLeft, (float)(rcShowFenceTitle_.top + 12), 420.0f, 16.0f),
+                     &sf, &brSub);
+        drawToggle(rcShowFenceTitle_, g_config.showFenceTitle != 0);
         break;
     }
 
@@ -729,6 +771,9 @@ void SettingsWindow::Toggle(int id) {
     case ID_SHADOW: g_config.textShadow = g_config.textShadow ? 0 : 1; break;
     case ID_ARROW: g_config.shortcutArrow = g_config.shortcutArrow ? 0 : 1; break;
     case ID_SHOW_LABELS: g_config.showLabels = g_config.showLabels ? 0 : 1; break;
+    case ID_SHOW_FENCE_TITLE:
+        g_config.showFenceTitle = g_config.showFenceTitle ? 0 : 1;
+        break;
     case ID_HOVER_EXPAND:
         g_config.autoExpandOnHover = g_config.autoExpandOnHover ? 0 : 1;
         break;
@@ -791,8 +836,28 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == ID_ACRYLIC || id == ID_SHADOW || id == ID_ARROW || id == ID_SHOW_LABELS ||
-            id == ID_HOVER_EXPAND || id == ID_SORT_ANIM || id == ID_SYSICONS) {
+            id == ID_HOVER_EXPAND || id == ID_SORT_ANIM || id == ID_SYSICONS ||
+            id == ID_SHOW_FENCE_TITLE) {
             Toggle(id);
+            return 0;
+        }
+        if (id == ID_COLOR_PICK) {
+            // 系统调色盘：预设 8 色之外想用任意颜色就走这里
+            SetForegroundWindow(h);   // 本窗口是 topmost，不先抢前台的话对话框会被压住
+            static COLORREF custom[16] = {};
+            CHOOSECOLORW cc{};
+            cc.lStructSize = sizeof(cc);
+            cc.hwndOwner = h;
+            cc.rgbResult = g_config.fences.empty() ? RGB(250, 251, 254)
+                                                   : (COLORREF)g_config.fences[0].color;
+            cc.lpCustColors = custom;
+            cc.Flags = CC_FULLOPEN | CC_RGBINIT | CC_ANYCOLOR;
+            if (ChooseColorW(&cc)) {
+                for (auto& f : g_config.fences) f.color = (int)cc.rgbResult;
+                g_config.Save();
+                NotifyChanged();
+                Paint();
+            }
             return 0;
         }
         if (id == ID_RADIUS || id == ID_ALPHA || id == ID_HEADER_H) {

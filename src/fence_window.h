@@ -126,11 +126,16 @@ private:
     int HitItem(POINT clientPt) const;
     // 当前宽度下能放几列（拖拽改宽度后要跟着变）。列表/详情恒为 1 列。
     int CellCols() const;
-    // 两端对齐的列中心：第 0 列的中心 = kPad + 图标宽/2，最后一列 = 右内边距 - 图标宽/2，
-    // 中间等距。满行正好顶满左右内边距；不满的最后一排自然左对齐，且列位置与上一排对齐。
+    // 两端对齐的列中心：第 0 列的中心 = kPad+kColInset + 图标宽/2，
+    // 最后一列 = 右内边距-kColInset - 图标宽/2，中间等距。
     int ColCenterX(int c, int cols) const;
-    // 第 index 个格子的客户区矩形（命中、悬停、选中、落点高亮都用它）
+    // 图标列的水平范围（已含 kColInset）
+    int ColLeft() const;
+    int ColRight() const;
+    // 第 index 个格子的客户区矩形（命中、落点分区用；格子之间无缝）
     void ItemRect(int index, RECT& r) const;
+    // 悬停/选中/落点高亮专用：以图标中心为准、左右对称、固定格子宽度
+    RECT ItemHighlightRect(int index) const;
     // 第 index 个图标下方的文字盒（已夹在卡片内边距之内，相邻两列不会重叠）
     void ItemLabelBox(int index, int& left, int& w) const;
     // 第 index 个格子的客户区原点（图标左上角）；放不下返回 false
@@ -199,6 +204,11 @@ private:
     void BeginPress(HWND h, POINT pt);
     void ApplyResize(POINT screenPt);
 
+    // 实际占用的头部高度：显示标题时 = headerH_；关掉标题时只剩一条 2px 的
+    // 「悬停感应条」（看不见但能收到鼠标，用来悬停展开）。
+    static constexpr int kHeadStripH = 2;
+    int HeadH() const { return showTitle_ ? headerH_ : kHeadStripH; }
+
     int minW() const;
     int minH() const;
 
@@ -224,6 +234,7 @@ private:
     bool suppressAutoExpand_ = false;
     int headerH_ = 44;
     bool showLabels_ = true;
+    bool showTitle_ = true;    // g_config.showFenceTitle 的镜像
 
     std::vector<DesktopIconView*>* all_ = nullptr;
     std::function<std::vector<RECT>()> obstacles_;
