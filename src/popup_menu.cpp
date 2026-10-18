@@ -192,11 +192,12 @@ void PopupMenu::Paint() {
             const RECT& r = itemRects_[i];
 
             if (it.separator) {
-                // 线的 y 必须落在 .5 像素上：SmoothingModeAntiAlias + 1px 线画在整数
-                // 坐标上会被摊成两行半透明，浅底上几乎看不见
-                const float ly = std::floor((float)(r.top + r.bottom) * 0.5f) + 0.5f;
-                Pen sp(light_ ? Color(255, 208, 208, 216) : Color(255, 78, 78, 88), 1.0f);
-                g.DrawLine(&sp, (float)r.left + 10.0f, ly, (float)r.right - 10.0f, ly);
+                // 用填充矩形画线，不用 DrawLine：抗锯齿会把 1px 线摊成两行半透明，
+                // 在浅色卡片上几乎看不见
+                const float ly = std::floor((float)(r.top + r.bottom) * 0.5f);
+                SolidBrush sb(light_ ? Color(255, 202, 202, 212) : Color(255, 78, 78, 88));
+                g.FillRectangle(&sb, RectF((float)r.left + 10.0f, ly,
+                                           (float)(r.right - r.left) - 20.0f, 1.0f));
                 continue;
             }
 
