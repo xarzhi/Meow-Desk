@@ -105,8 +105,7 @@ public:
     int itemCount() const;
 
     // 头部右侧的锁按钮：锁上之后盒子不能拖动、也不能拖边缘改尺寸
-    RECT LockRect() const;
-    bool locked() const { return cfg_ && cfg_->locked; }
+    RECT LockRect() const;    bool locked() const { return cfg_ && cfg_->locked; }
     void SetLocked(bool on);
     void ToggleLock() { SetLocked(!locked()); }
 
@@ -300,6 +299,17 @@ private:
     // 所以记下当前悬停的标签，等一个短定时器到期、光标还在原地才真切。
     int pressTab_ = -1;
     int hoverTab_ = -1;
+
+    // ---- 标签滑块（当前分组身后那块底色）----
+    // 切分组时滑块从旧标签的位置滑到新标签，而不是「啪」一下跳过去。
+    // from/to 是客户区矩形，按 easeInOutCubic 插值。
+    void KickTabPill(const RECT& from);
+    RECT TabPillRect() const;
+    RECT tabPillFrom_{};
+    RECT tabPillTo_{};
+    bool tabPillAnim_ = false;
+    DWORD tabPillT0_ = 0;
+    int tabPillDur_ = 200;
     bool pressHeader_ = false;
     bool pressBody_ = false;
     bool dragging_ = false;

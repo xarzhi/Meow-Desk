@@ -132,11 +132,11 @@ int MeasureTabText(const std::wstring& s, int px) {
     return sz.cx;
 }
 
-const int kTabPadX = 11;    // 标签左右内边距
-const int kTabGap = 4;      // 相邻标签之间
-const int kTabLeft = 12;    // 第一个标签离卡片左边
-const int kTabMinW = 34;
-const int kTabMaxW = 148;
+const int kTabPadX = 12;    // 标签左右内边距
+const int kTabGap = 2;      // 相邻标签之间（小一点更像分段控件）
+const int kTabLeft = 11;    // 第一个标签离卡片左边
+const int kTabMinW = 40;
+const int kTabMaxW = 152;
 // 头部右侧被锁按钮（width-52±9）和箭头（最右 40px）占掉了，标签不能压过去
 const int kTabRightReserve = 74;
 
@@ -819,6 +819,8 @@ void FenceWindow::SetActiveGroup(int g) {
     const int n = groupCount();
     if (g < 0) g = 0;
     if (g >= n) g = n - 1;
+    // 先把滑块现在的位置记下来（改 activeGroup 之后 TabRects 就是新布局了）
+    const RECT pillBefore = TabPillRect();
     cfg_->activeGroup = g;
 
     hot_ = -1;
@@ -831,9 +833,55 @@ void FenceWindow::SetActiveGroup(int g) {
     itemDragging_ = false;
     StopFlip();
     InvalidateDetail();
+    KickTabPill(pillBefore);
 
     Redraw();
     if (onStateChanged) onStateChanged();   // 存配置（activeGroup 要落盘）
+}
+
+// 滑块补间：from 是切换前滑块所在的位置（可能是上一次动画的中间态），
+// 终点是当前 activeGroup 对应的标签矩形。
+void FenceWindow::KickTabPill(const RECT& from) {
+    const std::vector<RECT> tabs = TabRects();
+    const int act = activeGroup();
+    if (act < 0 || act >= (int)tabs.size()) {
+        tabPillAnim_ = false;
+        return;
+    }
+    const RECT to = tabs[act];
+    RECT src = from;
+    if (src.right <= src.left) src = to;   // 还没有滑块（第一次出现标签）→ 直接就位
+    tabPillFrom_ = src;
+    tabPillTo_ = to;
+    if (src.left == to.left && src.top == to.top && src.right == to.right &&
+        src.bottom == to.bottom) {
+        tabPillAnim_ = false;
+        return;
+    }
+    tabPillT0_ = GetTickCount();
+    tabPillAnim_ = true;
+    if (hwnd_) SetTimer(hwnd_, kAnimTimer, 16, nullptr);
+}
+
+// 滑块当前应该画在哪：动画中按 easeInOutCubic 在 from/to 之间取值
+RECT FenceWindow::TabPillRect() const {
+    const std::vector<RECT> tabs = TabRects();
+    const int act = activeGroup();
+    RECT target{};
+    if (act >= 0 && act < (int)tabs.size()) target = tabs[act];
+    if (!tabPillAnim_ || tabPillDur_ <= 0) return target;
+
+    const DWORD el = GetTickCount() - tabPillT0_;
+    if (el >= (DWORD)tabPillDur_) return target;
+    const float p = (float)el / (float)tabPillDur_;
+    // 和 flip 动画同一套缓动：起步收尾都柔，中间快
+    const float t = (p < 0.5f) ? 4.0f * p * p * p
+                              : 1.0f - std::pow(-2.0f * p + 2.0f, 3.0f) / 2.0f;
+    auto lerpI = [&](int a, int b) { return a + (int)std::lround((double)(b - a) * t); };
+    return RECT{lerpI(tabPillFrom_.left, tabPillTo_.left),
+                lerpI(tabPillFrom_.top, tabPillTo_.top),
+                lerpI(tabPillFrom_.right, tabPillTo_.right),
+                lerpI(tabPillFrom_.bottom, tabPillTo_.bottom)};
 }
 
 int FenceWindow::AddGroup(const std::wstring& name) {
@@ -856,6 +904,7 @@ void FenceWindow::RemoveActiveGroup() {
     // 第 0 个标签就是盒子标题本身，删掉它盒子就没名字了
     if (g <= 0 || cfg_->groups.size() <= 1) return;
 
+    const RECT pillBefore = TabPillRect();
     cfg_->groups.erase(cfg_->groups.begin() + g);
     // 这个分组里的图标退回第 0 组（盒子标题页），后面分组的图标下标各减一 ——
     // 不这么做的话它们会指向一个不存在的分组，变成「怎么也看不见的图标」。
@@ -874,6 +923,7 @@ void FenceWindow::RemoveActiveGroup() {
     drop_ = DropHint{};
     StopFlip();
     InvalidateDetail();
+    KickTabPill(pillBefore);
     Redraw();
     if (onStateChanged) onStateChanged();
 }
@@ -900,7 +950,7 @@ std::vector<RECT> FenceWindow::TabRects() const {
     if (hh < 16) return out;
 
     const int fontPx = (headerH_ >= 40) ? 14 : 13;
-    const int th = std::min(hh - 10, 26);
+    const int th = std::min(hh - 8, 30);
     const int top = (hh - th) / 2;
     const int rightLimit = width_ - kTabRightReserve;
 
@@ -1101,14 +1151,12 @@ int FenceWindow::HitItem(POINT clientPt) const {
 }
 
 void FenceWindow::CollectVisible(std::vector<DesktopIconView*>& out) const {
-    out.clear();
-    if (!all_) return;
-    for (auto* e : *all_) {
-        if (!e || e->owner != index_) continue;
-        // 正在被拖出去的那个仍然占着原来的格子：布局不能动，否则后面的图标
-        // 会在松手之前就往前挤。它由 Paint() 画成半透明的「空位」。
-        out.push_back(e);
-    }
+    // 必须是 Collect 的结果（owner + 当前分组都过滤过）：
+    // 绘制 / 命中 / 落点 / flip 槽位全都走这里，一旦自己另写一份循环，
+    // 切分组时就会出现「标签换了、图标还是原来那批」。
+    Collect(out);
+    // 正在被拖出去的那个仍然占着原来的格子：布局不能动，否则后面的图标
+    // 会在松手之前就往前挤。它由 Paint() 画成半透明的「空位」。
 }
 
 int FenceWindow::itemCount() const {
@@ -1467,6 +1515,12 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             busy = true;
         }
 
+        // 分组标签的滑块补间
+        if (tabPillAnim_) {
+            if (GetTickCount() - tabPillT0_ >= (DWORD)tabPillDur_) tabPillAnim_ = false;
+            busy = true;
+        }
+
         if (!busy) {
             KillTimer(h, kAnimTimer);
             return 0;
@@ -1635,6 +1689,35 @@ void FenceWindow::Paint() {
             const int fontPx = (headerH_ >= 40) ? 14 : 13;
             Font tabFont(&family, (float)fontPx, FontStyleRegular, UnitPixel);
             Font tabFontBold(&family, (float)fontPx, FontStyleBold, UnitPixel);
+
+            // ---- 滑块（当前分组身后的那块底色）----
+            // 样式参考 Windows 11 的分段控件：浅色卡片上是「更白的胶囊 + 极淡描边
+            // + 一点点投影」，深色卡片上是「一层更亮的白」。位置由 TabPillRect()
+            // 给出，切换分组时它在两个标签之间补间，不是瞬移。
+            const RECT pill = TabPillRect();
+            if (pill.right - pill.left >= 4 && pill.bottom - pill.top >= 4) {
+                const RectF pr((float)pill.left, (float)pill.top,
+                               (float)(pill.right - pill.left), (float)(pill.bottom - pill.top));
+                GraphicsPath pp;
+                AddRoundRect(pp, pr, 7.0f);
+                if (light) {
+                    // 先垫一层淡影：不然纯白块贴在浅色卡片上是「死」的，没有层次
+                    GraphicsPath sh;
+                    AddRoundRect(sh, RectF(pr.X, pr.Y + 1.0f, pr.Width, pr.Height), 7.0f);
+                    SolidBrush shadow{Color(18, 0, 0, 0)};
+                    gfx.FillPath(&shadow, &sh);
+                    SolidBrush face{Color(242, 255, 255, 255)};
+                    gfx.FillPath(&face, &pp);
+                    Pen edge{Color(44, 0, 0, 0), 1.0f};
+                    gfx.DrawPath(&edge, &pp);
+                } else {
+                    SolidBrush face{Color(36, 255, 255, 255)};
+                    gfx.FillPath(&face, &pp);
+                    Pen edge{Color(44, 255, 255, 255), 1.0f};
+                    gfx.DrawPath(&edge, &pp);
+                }
+            }
+
             StringFormat tf;
             tf.SetAlignment(StringAlignmentCenter);
             tf.SetLineAlignment(StringAlignmentCenter);
@@ -1645,14 +1728,7 @@ void FenceWindow::Paint() {
                 const bool on = ((int)i == act);
                 const RectF rr((float)tr.left, (float)tr.top, (float)(tr.right - tr.left),
                                (float)(tr.bottom - tr.top));
-                if (on) {
-                    // 当前分组：浅色卡片压一层淡黑、深色卡片提一层淡白，做出「选中」的块
-                    SolidBrush bg{light ? Color(28, 0, 0, 0) : Color(54, 255, 255, 255)};
-                    GraphicsPath pill;
-                    AddRoundRect(pill, rr, 6.0f);
-                    gfx.FillPath(&bg, &pill);
-                }
-                SolidBrush txt{on ? Color(fg) : WithAlpha(fg, (BYTE)(light ? 118 : 148))};
+                SolidBrush txt{on ? Color(fg) : WithAlpha(fg, (BYTE)(light ? 122 : 146))};
                 const std::wstring name = GroupName((int)i);
                 const RectF box(rr.X + 2.0f, rr.Y, std::max(4.0f, rr.Width - 4.0f), rr.Height);
                 gfx.DrawString(name.c_str(), -1, on ? &tabFontBold : &tabFont, box, &tf, &txt);

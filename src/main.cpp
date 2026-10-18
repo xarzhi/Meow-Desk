@@ -549,9 +549,35 @@ static void ShowFenceMenu(int fi, POINT sp, int item = -1);
 static void BeginRenameGroup(int fi, int gi);
 static void BeginRenameFence(int fi);
 
+// 新建盒子 / 一键整理建的盒子都要继承「已有盒子的外观」。
+// 外观（颜色、透明度、圆角、磨砂、查看方式、排序方式）在设置页是全局一起改的，
+// 所以新盒子必须照着现有盒子来，不能留 FenceConfig 的默认值 ——
+// 否则改完样式再一键整理，新出来的盒子跟原来的长得不一样。
+static void InheritFenceStyle(FenceConfig& c) {
+    if (g_config.fences.empty()) return;
+    const FenceConfig& s = g_config.fences.front();
+    c.color = s.color;
+    c.alpha = s.alpha;
+    c.radius = s.radius;
+    c.acrylic = s.acrylic;
+    c.viewMode = s.viewMode;
+    c.sortKey = s.sortKey;
+    c.sortAsc = s.sortAsc;
+}
+
+// 新盒子的尺寸也跟着现有盒子走（没有盒子时才用 340×380）。
+// 一键整理一次可能建出好几个盒子，大小不一会显得很乱。
+static void InheritFenceSize(int& w, int& h) {
+    if (g_config.fences.empty()) return;
+    const FenceConfig& s = g_config.fences.front();
+    if (s.w >= 120) w = s.w;
+    if (s.h >= 120) h = s.h;
+}
+
 // 新建盒子：摆在当前盒子右边，超出工作区就换到下一行
 static void NewFenceNear(int fi) {
-    const int w = 340, h = 380;
+    int w = 340, h = 380;
+    InheritFenceSize(w, h);
     RECT base{200, 200, 200 + w, 200 + h};
     if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) base = g_fences[fi]->rect();
 
@@ -577,6 +603,7 @@ static void NewFenceNear(int fi) {
     c.w = w;
     c.h = h;
     c.title = L"新盒子";
+    InheritFenceStyle(c);
     g_config.fences.push_back(c);
     // 容器可能重新分配：先把已有盒子手里的配置指针重绑一遍，再建新的那个
     for (auto& f : g_fences)
@@ -638,7 +665,8 @@ static int FindFenceByTitle(const std::wstring& t) {
 
 // 给某条规则新建盒子：从现有盒子往右摆，超出工作区换到下一行（和「新建盒子」一致）
 static int CreateRuleFence(const std::wstring& title) {
-    const int w = 340, h = 380;
+    int w = 340, h = 380;
+    InheritFenceSize(w, h);
     RECT base{200, 200, 200 + w, 200 + h};
     for (int i = (int)g_fences.size() - 1; i >= 0; --i) {
         if (g_fences[i] && g_fences[i]->hwnd()) {
@@ -668,6 +696,7 @@ static int CreateRuleFence(const std::wstring& title) {
     c.w = w;
     c.h = h;
     c.title = title;
+    InheritFenceStyle(c);
     g_config.fences.push_back(c);
     for (auto& f : g_fences)
         if (f) f->RebindConfig();   // 容器可能重分配，先把已有盒子重绑
