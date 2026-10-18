@@ -27,6 +27,7 @@ add_executable(meow-desk WIN32
     src/settings_window.cpp
     src/search_window.cpp
     src/popup_menu.cpp
+    src/confirm_dialog.cpp
     src/pinyin.cpp
     src/layout_store.cpp
     # 本地存储用 SQLite 3 的 amalgamation（单文件，无外部依赖）。

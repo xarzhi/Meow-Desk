@@ -12,6 +12,7 @@
 //     "拖进盒子""盒子间互拖""拖回桌面"都只是改这个整数
 //   · 启动时隐藏资源管理器的桌面图标视图，退出时恢复
 #include "config.h"
+#include "confirm_dialog.h"
 #include "desktop_icons.h"
 #include "desktop_surface.h"
 #include "drag_layer.h"
@@ -58,6 +59,8 @@ static SearchWindow g_search;
 
 // 盒子的右键菜单（自绘，不是系统菜单）
 static PopupMenu g_fenceMenu;
+// 「删除盒子 / 删除分组」的确认框（同样是自绘，点确定才真删）
+static ConfirmBox g_confirm;
 
 // 全局快捷键：Ctrl+Alt+D 唤出搜索面板
 static const int kHotkeyId = 1;
@@ -277,10 +280,36 @@ static void PlaceOnDesktop(DesktopIconView* e, POINT dropPt,
     e->pos = g_surface.CellForCursor(dropPt, e->bmp.valid() ? &e->bmp : nullptr);
     e->dragPos = e->pos;
     e->owner = -1;
+    e->group = 0;   // 回到桌面就不属于任何分组了
     e->selected = false;
     FitIconToOwner(e);   // 回桌面 → 位图换回 48px
     std::vector<DesktopIconView*> one{e};
     CommitPositions(one);
+    SaveIconLayout();
+}
+
+// 把一批图标从盒子里倒回桌面（删除盒子 / 删除分组时用）。
+// 落点从盒子原来所在的位置开始铺开，撞上已有图标会自动挪到最近的空格子；
+// 整批只提交一次给资源管理器，比一个个走 PlaceOnDesktop 快得多。
+static void SendIconsToDesktop(int fi, const std::vector<DesktopIconView*>& list) {
+    if (list.empty()) return;
+    RECT r{120, 120, 460, 600};
+    if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) r = g_fences[fi]->rect();
+
+    int i = 0;
+    for (auto* e : list) {
+        if (!e) continue;
+        const POINT pt{r.left + g_cellW / 2 + (i % 5) * g_cellW,
+                       r.top + 40 + (i / 5) * g_cellH};
+        e->pos = g_surface.CellForCursor(pt, e->bmp.valid() ? &e->bmp : nullptr);
+        e->dragPos = e->pos;
+        e->owner = -1;
+        e->group = 0;
+        e->selected = false;
+        FitIconToOwner(e);   // 回桌面 → 位图换回 48px
+        ++i;
+    }
+    CommitPositions(list);
     SaveIconLayout();
 }
 
@@ -540,13 +569,16 @@ enum {
     kCmdLock = 4042,
     kCmdNewGroup = 4043,      // 在头部新建一个分组标签
     kCmdRenameGroup = 4044,   // 重命名当前分组
-    kCmdDeleteGroup = 4045,   // 删除当前分组
+    kCmdDeleteGroup = 4045,   // 删除当前分组（图标回桌面）
+    kCmdDeleteFence = 4046,   // 删除整个盒子（图标回桌面）
     kCmdMoveToGroup = 4100,   // 4100..4127：盒内图标「移动到第 N 个分组」
 };
 
 static void AddFenceWindow(int i);
 static void ShowFenceMenu(int fi, POINT sp, int item = -1);
 static void BeginRenameGroup(int fi, int gi);
+static void DeleteFence(int fi);
+static void DeleteActiveGroup(int fi);
 static void BeginRenameFence(int fi);
 
 // 新建盒子 / 一键整理建的盒子都要继承「已有盒子的外观」。
@@ -1009,15 +1041,22 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
     items.push_back(PopupMenuItem(L"\u521b\u5efa\u5206\u7ec4", kCmdNewGroup));  // 创建分组
     if (f->hasTabs()) {
         items.push_back(PopupMenuItem(L"\u91cd\u547d\u540d\u5206\u7ec4", kCmdRenameGroup));
-        // 第 0 个标签就是盒子标题，删不掉（要删就删盒子）
-        if (f->activeGroup() > 0)
-            items.push_back(PopupMenuItem(L"\u5220\u9664\u5f53\u524d\u5206\u7ec4", kCmdDeleteGroup));
     }
     // 头部右侧的锁按钮在「显示盒子标题」关掉时是看不见的，这里留一个出口，
     // 免得锁上之后没法再解开。
     items.push_back(PopupMenuItem(f->locked() ? L"\u89e3\u9501\u4f4d\u7f6e"    // 解锁位置
                                               : L"\u9501\u5b9a\u4f4d\u7f6e",   // 锁定位置
                                   kCmdLock));
+    // 删除类放最下面，和上面隔开，免得误点。
+    // 「删除分组」始终占一行（灰掉比消失更好懂）：第 0 个标签就是盒子标题本身，
+    // 它不能被删 —— 要删盒子请用下面的「删除盒子」。
+    items.push_back(PopupMenuItem::Sep());
+    {
+        PopupMenuItem m(L"\u5220\u9664\u5206\u7ec4", kCmdDeleteGroup);   // 删除分组
+        m.disabled = !f->hasTabs() || f->activeGroup() <= 0;
+        items.push_back(std::move(m));
+    }
+    items.push_back(PopupMenuItem(L"\u5220\u9664\u76d2\u5b50", kCmdDeleteFence));  // 删除盒子
 
     if (!g_fenceMenu.Create()) return;
     g_fenceMenu.SetOwner(f->hwnd());
@@ -1056,7 +1095,34 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
             return;
         }
         if (id == kCmdRenameGroup) { BeginRenameGroup(fi, w->activeGroup()); return; }
-        if (id == kCmdDeleteGroup) { w->RemoveActiveGroup(); RedrawAll(); return; }
+        if (id == kCmdDeleteGroup) {
+            if (w->activeGroup() <= 0) return;   // 第一个标签是盒子标题，删不掉
+            int cnt = 0;
+            for (auto* e : g_icons)
+                if (e && e->owner == fi && e->group == w->activeGroup()) ++cnt;
+            const std::wstring gname = w->activeGroupName();
+            g_confirm.Show(w->hwnd(), L"\u5220\u9664\u5206\u7ec4",   // 删除分组
+                           L"\u201c" + gname + L"\u201d\u91cc\u7684 " + std::to_wstring(cnt) +
+                               L" \u4e2a\u56fe\u6807\u4f1a\u56de\u5230\u684c\u9762\u3002\n"
+                               L"\u5206\u7ec4\u6807\u7b7e\u5c06\u88ab\u5220\u9664\uff0c"
+                               L"\u6587\u4ef6\u672c\u8eab\u4e0d\u53d7\u5f71\u54cd\u3002",
+                           L"\u5220\u9664", [fi] { DeleteActiveGroup(fi); });
+            return;
+        }
+        if (id == kCmdDeleteFence) {
+            int cnt = 0;
+            for (auto* e : g_icons)
+                if (e && e->owner == fi) ++cnt;
+            const std::wstring t = w->title();
+            g_confirm.Show(w->hwnd(), L"\u5220\u9664\u76d2\u5b50",   // 删除盒子
+                           L"\u201c" + t + L"\u201d\u548c\u91cc\u9762\u7684 " +
+                               std::to_wstring(cnt) +
+                               L" \u4e2a\u56fe\u6807\u90fd\u4f1a\u56de\u5230\u684c\u9762\u3002\n"
+                               L"\u76d2\u5b50\u672c\u8eab\u4f1a\u88ab\u5220\u9664\uff0c"
+                               L"\u6587\u4ef6\u4e0d\u4f1a\u4e22\u3002",
+                           L"\u5220\u9664", [fi] { DeleteFence(fi); });
+            return;
+        }
         if (id == kCmdLock) { w->ToggleLock(); return; }
         if (id >= kCmdSortName && id < kCmdSortName + 5) {
             // 换排序字段时保留当前的正序/倒序
@@ -1176,6 +1242,73 @@ static void AddFenceWindow(int i) {
             return v;
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// 删除盒子 / 删除分组
+//
+// 盒子下标是「数组下标」，删掉中间一个会把后面所有盒子的下标往前挪一格：
+//   · FenceWindow::index_ / cfg_
+//   · 各种 [i] 捕获的回调（onGeometryChanged / onContextMenu / onStateChanged /
+//     onItemDrag* / SetObstacles / InstallKeepAbove 的锚点）
+//   · 图标的 owner
+// 原地改这些太容易漏，所以先把窗口全销毁、再按新下标整批重建一遍。
+// ---------------------------------------------------------------------------
+static void RebuildFences();
+
+// 删掉当前分组：组里的图标回到桌面，剩下的组各回各位
+static void DeleteActiveGroup(int fi) {
+    if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
+    FenceWindow* w = g_fences[fi].get();
+    const int g = w->activeGroup();
+    if (g <= 0) return;   // 第一个标签就是盒子标题，删不掉
+
+    std::vector<DesktopIconView*> moved;
+    for (auto* e : g_icons)
+        if (e && e->owner == fi && e->group == g) moved.push_back(e);
+    SendIconsToDesktop(fi, moved);
+
+    w->RemoveActiveGroup();   // 剩下的组内图标由它负责重新编号
+    g_config.Save();
+    SaveIconLayout();
+    RedrawAll();
+    LogStep("delete group #" + std::to_string(g) + " of fence " + std::to_string(fi) +
+            " (" + std::to_string(moved.size()) + " icons to desktop)");
+}
+
+// 删掉整个盒子：盒子里所有分组的所有图标回到桌面
+static void DeleteFence(int fi) {
+    if (fi < 0 || fi >= (int)g_fences.size() || fi >= (int)g_config.fences.size()) return;
+
+    std::vector<DesktopIconView*> moved;
+    for (auto* e : g_icons)
+        if (e && e->owner == fi) moved.push_back(e);
+    SendIconsToDesktop(fi, moved);
+
+    // 摘掉窗口
+    if (g_fences[fi]) g_fences[fi]->Destroy();
+    g_fences.erase(g_fences.begin() + fi);
+    g_config.fences.erase(g_config.fences.begin() + fi);
+
+    // 后面的盒子整体前移一格
+    for (auto* e : g_icons)
+        if (e && e->owner > fi) --e->owner;
+
+    RebuildFences();
+    g_config.Save();
+    SaveIconLayout();
+    RedrawAll();
+    LogStep("delete fence " + std::to_string(fi) + " (" + std::to_string(moved.size()) +
+            " icons to desktop)");
+}
+
+// 按当前 g_config.fences 把所有盒子窗口重建一遍（下标变了之后必须走这条路）
+static void RebuildFences() {
+    for (auto& f : g_fences)
+        if (f) f->Destroy();
+    g_fences.clear();
+    for (int i = 0; i < (int)g_config.fences.size(); ++i) AddFenceWindow(i);
+    RestoreZOrder();
 }
 
 // ---------------------------------------------------------------------------
