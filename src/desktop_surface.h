@@ -141,6 +141,15 @@ private:
     // 悬停：光标压到哪个图标上 → 给它画一层半透明底（和选中态区分开）
     void UpdateHover(POINT screenPt);
     void ClearHover();
+    // 「这个屏幕点上应该悬停哪个图标」。比 HitTest 多了两条约束：
+    //  1) 桌面层必须真的是这个点最上层的窗口 —— 否则光标压在盒子上时，
+    //     盒子底下那个图标也会被点亮（盒子和图标层都是我们的窗口）；
+    //  2) 拖拽/框选过程中一律不悬停。
+    DesktopIconView* HitTestScreen(POINT screenPt) const;
+    // 按「当前光标位置」重新算一次悬停标志，不触发绘制。
+    // 悬停本来只跟 WM_MOUSEMOVE 走，但图标格子会因刷新图标/恢复布局/盒子开关
+    // 整体搬家，那时光标没动，缓存下来的悬停格子就是旧的。整屏重画前同步一次最省心。
+    void SyncHoverToCursor();
     // 只重画若干格子（分层窗口每次仍要整体上传，但不重画 200 个图标）
     void RepaintCells(const RECT& r);
     void UploadLayered();

@@ -831,6 +831,12 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_TIMER:
         if (wp == 1) {
+            // 每 500ms 拿「当前光标位置」校准一次悬停。正常情况下这里什么都不做
+            // （命中的还是同一个图标，UpdateHover 直接返回），但万一某次
+            // WM_MOUSEMOVE / WM_MOUSELEAVE 丢了（别的程序 SetCursorPos、远程桌面、
+            // 光标被瞬间甩过整个屏幕），底色不会一直挂在某个图标上。
+            POINT cur{};
+            if (GetCursorPos(&cur)) UpdateHover(cur);
             if (onTick) onTick();
             return 0;
         }
@@ -921,6 +927,9 @@ void DesktopSurface::PaintLayered() {
     std::memset(bits_, 0, (size_t)bufW_ * (size_t)bufH_ * 4);  // 全透明底
 
     if (!icons_) return;
+
+    // 整屏重画前按当前光标位置同步一次悬停（图标可能刚搬过家）
+    SyncHoverToCursor();
 
     // 先画不动的，再画正在拖的，让拖动的图标压在上面
     for (auto* e : *icons_) {
@@ -1023,6 +1032,8 @@ void DesktopSurface::PaintOpaque(HDC hdc) {
     }
 
     if (icons_) {
+        // 整屏重画前按当前光标位置同步一次悬停（图标可能刚搬过家）
+        SyncHoverToCursor();
         for (auto* e : *icons_) {
             if (!e || !e->OnDesktop()) continue;
             // 拖动中的图标交给拖拽浮层画（桌面层在所有盒子下面，会被挡住）
@@ -1319,19 +1330,40 @@ void DesktopSurface::RepaintCells(const RECT& rect) {
     UploadLayered();
 }
 
+DesktopIconView* DesktopSurface::HitTestScreen(POINT screenPt) const {
+    if (!icons_ || !hwnd_) return nullptr;
+    if (mode_ != Mode::None) return nullptr;   // 拖拽/框选过程中不显示悬停
+    // 盒子和图标层都是我们的窗口，且盒子盖在图标层上面。光标落在盒子上时
+    // 图标层收不到鼠标消息，但整屏重画时按光标位置同步悬停就会「穿透」到盒
+    // 子底下的图标上 —— 用 WindowFromPoint 确认最上层确实是图标层。
+    if (WindowFromPoint(screenPt) != hwnd_) return nullptr;
+    return HitTest(POINT{screenPt.x - origin_.x, screenPt.y - origin_.y});
+}
+
+void DesktopSurface::SyncHoverToCursor() {
+    POINT p{};
+    if (!GetCursorPos(&p)) return;
+    DesktopIconView* hit = HitTestScreen(p);
+    if (hit == hover_) return;
+    DesktopIconView* old = hover_;
+    hover_ = hit;
+    if (old) old->hover = false;
+    if (hit) hit->hover = true;
+
+    // 不透明路径是「按裁剪区现画」的：这次同步如果发生在一次局部绘制中，
+    // 旧/新格子可能都不在裁剪区内，得补一次失效，否则旧底色会留到下次全屏重画。
+    // 补完下一次 WM_PAINT 就会把两格都画对，不会反复触发（同步只在换图标时发生）。
+    if (opaque_ && hwnd_) {
+        if (old) InvalidateRect(hwnd_, &CellRect(old), FALSE);
+        if (hit) InvalidateRect(hwnd_, &CellRect(hit), FALSE);
+    }
+}
+
 // 光标压在哪个桌面图标上 → 给它画半透明底。
 // 只在「换了图标」时才重画，鼠标在同一格里移动不产生任何绘制。
 void DesktopSurface::UpdateHover(POINT screenPt) {
     if (!icons_) return;
-    DesktopIconView* hit = nullptr;
-    for (auto* e : *icons_) {
-        if (!e || !e->OnDesktop()) continue;
-        if (screenPt.x >= e->pos.x && screenPt.x < e->pos.x + cellW_ &&
-            screenPt.y >= e->pos.y && screenPt.y < e->pos.y + cellH_) {
-            hit = e;
-            break;
-        }
-    }
+    DesktopIconView* hit = HitTestScreen(screenPt);
     if (hit == hover_) return;
 
     // 旧格子 + 新格子一起重画（多留 2px 给圆角和光晕）
