@@ -20,6 +20,7 @@
 #include "search_window.h"
 #include "settings_window.h"
 #include "shell_icons.h"
+#include "storage.h"
 #include "tray.h"
 #include "zorder.h"
 
@@ -80,9 +81,28 @@ static int SnapTo(int v, int step) {
     return (int)std::lround((double)v / (double)step) * step;
 }
 
+// 路径转 UTF-8 只是给日志用
+static std::string Narrow(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
+                                      nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
 static void OpenPath(const std::wstring& path) {
     if (path.empty()) return;
-    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    const HINSTANCE r =
+        ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    // ShellExecute 的返回值 <= 32 就是失败码（SE_ERR_*），排障时很有用
+    const INT_PTR rc = reinterpret_cast<INT_PTR>(r);
+    if (rc <= 32) {
+        LogStep("open failed rc=" + std::to_string((long long)rc) + " " + Narrow(path));
+    } else {
+        LogStep("open ok " + Narrow(path));
+    }
 }
 
 static void DumpIconPositions() {
@@ -454,6 +474,8 @@ static void Cleanup() {
     g_icons.clear();
 
     SetSystemDesktopIconsVisible(true);
+
+    storage::Close();   // 关掉数据库，释放 page cache / 文件句柄
 }
 
 // ---------------------------------------------------------------------------

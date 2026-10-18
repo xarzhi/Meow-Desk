@@ -654,7 +654,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
             ly += 22.0f;
         }
 
-        g.DrawString(L"\u914d\u7f6e\u6587\u4ef6", -1, &fBody,
+        g.DrawString(L"\u6570\u636e\u6587\u4ef6", -1, &fBody,
                      RectF((float)kRowLeft, (float)c1 + 120.0f, 200.0f, 22.0f), &sf, &brText);
         g.DrawString(AppConfig::File().c_str(), -1, &fSub,
                      RectF((float)kRowLeft, (float)c1 + 146.0f, 520.0f, 18.0f), &sf, &brSub);
@@ -669,7 +669,8 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
             g.FillPath(&fill, &p);
             Pen pen(C(t.cardBorder), 1.0f);
             g.DrawPath(&pen, &p);
-            g.DrawString(L"\u6253\u5f00\u914d\u7f6e\u6587\u4ef6\u5939", -1, &fBody,
+            // 现在存的是 meow-desk.db，说「配置文件夹」已经不准确了
+            g.DrawString(L"\u6253\u5f00\u6570\u636e\u6587\u4ef6\u5939", -1, &fBody,
                          RectF((float)rcOpenFolder_.left, (float)rcOpenFolder_.top,
                                (float)(rcOpenFolder_.right - rcOpenFolder_.left),
                                (float)(rcOpenFolder_.bottom - rcOpenFolder_.top)),

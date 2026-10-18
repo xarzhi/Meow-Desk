@@ -34,7 +34,10 @@ set(ENV{INCLUDE} "${_inc_flags}")
 set(ENV{LIB}     "${_lib_flags}")
 
 # 同时作为编译器/链接器 flags 兜底
+# 注意 C 也要加：third_party/sqlite/sqlite3.c 是 .c 文件，
+# 只设 CMAKE_CXX_FLAGS 的话它连 stdarg.h 都找不到（C1083）
 foreach(d ${_inc})
+    string(APPEND CMAKE_C_FLAGS   " /I\"${d}\"")
     string(APPEND CMAKE_CXX_FLAGS " /I\"${d}\"")
 endforeach()
 foreach(l ${_lib})

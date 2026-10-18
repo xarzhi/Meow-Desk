@@ -1,4 +1,16 @@
+// 图标布局持久化
+//
+// 为什么需要：`owner`（图标属于哪个盒子）以前只存在内存里，程序一退出就全丢，
+// 盒子里放好的图标重启后全回到桌面。这里把「归属 + 盒内顺序 + 桌面坐标」
+// 落到 SQLite 的 icon_layout 表，启动时按 path 还原。
+//
+// 用 path（解析名）当主键：显示名可能重名，path 唯一且稳定。
+//
+// 历史：早期版本用 %APPDATA%\meow-desk\layout.ini（UTF-8，TAB 分隔）。
+// 现在只在两种情况下还会读它 —— 首次迁移到 SQLite、以及数据库打不开时的回退。
 #include "layout_store.h"
+
+#include "storage.h"
 
 #include <shlobj.h>
 
@@ -7,8 +19,6 @@
 #include <cstring>
 
 namespace {
-
-const wchar_t* kHeader = L"# meow-desk layout v1";
 
 std::wstring AppDataDir() {
     wchar_t* p = nullptr;
@@ -27,6 +37,28 @@ std::wstring AppDataDir() {
     return dir;
 }
 
+std::wstring LegacyIniPath() { return AppDataDir() + L"\\layout.ini"; }
+
+bool FileExists(const std::wstring& p) {
+    const DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+void BackupLegacy(const std::wstring& p) {
+    const std::wstring bak = p + L".bak";
+    DeleteFileW(bak.c_str());
+    MoveFileW(p.c_str(), bak.c_str());
+}
+
+void LogLine(const char* s) {
+    FILE* f = nullptr;
+    fopen_s(&f, "meow-desk.log", "a");
+    if (f) {
+        fprintf(f, "%s\n", s);
+        fclose(f);
+    }
+}
+
 std::vector<std::wstring> SplitTab(const std::wstring& s) {
     std::vector<std::wstring> out;
     size_t start = 0;
@@ -39,16 +71,12 @@ std::vector<std::wstring> SplitTab(const std::wstring& s) {
     return out;
 }
 
-}  // namespace
-
-std::wstring LayoutFilePath() { return AppDataDir() + L"\\layout.ini"; }
-
-bool LoadLayout(std::vector<LayoutEntry>& out) {
+// ---- 老 layout.ini 解析（迁移 / 回退专用）----
+bool LoadLegacyIni(std::vector<LayoutEntry>& out) {
     out.clear();
     FILE* f = nullptr;
-    if (_wfopen_s(&f, LayoutFilePath().c_str(), L"rb") != 0 || !f) return false;
+    if (_wfopen_s(&f, LegacyIniPath().c_str(), L"rb") != 0 || !f) return false;
 
-    // UTF-8（兼容 BOM）
     std::string data;
     char buf[4096];
     size_t n = 0;
@@ -91,29 +119,73 @@ bool LoadLayout(std::vector<LayoutEntry>& out) {
     return !out.empty();
 }
 
-bool SaveLayout(const std::vector<LayoutEntry>& in) {
-    const std::wstring path = LayoutFilePath();
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
+bool LayoutFromDb(std::vector<LayoutEntry>& out) {
+    out.clear();
+    storage::Stmt st("SELECT path,owner,ord,x,y FROM icon_layout");
+    if (!st.ok()) return false;
+    while (st.step()) {
+        LayoutEntry e;
+        e.path = st.colText(0);
+        e.owner = st.colInt(1);
+        e.order = st.colInt(2);
+        e.pos.x = st.colInt(3);
+        e.pos.y = st.colInt(4);
+        if (e.path.empty()) continue;
+        if (e.owner < 0) e.owner = -1;
+        out.push_back(std::move(e));
+    }
+    return !out.empty();
+}
 
-    std::wstring text;
-    text += kHeader;
-    text += L"\n";
-    for (const auto& e : in) {
-        wchar_t buf[64];
-        swprintf_s(buf, L"%d\t%d\t%d\t%d\t", e.owner, e.order, e.pos.x, e.pos.y);
-        text += buf;
-        text += e.path;
-        text += L"\n";
+}  // namespace
+
+bool LoadLayout(std::vector<LayoutEntry>& out) {
+    out.clear();
+    if (storage::Open()) {
+        if (LayoutFromDb(out)) return true;
+        // 空表：如果有老的 layout.ini，导进来再备份掉
+        const std::wstring legacy = LegacyIniPath();
+        if (FileExists(legacy) && LoadLegacyIni(out)) {
+            SaveLayout(out);
+            BackupLegacy(legacy);
+            LogLine("layout: migrated layout.ini -> meow-desk.db");
+            return !out.empty();
+        }
+        return false;
+    }
+    LogLine(("layout: sqlite unavailable, fallback to ini. " + storage::LastError()).c_str());
+    return LoadLegacyIni(out);
+}
+
+bool SaveLayout(const std::vector<LayoutEntry>& in) {
+    if (!storage::Open()) return false;
+    if (!storage::Begin()) return false;
+
+    bool ok = storage::Exec("DELETE FROM icon_layout;");
+    if (ok) {
+        storage::Stmt st(
+            "INSERT OR REPLACE INTO icon_layout(path,owner,ord,x,y)"
+            " VALUES(?1,?2,?3,?4,?5)");
+        for (const auto& e : in) {
+            if (!st.ok()) {
+                ok = false;
+                break;
+            }
+            st.bindText(1, e.path);
+            st.bindInt(2, e.owner);
+            st.bindInt(3, e.order);
+            st.bindInt(4, e.pos.x);
+            st.bindInt(5, e.pos.y);
+            ok = st.done() && ok;
+            st.reset();
+        }
     }
 
-    const int an = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0,
-                                       nullptr, nullptr);
-    std::string utf8((size_t)an, '\0');
-    if (an > 0)
-        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &utf8[0], an, nullptr,
-                            nullptr);
-    const bool ok = fwrite(utf8.data(), 1, utf8.size(), f) == utf8.size();
-    fclose(f);
-    return ok;
+    if (ok) {
+        storage::Commit();
+        return true;
+    }
+    storage::Rollback();
+    LogLine(("layout: save failed. " + storage::LastError()).c_str());
+    return false;
 }
