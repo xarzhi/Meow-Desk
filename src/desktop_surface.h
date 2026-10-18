@@ -75,6 +75,31 @@ public:
     // exclude 里的图标不算占位。放不下即返回原值。
     POINT SnapToFreeCell(POINT wantCell, const std::vector<DesktopIconView*>& exclude) const;
 
+    // 同上，但显式指定网格锚点（anchor 必须是某个已知落在网格上的格子左上角）。
+    // 真实桌面的网格不从屏幕 (0,0) 起算，用绝对坐标取整会让图标落下时整体错位，
+    // 所以吸附一律相对锚点取整。
+    POINT SnapToFreeCellAt(POINT wantCell, POINT anchor,
+                           const std::vector<DesktopIconView*>& exclude) const;
+
+    // 离 nearPt 最近的桌面图标位置（没有桌面图标时退回 origin_）
+    POINT AutoGridAnchor(POINT nearPt) const;
+
+    // 把「想要的左上角」吸附到网格格子（不做占位判断）
+    POINT SnapCell(POINT want) const;
+
+    // 光标在 (x,y) 松手时图标会落到哪个格子（用于落点预览和盒子 → 桌面的落位）
+    POINT CellForCursor(POINT cursor, const IconBitmap* icon) const;
+
+    // 桌面内拖放的落位：目标格空就直接用；被别的图标占了就和它交换
+    // （资源管理器也是这个行为）。否则桌面排满时环形搜索会把图标甩到很远，
+    // 观感就是「松手后图标跑掉了」。被挪走的图标通过 swapped 返回，调用方要写回位置。
+    POINT ResolveDropCell(POINT wantCell, DesktopIconView* mover,
+                          const std::vector<DesktopIconView*>& exclude,
+                          std::vector<DesktopIconView*>* swapped) const;
+
+    // 落点预览：在「松手会落到的格子」画一个半透明圆角框。on=false 隐藏。
+    void SetDropPreview(bool on, POINT cellTopLeft = POINT{0, 0});
+
     // 拖到外部（盒子）时询问是否接收；返回 true 表示这批图标被拿走
     std::function<bool(const std::vector<DesktopIconView*>&, POINT screenPt)> onDrop;
     // 拖动中判断光标是否落在外部目标（盒子）上：是则图标跟手走，不再吸附格子
@@ -117,6 +142,9 @@ private:
     // 桌面空白处的点击也要能收到：per-pixel alpha 分层窗口里 alpha==0 的像素
     // 会让鼠标消息穿透，所以把整层的 alpha 抬到 1（视觉上不可见）
     void MakeHitTestable();
+    // 落点预览框（两条渲染路径各一份）
+    void DrawPreviewLayered();
+    void DrawPreviewGdi(HDC hdc);
     void Dirty(const RECT& r);
     void FlushDirty();
     bool EnsureSolidDib();
@@ -152,6 +180,8 @@ private:
     bool moved_ = false;
     bool dragLayerShown_ = false;   // 拖拽浮层已经开始接管这批图标
     bool marqueeAdditive_ = false;
+    bool previewOn_ = false;        // 落点预览框是否显示
+    POINT previewCell_{0, 0};       // 预览格子左上角（屏幕坐标）
     std::vector<DesktopIconView*> dragSet_;
     std::vector<POINT> dragStartPos_;
     POINT pressScreen_{0, 0};

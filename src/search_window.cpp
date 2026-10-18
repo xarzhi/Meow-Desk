@@ -14,6 +14,7 @@
 #include <gdiplus.h>
 
 #include "icon_render.h"
+#include "pinyin.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "dwmapi.lib")
@@ -92,40 +93,8 @@ std::wstring Lower(std::wstring s) {
     return s;
 }
 
-// 汉字 → 拼音首字母。GB2312 一级汉字（16~55 区）本身就是按拼音排序的，
-// 用区位码落在哪一段就能反推首字母，不需要几万字的拼音表。
-// 边界值 = 各组第一个字的区位码（啊 芭 擦 搭 蛾 发 噶 哈 击 喀 垃 妈 拿 哦 啪 期
-// 然 撒 塌 挖 昔 压 匝），末尾 5587 = 一级汉字「做」之后。
-wchar_t PinyinInitial(wchar_t ch) {
-    if (ch < 0x80) return (wchar_t)towlower(ch);
-    char gbk[4]{};
-    if (WideCharToMultiByte(936, 0, &ch, 1, gbk, 3, nullptr, nullptr) != 2) return 0;
-    const unsigned char h = (unsigned char)gbk[0], l = (unsigned char)gbk[1];
-    if (h < 0xA1 || l < 0xA1) return 0;
-    const int code = (h - 0xA0) * 100 + (l - 0xA0);  // 区位码
-    if (code < 1601 || code >= 5587) return 0;       // 一级汉字之外（生僻字/二级字）不参与
-    static const int kBound[] = {1601, 1637, 1833, 2078, 2274, 2302, 2433, 2594, 2787, 3106,
-                                 3212, 3472, 3635, 3722, 3730, 3858, 4027, 4086, 4390, 4558,
-                                 4684, 4925, 5249, 5587};
-    static const wchar_t kPy[] = L"abcdefghjklmnopqrstwxyz";
-    for (int i = 0; i < 23; ++i)
-        if (code >= kBound[i] && code < kBound[i + 1]) return kPy[i];
-    return 0;
-}
-
-// 「网易云音乐」→ "wyyyy"；非汉字原样小写。用来支持拼音首字母搜索。
-std::wstring PinyinInitials(const std::wstring& name) {
-    std::wstring out;
-    out.reserve(name.size());
-    for (wchar_t c : name) {
-        const wchar_t p = PinyinInitial(c);
-        if (p) out.push_back(p);
-    }
-    return out;
-}
-
 // 去掉分隔符再比。搜狗/微软拼音在组合串里会插音节分隔符，比如输入 wyy 时
-// 的 GCS_COMPSTR 是 "w'y'y"，不剥掉就永远匹配不上 "wyyyl"。
+// 的 GCS_COMPSTR 是 "w'y'y"，不剥掉就永远匹配不上 "wy" 音。
 bool IsSeparator(wchar_t c) {
     return c == L'\'' || c == L' ' || c == L'-' || c == L'_' || c == L'.' || c == L'\t';
 }
@@ -308,7 +277,8 @@ void SearchWindow::Filter() {
     const std::wstring raw = Lower(std::wstring(buf) + imeComp_);
     const std::wstring q = StripSeparators(raw);
 
-    // 打分：名称前缀 3 > 拼音首字母前缀 2 > 其它命中 1，稳定排序保证同分按桌面顺序
+    // 打分：名称前缀 5 > 名称子串 4 > 拼音前缀 3 > 拼音子串 2，
+    // 稳定排序保证同分按桌面顺序
     std::vector<std::pair<DesktopIconView*, int>> scored;
     scored.reserve(all_->size());
     for (auto* e : *all_) {
@@ -319,24 +289,23 @@ void SearchWindow::Filter() {
         }
         const std::wstring nm = Lower(e->name);
         if (nm.rfind(raw, 0) == 0) {
-            scored.emplace_back(e, 3);   // 原样前缀（含空格，例如 "deep "）
+            scored.emplace_back(e, 5);   // 原样前缀（含空格，例如 "deep "）
             continue;
         }
         const std::wstring nc = StripSeparators(nm);
         if (nc.rfind(q, 0) == 0) {
-            scored.emplace_back(e, 3);   // 忽略空格/连字符的前缀
+            scored.emplace_back(e, 5);   // 忽略空格/连字符的前缀
             continue;
         }
-        if (nm.find(raw) != std::wstring::npos || nc.find(q) != std::wstring::npos) {
-            scored.emplace_back(e, 1);
+        if (q.size() >= 2 &&
+            (nm.find(raw) != std::wstring::npos || nc.find(q) != std::wstring::npos)) {
+            scored.emplace_back(e, 4);
             continue;
         }
-        // 拼音首字母：既能前缀（wyy → 网易云音乐），也能中间
-        const std::wstring py = PinyinInitials(e->name);
-        if (py.rfind(q, 0) == 0)
-            scored.emplace_back(e, 2);
-        else if (py.find(q) != std::wstring::npos)
-            scored.emplace_back(e, 1);
+        // 拼音：全拼（wangyi）、首字母（wyy）、混打（wyuny）都支持
+        const int pos = PinyinMatchPos(e->name, q);
+        if (pos == 0) scored.emplace_back(e, 3);
+        else if (pos > 0) scored.emplace_back(e, 2);
     }
     std::stable_sort(scored.begin(), scored.end(),
                      [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -347,6 +316,7 @@ void SearchWindow::Filter() {
 
     if (sel_ >= (int)hits_.size()) sel_ = (int)hits_.size() - 1;
     if (sel_ < 0) sel_ = 0;
+    if (onFiltered) onFiltered(hits_);
 }
 
 void SearchWindow::MoveSel(int delta) {

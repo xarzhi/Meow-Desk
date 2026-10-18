@@ -884,8 +884,10 @@ bool SettingsWindow::Create(HWND owner) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
 
+    // WS_MINIMIZEBOX：标题栏要有最小化按钮。少了它 Win11 只画「关闭」一个按钮。
+    const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     RECT wr{0, 0, kClientW, kClientH};
-    AdjustWindowRectEx(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_APPWINDOW);
+    AdjustWindowRectEx(&wr, kStyle, FALSE, WS_EX_APPWINDOW);
     const int w = wr.right - wr.left;
     const int h = wr.bottom - wr.top;
 
@@ -893,7 +895,7 @@ bool SettingsWindow::Create(HWND owner) {
     int sy = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
 
     hwnd_ = CreateWindowExW(WS_EX_APPWINDOW, kClass, L"meow-desk \u8bbe\u7f6e",
-                            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                            kStyle,
                             sx, sy, w, h, owner, nullptr, inst, this);
     if (!hwnd_) return false;
 

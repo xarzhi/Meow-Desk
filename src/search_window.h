@@ -35,6 +35,8 @@ public:
 
     // 打开某个图标
     std::function<void(DesktopIconView*)> onOpen;
+    // 过滤结果变化（调试/自测用：把命中的名字 dump 出来）
+    std::function<void(const std::vector<DesktopIconView*>&)> onFiltered;
 
 private:
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);

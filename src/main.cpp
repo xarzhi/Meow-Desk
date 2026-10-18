@@ -16,6 +16,7 @@
 #include "desktop_surface.h"
 #include "drag_layer.h"
 #include "fence_window.h"
+#include "layout_store.h"
 #include "search_window.h"
 #include "settings_window.h"
 #include "shell_icons.h"
@@ -28,8 +29,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "shell32.lib")
@@ -88,7 +91,7 @@ static void DumpIconPositions() {
     if (!f) return;
     for (auto* e : g_icons) {
         if (!e) continue;
-        fwprintf(f, L"%s\t%ld\t%ld\n", e->name.c_str(), e->pos.x, e->pos.y);
+        fwprintf(f, L"%s\t%ld\t%ld\t%d\n", e->name.c_str(), e->pos.x, e->pos.y, e->owner);
     }
     fclose(f);
 }
@@ -183,17 +186,99 @@ static void InsertIntoFence(DesktopIconView* e, int fi, int vis) {
     g_icons.insert(anchor, e);
 }
 
+// ---------------------------------------------------------------------------
+// 布局持久化
+//
+// owner（图标属于哪个盒子）以前只活在内存里，重启后盒子里空空如也。
+// 这里把「归属 + 盒内顺序 + 桌面坐标」写进 %APPDATA%\meow-desk\layout.ini，
+// 启动时按 path（解析名，唯一且稳定）还原。
+// ---------------------------------------------------------------------------
+static void SaveIconLayout();
+
 // 把图标放回桌面：吸附到离光标最近的空闲格子，绝不和已有图标重叠
 static void PlaceOnDesktop(DesktopIconView* e, POINT dropPt,
                            const std::vector<DesktopIconView*>& pending) {
     if (!e) return;
-    POINT want{dropPt.x - g_cellW / 2, dropPt.y - g_cellH / 2};
-    e->pos = g_surface.SnapToFreeCell(want, pending);
+    (void)pending;   // 目前只有「盒子 → 桌面」的单图标路径，保留参数给将来的多选拖出
+    // 拖拽浮层是把图标中心钉在光标上的（gh.x = pt.x - w/2, gh.y = pt.y - h/2），
+    // 落位必须用同一套几何关系，否则松手瞬间图标会「跳」一下，看起来就是落点不准。
+    e->pos = g_surface.CellForCursor(dropPt, e->bmp.valid() ? &e->bmp : nullptr);
     e->dragPos = e->pos;
     e->owner = -1;
     e->selected = false;
     std::vector<DesktopIconView*> one{e};
     CommitPositions(one);
+    SaveIconLayout();
+}
+
+// 把当前「归属 + 盒内顺序 + 桌面坐标」整份写盘
+static void SaveIconLayout() {
+    if (g_icons.empty()) return;
+    std::vector<LayoutEntry> out;
+    out.reserve(g_icons.size());
+    std::vector<int> nextOrder(g_fences.size() + 1, 0);
+    for (auto* e : g_icons) {
+        if (!e) continue;
+        LayoutEntry le;
+        le.path = e->path;
+        le.owner = (e->owner >= 0 && e->owner < (int)g_fences.size()) ? e->owner : -1;
+        if (le.owner >= 0) le.order = nextOrder[le.owner]++;
+        le.pos = e->pos;
+        out.push_back(std::move(le));
+    }
+    if (!SaveLayout(out))
+        LogStep("SaveLayout FAILED (" + std::to_string(out.size()) + " entries)");
+    DumpIconPositions();   // 顺带刷新调试快照
+}
+
+// 启动时按 path 还原归属和位置。必须在盒子创建之后调用（要校验盒号）。
+static void ApplyIconLayout() {
+    std::vector<LayoutEntry> saved;
+    if (!LoadLayout(saved) || saved.empty()) {
+        LogStep("layout: none");
+        return;
+    }
+    std::unordered_map<std::wstring, const LayoutEntry*> byPath;
+    byPath.reserve(saved.size() * 2);
+    for (const auto& le : saved) byPath.emplace(le.path, &le);
+
+    int toFence = 0, onDesk = 0;
+    std::unordered_map<DesktopIconView*, int> orderOf;
+    for (auto* e : g_icons) {
+        if (!e) continue;
+        auto it = byPath.find(e->path);
+        if (it == byPath.end()) continue;
+        const LayoutEntry* le = it->second;
+        if (le->owner >= 0 && le->owner < (int)g_fences.size()) {
+            e->owner = le->owner;
+            orderOf[e] = le->order;
+            ++toFence;
+        } else {
+            e->owner = -1;
+            // (0,0) 视为「没记录过位置」，保留枚举出来的原始坐标
+            if (le->pos.x != 0 || le->pos.y != 0) {
+                e->pos = le->pos;
+                e->dragPos = le->pos;
+            }
+            ++onDesk;
+        }
+    }
+
+    // 盒内图标的显示顺序 = g_icons 里过滤 owner 后的相对顺序，所以按
+    // (是否在盒内, 盒号, 盒内序号) 重排即可；桌面图标保持原有相对顺序。
+    auto key = [&orderOf](DesktopIconView* p) {
+        if (!p || p->owner < 0) return std::pair<int, int>{0, 0};
+        auto it = orderOf.find(p);
+        return std::pair<int, int>{1 + p->owner,
+                                   it == orderOf.end() ? (std::numeric_limits<int>::max)()
+                                                       : it->second};
+    };
+    std::stable_sort(g_icons.begin(), g_icons.end(),
+                     [&key](DesktopIconView* x, DesktopIconView* y) { return key(x) < key(y); });
+
+    LogStep("layout: " + std::to_string(toFence) + " in fences, " + std::to_string(onDesk) +
+            " on desktop");
+    DumpIconPositions();   // 还原后要刷新调试快照，否则外部看到的是还原前的坐标
 }
 
 // 盒子里第 idx 个可见图标（skip 用来跳过正在被拖的那个）
@@ -311,6 +396,12 @@ static void ApplySettings() {
 
     g_surface.SetTextShadow(g_config.textShadow != 0);
     g_surface.SetShowLabels(g_config.showLabels != 0);
+    {
+        const int textH = std::max(14, g_cellH - (DesktopSurface::kIconTopPad + kIconPx +
+                                                  DesktopSurface::kTextGap));
+        g_drag.SetLabelLayout(std::max(40, g_cellW - 10), textH, g_config.textShadow != 0,
+                              g_config.showLabels != 0);
+    }
     for (auto& f : g_fences) if (f) f->ApplyConfig(recapture);
 }
 
@@ -337,6 +428,17 @@ static void SetDesktopIconsShown(bool shown) {
 // ---------------------------------------------------------------------------
 static void Cleanup() {
     UnregisterHotKey(nullptr, kHotkeyId);
+
+    // 退出前收尾：布局写盘 + 把桌面图标的最终坐标同步回资源管理器，
+    // 否则我们隐藏了真实图标又摆在自己的位置，一退出图标会整体跳一下。
+    SaveIconLayout();
+    {
+        std::vector<DesktopIconView*> desk;
+        for (auto* e : g_icons)
+            if (e && e->OnDesktop()) desk.push_back(e);
+        if (!desk.empty()) CommitPositions(desk);
+    }
+
     g_tray.Destroy();
     g_search.Destroy();
     g_settings.Destroy();
@@ -419,6 +521,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     // 4. 拖拽浮层（最先创建，层级最后摆）
     g_drag.Create();
+    {
+        // 浮层里图标下方也要显示名称：排版盒子和桌面标签保持一致
+        const int iconSide = kIconPx;
+        const int textH = std::max(14, g_cellH - (DesktopSurface::kIconTopPad + iconSide +
+                                                  DesktopSurface::kTextGap));
+        g_drag.SetLabelLayout(std::max(40, g_cellW - 10), textH, g_config.textShadow != 0,
+                              g_config.showLabels != 0);
+    }
 
     // 5. 桌面层
     g_surface.SetIcons(&g_icons);
@@ -448,10 +558,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             InsertIntoFence(e, fi, h.active() ? h.insert + k : -1);
             ++k;
         }
+        SaveIconLayout();
         RedrawAll();
         return true;
     };
-    g_surface.onMoved = [](const std::vector<DesktopIconView*>& list) { CommitPositions(list); };
+    g_surface.onMoved = [](const std::vector<DesktopIconView*>& list) {
+        CommitPositions(list);
+        SaveIconLayout();
+    };
     g_surface.onDragUpdate = [](const std::vector<DesktopIconView*>& list) {
         std::vector<DragGhost> ghosts;
         ghosts.reserve(list.size());
@@ -461,6 +575,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             gh.bmp = &e->bmp;
             gh.x = e->dragPos.x + (g_cellW - e->bmp.width) / 2;
             gh.y = e->dragPos.y + DesktopSurface::kIconTopPad;
+            gh.name = &e->name;
             ghosts.push_back(gh);
         }
         g_drag.Show(ghosts);
@@ -496,11 +611,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         f->onItemDragStart = [](DesktopIconView* e, POINT pt) {
             g_draggingIcon = e;
             ClearAllDropHints();
+            g_surface.SetDropPreview(false);
             std::vector<DragGhost> ghosts;
             DragGhost gh;
             gh.bmp = &e->bmp;
             gh.x = pt.x - e->bmp.width / 2;
             gh.y = pt.y - e->bmp.height / 2;
+            gh.name = &e->name;
             ghosts.push_back(gh);
             g_drag.Show(ghosts);
             RestoreZOrder();
@@ -513,13 +630,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             gh.bmp = bm;
             gh.x = pt.x - bm->width / 2;
             gh.y = pt.y - bm->height / 2;
+            if (g_draggingIcon) gh.name = &g_draggingIcon->name;
             ghosts.push_back(gh);
             g_drag.Show(ghosts);
             UpdateAllDropHints(pt);
+            // 拖离所有盒子 → 在真实桌面上的落点画预览框
+            if (FenceIndexAt(pt) < 0)
+                g_surface.SetDropPreview(true, g_surface.CellForCursor(pt, bm));
+            else
+                g_surface.SetDropPreview(false);
         };
         f->onItemDrop = [](DesktopIconView* e, POINT pt) {
             g_drag.Hide();
             g_draggingIcon = nullptr;
+            g_surface.SetDropPreview(false);
 
             const int fi = FenceIndexAt(pt);
             FenceWindow::DropHint h;
@@ -535,6 +659,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 std::vector<DesktopIconView*> pending;
                 PlaceOnDesktop(e, pt, pending);   // 盒子 → 桌面
             }
+            SaveIconLayout();
             RedrawAll();
         };
 
@@ -558,6 +683,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
     LogStep("fences created: " + std::to_string(g_fences.size()));
 
+    // 盒子建好之后才能校验盒号 → 在这里还原上次的图标布局
+    ApplyIconLayout();
+    RedrawAll();   // 盒子创建时就已经画过一次（那时还是空的），还原后必须重画
+
     // 7. 设置窗口 + 托盘 + 搜索面板
     g_settings.Create(nullptr);
     g_settings.onChanged = [] { ApplySettings(); };
@@ -567,6 +696,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     g_search.SetIcons(&g_icons);
     g_search.onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
+    g_search.onFiltered = [](const std::vector<DesktopIconView*>& hits) {
+        // 自测用：把当前搜索命中写到 search.txt（前 8 条）
+        FILE* f = nullptr;
+        fopen_s(&f, "search.txt", "w, ccs=UTF-8");
+        if (!f) return;
+        fwprintf(f, L"%d\n", (int)hits.size());
+        for (size_t i = 0; i < hits.size() && i < 8; ++i)
+            fwprintf(f, L"%s\n", hits[i] ? hits[i]->name.c_str() : L"(null)");
+        fclose(f);
+    };
     if (!g_search.Create()) LogStep("search window create FAILED");
     if (!RegisterHotKey(nullptr, kHotkeyId, MOD_ALT, 'F'))
         LogStep("RegisterHotKey(Alt+F) FAILED");

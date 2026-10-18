@@ -24,6 +24,8 @@ add_executable(meow-desk WIN32
     src/tray.cpp
     src/settings_window.cpp
     src/search_window.cpp
+    src/pinyin.cpp
+    src/layout_store.cpp
 )
 
 target_include_directories(meow-desk PRIVATE

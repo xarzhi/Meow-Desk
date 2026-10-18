@@ -33,6 +33,68 @@ inline int SnapTo(int v, int step) {
     return (int)std::lround((double)v / (double)step) * step;
 }
 
+// 在预乘 alpha 的 32bpp 缓冲上填一个圆角矩形。radius 像素的四个圆角逐行收缩，
+// 收进量 = radius - sqrt(radius^2 - (radius-dy)^2)。
+void FillRoundRectAlpha(BYTE* dst, int dstW, int dstH, const RECT& r, int radius, int a,
+                        COLORREF color) {
+    if (!dst || a <= 0) return;
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    const int rw = (int)(r.right - r.left);
+    const int rh = (int)(r.bottom - r.top);
+    const int rad = std::max(0, std::min(radius, std::min(rw, rh) / 2));
+    for (int y = r.top; y < r.bottom; ++y) {
+        int inset = 0;
+        if (rad > 0) {
+            const int dy = std::min(y - r.top, (r.bottom - 1) - y);
+            if (dy < rad) {
+                const int t = rad - dy;
+                inset = rad - (int)std::lround(std::sqrt((double)(rad * rad - t * t)));
+            }
+        }
+        RECT line{r.left + inset, y, r.right - inset, y + 1};
+        FillRectAlpha(dst, dstW, dstH, line, a, color);
+    }
+}
+
+// 圆角矩形的「描边环」：只画外圈 th 像素，中间留空。
+// 不能先用高 alpha 填满整块再叠低 alpha —— 那会让中间也一样实，看着像实心色块。
+void StrokeRoundRectAlpha(BYTE* dst, int dstW, int dstH, const RECT& r, int radius, int th,
+                          int a, COLORREF color) {
+    if (!dst || a <= 0 || th <= 0) return;
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    const int rw = (int)(r.right - r.left);
+    const int rh = (int)(r.bottom - r.top);
+    const int rad = std::max(0, std::min(radius, std::min(rw, rh) / 2));
+
+    auto extent = [&](int y, int& left, int& right) {
+        int inset = 0;
+        if (rad > 0) {
+            const int dy = std::min(y - r.top, (r.bottom - 1) - y);
+            if (dy < rad) {
+                const int t = rad - dy;
+                inset = rad - (int)std::lround(std::sqrt((double)(rad * rad - t * t)));
+            }
+        }
+        left = r.left + inset;
+        right = r.right - inset;
+    };
+
+    for (int y = r.top; y < r.bottom; ++y) {
+        int L = 0, R = 0;
+        extent(y, L, R);
+        if (R <= L) continue;
+        if (y < r.top + th || y >= r.bottom - th || L + th >= R) {
+            RECT line{L, y, R, y + 1};   // 上/下边框整行，或太窄时整行
+            FillRectAlpha(dst, dstW, dstH, line, a, color);
+        } else {
+            RECT l1{L, y, L + th, y + 1};
+            RECT l2{R - th, y, R, y + 1};
+            FillRectAlpha(dst, dstW, dstH, l1, a, color);
+            FillRectAlpha(dst, dstW, dstH, l2, a, color);
+        }
+    }
+}
+
 RECT Normalize(POINT a, POINT b) {
     RECT r{};
     r.left = std::min(a.x, b.x);
@@ -255,8 +317,34 @@ void DesktopSurface::InvalidateCache() {
     Redraw();
 }
 
-POINT DesktopSurface::SnapToFreeCell(POINT want,
-                                    const std::vector<DesktopIconView*>& exclude) const {
+POINT DesktopSurface::AutoGridAnchor(POINT nearPt) const {
+    // 资源管理器的桌面图标网格有自己的左上留白，格子不是从屏幕 (0,0) 起算的，
+    // 直接对绝对坐标 round(x/cw)*cw 会让图标落下时整体偏掉半格甚至更多。
+    // 所以拿「离得最近的桌面图标当前位置」当锚点 —— 它一定在网格上。
+    // 注意参数不能叫 near / far：windef.h 里那两个是空宏，会把这行拆成 ".x"。
+    POINT best = origin_;
+    long long bestD = -1;
+    if (icons_) {
+        for (auto* o : *icons_) {
+            if (!o || !o->OnDesktop()) continue;
+            const long long dx = (long long)o->pos.x - (long long)nearPt.x;
+            const long long dy = (long long)o->pos.y - (long long)nearPt.y;
+            const long long d = dx * dx + dy * dy;
+            if (bestD < 0 || d < bestD) {
+                bestD = d;
+                best = o->pos;
+            }
+        }
+    }
+    return best;
+}
+
+POINT DesktopSurface::SnapToFreeCell(POINT want, const std::vector<DesktopIconView*>& exclude) const {
+    return SnapToFreeCellAt(want, AutoGridAnchor(want), exclude);
+}
+
+POINT DesktopSurface::SnapToFreeCellAt(POINT want, POINT anchor,
+                                       const std::vector<DesktopIconView*>& exclude) const {
     const int cw = cellW_ > 0 ? cellW_ : 75;
     const int ch = cellH_ > 0 ? cellH_ : 98;
     const int maxX = origin_.x + width_ - cw;
@@ -273,8 +361,9 @@ POINT DesktopSurface::SnapToFreeCell(POINT want,
         return v;
     };
 
-    const int baseX = clampX((int)std::lround((double)want.x / cw) * cw);
-    const int baseY = clampY((int)std::lround((double)want.y / ch) * ch);
+    // 相对锚点取整：落在网格上的锚点 + 整数个格子间距 → 仍在网格上
+    const int baseX = clampX(anchor.x + (int)std::lround((double)(want.x - anchor.x) / cw) * cw);
+    const int baseY = clampY(anchor.y + (int)std::lround((double)(want.y - anchor.y) / ch) * ch);
 
     auto freeAt = [&](int x, int y) {
         RECT a{x, y, x + cw, y + ch};
@@ -309,6 +398,80 @@ POINT DesktopSurface::SnapToFreeCell(POINT want,
         if (found) return POINT{bestX, bestY};
     }
     return POINT{baseX, baseY};
+}
+
+// 盒子里拖出来的图标没有「原来的桌面格子」，只能按光标位置反推：
+// 拖拽浮层是把图标中心钉在光标上的，所以格子左上角 = 光标 - (半格宽, 图标中心高)。
+POINT DesktopSurface::CellForCursor(POINT cursor, const IconBitmap* icon) const {
+    const int ih = (icon && icon->valid()) ? icon->height : iconPx_;
+    POINT want;
+    want.x = cursor.x - cellW_ / 2;
+    want.y = cursor.y - kIconTopPad - ih / 2;
+    return SnapToFreeCell(want, {});
+}
+
+// 「某个格子上站着谁」——只算桌面上、且不在 exclude 里的图标
+static DesktopIconView* IconAtCellOf(const std::vector<DesktopIconView*>* icons, int x, int y,
+                                     const std::vector<DesktopIconView*>& exclude) {
+    if (!icons) return nullptr;
+    for (auto* o : *icons) {
+        if (!o || !o->OnDesktop()) continue;
+        if (std::find(exclude.begin(), exclude.end(), o) != exclude.end()) continue;
+        if (o->pos.x == x && o->pos.y == y) return o;
+    }
+    return nullptr;
+}
+
+// 把「想要的左上角」吸附到网格上的格子（不做占位判断）
+POINT DesktopSurface::SnapCell(POINT want) const {
+    const int cw = cellW_ > 0 ? cellW_ : 75;
+    const int ch = cellH_ > 0 ? cellH_ : 98;
+    const POINT anchor = AutoGridAnchor(want);
+    const int maxX = origin_.x + width_ - cw;
+    const int maxY = origin_.y + height_ - ch;
+    int bx = anchor.x + (int)std::lround((double)(want.x - anchor.x) / cw) * cw;
+    int by = anchor.y + (int)std::lround((double)(want.y - anchor.y) / ch) * ch;
+    if (bx < origin_.x) bx = origin_.x;
+    if (bx > maxX && maxX >= origin_.x) bx = maxX;
+    if (by < origin_.y) by = origin_.y;
+    if (by > maxY && maxY >= origin_.y) by = maxY;
+    return POINT{bx, by};
+}
+
+POINT DesktopSurface::ResolveDropCell(POINT want, DesktopIconView* mover,
+                                      const std::vector<DesktopIconView*>& exclude,
+                                      std::vector<DesktopIconView*>* swapped) const {
+    const POINT cellPos = SnapCell(want);
+    DesktopIconView* occ = IconAtCellOf(icons_, cellPos.x, cellPos.y, exclude);
+    if (!occ || occ == mover) return cellPos;
+
+    // 和目标格上的图标交换：它回到 mover 原来的格子。
+    // 前提是那个格子还没被别的拖拽图标占掉（多选拖动时可能已经不空了）。
+    if (mover) {
+        const POINT old = mover->pos;
+        if (!(old.x == cellPos.x && old.y == cellPos.y)) {
+            std::vector<DesktopIconView*> ex2 = exclude;
+            ex2.push_back(mover);
+            if (!IconAtCellOf(icons_, old.x, old.y, ex2)) {
+                occ->pos = old;
+                occ->dragPos = old;
+                occ->selected = false;
+                if (swapped) swapped->push_back(occ);
+                return cellPos;
+            }
+        }
+    }
+    // 换不了就退回环形搜索（不会重叠，只是可能跳几格）
+    return SnapToFreeCellAt(want, AutoGridAnchor(want), exclude);
+}
+
+void DesktopSurface::SetDropPreview(bool on, POINT cellTopLeft) {
+    const bool same = on && previewOn_ && cellTopLeft.x == previewCell_.x &&
+                      cellTopLeft.y == previewCell_.y;
+    if (on == previewOn_ && (same || !on)) return;
+    previewOn_ = on;
+    if (on) previewCell_ = cellTopLeft;
+    Redraw();
 }
 
 RECT DesktopSurface::CellRect(const DesktopIconView* e) const {
@@ -400,6 +563,7 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         dragLayerShown_ = false;
         dragSet_.clear();
         dragStartPos_.clear();
+        previewOn_ = false;
 
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         DesktopIconView* hit = HitTest(pt);
@@ -465,6 +629,27 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 for (auto* e : dragSet_) InvalidateCell(e, e->dragPos);
                 FlushDirty();
             }
+
+            // 落点预览：单个图标拖动时实时把「松手会落到哪个格子」画出来。
+            // 拖到盒子上时盒子自己会画插入缝隙线，这里就不要抢戏。
+            if (moved_ && dragSet_.size() == 1) {
+                const bool over = overTarget && overTarget(curScreen_);
+                POINT cell{0, 0};
+                const bool show = !over;
+                // 用 SnapCell（而不是 SnapToFreeCell）：落点被占时是「交换」，
+                // 图标仍然落在光标下的格子，预览框也必须画在那个格子上。
+                if (show) cell = SnapCell(dragSet_[0]->dragPos);
+                if (show != previewOn_ ||
+                    (show && (cell.x != previewCell_.x || cell.y != previewCell_.y))) {
+                    previewOn_ = show;
+                    previewCell_ = cell;
+                    Redraw();   // 只在跨格子时发生，不是每帧
+                }
+            } else if (previewOn_) {
+                previewOn_ = false;
+                Redraw();
+            }
+
             if (onDragUpdate) onDragUpdate(dragSet_);
             if (onDragHover) onDragHover(curScreen_);
             return 0;
@@ -516,15 +701,20 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             if (moved_ && !dragSet_.empty()) {
-                // 松手才落位：吸附到最近的空闲格子，绝不和已有图标重叠
+                // 松手才落位：吸附到最近的格子。目标格被占就和占位图标交换，
+                // 绝不重叠，也不会因为桌面排满而把图标甩到很远。
                 std::vector<DesktopIconView*> pending = dragSet_;
+                std::vector<DesktopIconView*> swapped;
                 for (auto* e : dragSet_) {
                     pending.erase(std::remove(pending.begin(), pending.end(), e), pending.end());
-                    POINT cell = SnapToFreeCell(e->dragPos, pending);
+                    POINT cell = (dragSet_.size() == 1)
+                                     ? ResolveDropCell(e->dragPos, e, pending, &swapped)
+                                     : SnapToFreeCell(e->dragPos, pending);
                     e->pos = cell;
                     e->dragPos = cell;
                 }
                 if (onMoved) onMoved(dragSet_);
+                if (!swapped.empty() && onMoved) onMoved(swapped);   // 被交换走的也要写回
             } else {
                 for (auto* e : dragSet_) e->dragPos = e->pos;
             }
@@ -533,6 +723,7 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         dragStartPos_.clear();
         moved_ = false;
         dragLayerShown_ = false;
+        previewOn_ = false;
         mode_ = Mode::None;
         Redraw();
         return 0;
@@ -673,6 +864,8 @@ void DesktopSurface::PaintLayered() {
     }
     // 正在拖的图标交给拖拽浮层画（桌面层在所有盒子下面，不然会被盒子挡住）
 
+    if (previewOn_) DrawPreviewLayered();
+
     if (mode_ == Mode::Marquee) {
         RECT m = Normalize(marqueeA_, marqueeB_);
         FillRectAlpha(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, m, 46, RGB(0, 120, 215));
@@ -687,6 +880,20 @@ void DesktopSurface::PaintLayered() {
     }
 
     MakeHitTestable();
+}
+
+// 落点预览框：拖动时告诉用户「松手就放这里」。
+// 画两层圆角矩形 —— 外圈是描边色（盖满），内缩 2px 再填半透明底色，就是一个空心框。
+void DesktopSurface::DrawPreviewLayered() {
+    if (!bits_) return;
+    RECT r{previewCell_.x - origin_.x, previewCell_.y - origin_.y,
+           previewCell_.x - origin_.x + cellW_, previewCell_.y - origin_.y + cellH_};
+    InflateRect(&r, -2, -2);
+    if (r.right <= 0 || r.bottom <= 0 || r.left >= bufW_ || r.top >= bufH_) return;
+    auto* b = reinterpret_cast<BYTE*>(bits_);
+    const int rad = 8;
+    FillRoundRectAlpha(b, bufW_, bufH_, r, rad, 34, RGB(0, 120, 215));       // 淡淡的底
+    StrokeRoundRectAlpha(b, bufW_, bufH_, r, rad, 2, 190, RGB(0, 120, 215));  // 2px 边框
 }
 
 // per-pixel alpha 的分层窗口有个坑：alpha == 0 的像素不接收鼠标消息（点击直接穿透到
@@ -756,6 +963,8 @@ void DesktopSurface::PaintOpaque(HDC hdc) {
         }
     }
 
+    if (previewOn_) DrawPreviewGdi(hdc);
+
     if (mode_ == Mode::Marquee) {
         RECT m = Normalize(marqueeA_, marqueeB_);
         FillRectBlend(hdc, m, 46, RGB(0, 120, 215));
@@ -767,6 +976,23 @@ void DesktopSurface::PaintOpaque(HDC hdc) {
         };
         for (const auto& r : edge) FillRectBlend(hdc, r, 160, RGB(0, 120, 215));
     }
+}
+
+void DesktopSurface::DrawPreviewGdi(HDC hdc) {
+    if (!hdc) return;
+    RECT r{previewCell_.x - origin_.x, previewCell_.y - origin_.y,
+           previewCell_.x - origin_.x + cellW_, previewCell_.y - origin_.y + cellH_};
+    InflateRect(&r, -2, -2);
+    RECT edge[4] = {
+        {r.left, r.top, r.right, r.top + 2},
+        {r.left, r.bottom - 2, r.right, r.bottom},
+        {r.left, r.top, r.left + 2, r.bottom},
+        {r.right - 2, r.top, r.right, r.bottom},
+    };
+    RECT in = r;
+    InflateRect(&in, -2, -2);
+    FillRectBlend(hdc, in, 32, RGB(0, 120, 215));
+    for (const auto& e : edge) FillRectBlend(hdc, e, 165, RGB(0, 120, 215));
 }
 
 void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging) {
