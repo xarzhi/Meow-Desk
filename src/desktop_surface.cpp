@@ -605,6 +605,7 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         dragSet_.clear();
         dragStartPos_.clear();
         previewOn_ = false;
+        ForgetHover();   // 按下之后要么进拖拽、要么进框选，悬停底色都该收掉
 
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         DesktopIconView* hit = HitTest(pt);
@@ -715,8 +716,24 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+
+        // 空闲状态：跟踪悬停高亮。鼠标在同一格子里移动不会触发重画。
+        UpdateHover(POINT{origin_.x + pt.x, origin_.y + pt.y});
+        if (!mouseTracking_) {
+            TRACKMOUSEEVENT tme{};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = h;
+            mouseTracking_ = TrackMouseEvent(&tme) != FALSE;
+        }
         return 0;
     }
+
+    case WM_MOUSELEAVE:
+        // 光标离开了桌面层（比如移进了某个盒子或别的窗口）→ 收掉悬停底色
+        mouseTracking_ = false;
+        ClearHover();
+        return 0;
 
     case WM_LBUTTONUP: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -845,6 +862,15 @@ bool DesktopSurface::EnsureBackbuffer(int w, int h) {
 void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging) {
     int x = (dragging ? e->dragPos.x : e->pos.x) - origin_.x;
     int y = (dragging ? e->dragPos.y : e->pos.y) - origin_.y;
+
+    // 悬停：一层很淡的半透明底 + 更淡的描边（选中态另有一套，颜色更深还带实边，
+    // 两者一眼能分开）。拖动中的图标不画，否则跟着鼠标跑一块色斑。
+    if (e->hover && !e->selected && !dragging) {
+        RECT hf{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
+        auto* b = reinterpret_cast<BYTE*>(bits_);
+        FillRoundRectAlpha(b, bufW_, bufH_, hf, 8, 26, RGB(0, 120, 215));
+        StrokeRoundRectAlpha(b, bufW_, bufH_, hf, 8, 1, 72, RGB(0, 120, 215));
+    }
 
     // 选中高亮（填充 + 1px 边框）
     if (e->selected) {
@@ -1041,6 +1067,13 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging) {
     int x = (dragging ? e->dragPos.x : e->pos.x) - origin_.x;
     int y = (dragging ? e->dragPos.y : e->pos.y) - origin_.y;
 
+    // 悬停底：这里用方角，和本路径下面那套方角选中高亮保持一致
+    //（分层路径画的是圆角 + 描边，更精致，但那套要走 32bpp DIB）
+    if (e->hover && !e->selected && !dragging) {
+        RECT hf{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
+        FillRectBlend(hdc, hf, 26, RGB(0, 120, 215));
+    }
+
     if (e->selected) {
         RECT fill{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
         FillRectBlend(hdc, fill, 48, RGB(0, 120, 215));
@@ -1186,23 +1219,27 @@ bool DesktopSurface::Create() {
     return true;
 }
 
+void DesktopSurface::UploadLayered() {
+    if (!hwnd_ || !memDC_ || !bits_ || opaque_) return;
+    BLENDFUNCTION bf{};
+    bf.BlendOp = AC_SRC_OVER;
+    bf.SourceConstantAlpha = 255;
+    bf.AlphaFormat = AC_SRC_ALPHA;
+
+    HDC screen = GetDC(nullptr);
+    POINT dst{origin_.x, origin_.y};
+    SIZE size{width_, height_};
+    POINT src{0, 0};
+    UpdateLayeredWindow(hwnd_, screen, &dst, &size, memDC_, &src, 0, &bf, ULW_ALPHA);
+    ReleaseDC(nullptr, screen);
+}
+
 void DesktopSurface::Redraw() {
     if (!hwnd_) return;
     if (!opaque_) {
         if (!memDC_ || !bits_) return;
         PaintLayered();
-
-        BLENDFUNCTION bf{};
-        bf.BlendOp = AC_SRC_OVER;
-        bf.SourceConstantAlpha = 255;
-        bf.AlphaFormat = AC_SRC_ALPHA;
-
-        HDC screen = GetDC(nullptr);
-        POINT dst{origin_.x, origin_.y};
-        SIZE size{width_, height_};
-        POINT src{0, 0};
-        UpdateLayeredWindow(hwnd_, screen, &dst, &size, memDC_, &src, 0, &bf, ULW_ALPHA);
-        ReleaseDC(nullptr, screen);
+        UploadLayered();
         return;
     }
     // 不透明路径：全屏失效，WM_PAINT 里现画壁纸 + 图标
@@ -1211,7 +1248,132 @@ void DesktopSurface::Redraw() {
     UpdateWindow(hwnd_);
 }
 
+// 只重画一块区域：悬停变化只影响一两个格子，没必要把 200 个图标全合成一遍。
+// 分层窗口每次仍要整体上传一次（UpdateLayeredWindow 没有局部接口），
+// 但省掉了「清整屏 + 重画所有图标 + 整屏 alpha|=1」这三趟全屏遍历。
+void DesktopSurface::RepaintCells(const RECT& rect) {
+    if (!icons_) return;
+    // 注意：不透明路径没有 bits_（那是分层窗口的整屏缓冲），这条判断必须在下面
+    // 那个 opaque_ 分支之后 —— 否则不透明模式下悬停高亮永远不会重画。
+    if (opaque_) {   // 不透明路径有自己的脏矩形机制
+        Dirty(rect);
+        FlushDirty();
+        return;
+    }
+    if (!bits_) return;
+
+    RECT c = rect;
+    if (c.left < 0) c.left = 0;
+    if (c.top < 0) c.top = 0;
+    if (c.right > bufW_) c.right = bufW_;
+    if (c.bottom > bufH_) c.bottom = bufH_;
+    if (c.right <= c.left || c.bottom <= c.top) return;
+
+    // 关键：先把 rect 撑到「盖住所有与它相交的图标所在的整格」。
+    // 图标只能画在自己格子里，所以这样做之后重画的图标一定完整落在清空区域内。
+    // 不这么做的话：rect 带 2px 外扩会切到隔壁格子，隔壁图标被重画一次，
+    // 但它只有一小截被清空 → 那一截叠成双份颜色（实测隔壁图标会变色）。
+    // 用整格（不带 padding）判断相交，撑一次就收敛，不会连锁扩散。
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (auto* e : *icons_) {
+            if (!e || !e->OnDesktop()) continue;
+            const int ex = e->pos.x - origin_.x;
+            const int ey = e->pos.y - origin_.y;
+            if (ex + cellW_ <= c.left || ex >= c.right || ey + cellH_ <= c.top ||
+                ey >= c.bottom)
+                continue;
+            const int l = std::min<int>(c.left, ex);
+            const int t = std::min<int>(c.top, ey);
+            const int r = std::max<int>(c.right, ex + cellW_);
+            const int b = std::max<int>(c.bottom, ey + cellH_);
+            if (l != c.left || t != c.top || r != c.right || b != c.bottom) {
+                c = RECT{l, t, r, b};
+                grew = true;
+            }
+        }
+    }
+    if (c.left < 0) c.left = 0;
+    if (c.top < 0) c.top = 0;
+    if (c.right > bufW_) c.right = bufW_;
+    if (c.bottom > bufH_) c.bottom = bufH_;
+    if (c.right <= c.left || c.bottom <= c.top) return;
+
+    // 清成「可命中的透明」：alpha = 1，否则这块会变成鼠标穿透
+    auto* p = reinterpret_cast<uint32_t*>(bits_);
+    for (int y = c.top; y < c.bottom; ++y) {
+        uint32_t* row = p + (size_t)y * (size_t)bufW_;
+        for (int x = c.left; x < c.right; ++x) row[x] = 0x01000000u;
+    }
+
+    // 重画所有和这块区域相交的图标（可能不止一个：相邻格子的光晕会溢进来）
+    for (auto* e : *icons_) {
+        if (!e || !e->OnDesktop()) continue;
+        const int ex = e->pos.x - origin_.x;
+        const int ey = e->pos.y - origin_.y;
+        if (ex + cellW_ <= c.left || ex >= c.right || ey + cellH_ <= c.top ||
+            ey >= c.bottom)
+            continue;
+        DrawOneLayered(e, false);
+    }
+    UploadLayered();
+}
+
+// 光标压在哪个桌面图标上 → 给它画半透明底。
+// 只在「换了图标」时才重画，鼠标在同一格里移动不产生任何绘制。
+void DesktopSurface::UpdateHover(POINT screenPt) {
+    if (!icons_) return;
+    DesktopIconView* hit = nullptr;
+    for (auto* e : *icons_) {
+        if (!e || !e->OnDesktop()) continue;
+        if (screenPt.x >= e->pos.x && screenPt.x < e->pos.x + cellW_ &&
+            screenPt.y >= e->pos.y && screenPt.y < e->pos.y + cellH_) {
+            hit = e;
+            break;
+        }
+    }
+    if (hit == hover_) return;
+
+    // 旧格子 + 新格子一起重画（多留 2px 给圆角和光晕）
+    RECT u{};
+    bool has = false;
+    auto add = [&](DesktopIconView* e) {
+        if (!e) return;
+        RECT r{e->pos.x - origin_.x - 2, e->pos.y - origin_.y - 2,
+               e->pos.x - origin_.x + cellW_ + 2, e->pos.y - origin_.y + cellH_ + 2};
+        if (!has) {
+            u = r;
+            has = true;
+        } else {
+            u.left = std::min(u.left, r.left);
+            u.top = std::min(u.top, r.top);
+            u.right = std::max(u.right, r.right);
+            u.bottom = std::max(u.bottom, r.bottom);
+        }
+    };
+    add(hover_);
+    add(hit);
+
+    if (hover_) hover_->hover = false;
+    hover_ = hit;
+    if (hover_) hover_->hover = true;
+    if (has) RepaintCells(u);
+}
+
+void DesktopSurface::ClearHover() {
+    if (!hover_) return;
+    DesktopIconView* old = hover_;
+    hover_ = nullptr;
+    old->hover = false;
+    RECT r{old->pos.x - origin_.x - 2, old->pos.y - origin_.y - 2,
+           old->pos.x - origin_.x + cellW_ + 2, old->pos.y - origin_.y + cellH_ + 2};
+    RepaintCells(r);
+}
+
 void DesktopSurface::Destroy() {
+    // 悬停指针指向调用方持有的图标，Destroy 之后可能就被销毁了，这里必须清掉
+    hover_ = nullptr;
+    mouseTracking_ = false;
     if (hwnd_) {
         KillTimer(hwnd_, 1);
         DestroyWindow(hwnd_);

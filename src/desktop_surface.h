@@ -38,6 +38,7 @@ struct DesktopIconView {
     IconBitmap bmp;          // 图标位图（预乘 alpha）
     int owner = -1;          // -1 = 桌面；>=0 = 第几个盒子
     bool selected = false;   // 选中
+    bool hover = false;      // 鼠标悬停（画一层半透明底）
     void* pidl = nullptr;    // 资源管理器的 PIDL（写回位置用），由调用方持有
 
     bool OnDesktop() const { return owner < 0; }
@@ -67,6 +68,16 @@ public:
     bool Create();
     void Redraw();
     void Destroy();
+
+    // 图标列表要变动（对象析构 / 从 vector 里被移走）之前必须调一下：
+    // hover_ 只是个裸指针，图标一没它就成了悬垂指针，下次重画会踩野内存。
+    // 这里只丢指针不重画（调用方紧接着都会自己刷新），所以开销可以忽略。
+    void ForgetHover() {
+        if (hover_) {
+            hover_->hover = false;
+            hover_ = nullptr;
+        }
+    }
 
     HWND hwnd() const { return hwnd_; }
     bool dragging() const { return mode_ != Mode::None; }
@@ -127,6 +138,13 @@ private:
     DesktopIconView* HitTest(POINT clientPt) const;
     RECT CellRect(const DesktopIconView* e) const;
 
+    // 悬停：光标压到哪个图标上 → 给它画一层半透明底（和选中态区分开）
+    void UpdateHover(POINT screenPt);
+    void ClearHover();
+    // 只重画若干格子（分层窗口每次仍要整体上传，但不重画 200 个图标）
+    void RepaintCells(const RECT& r);
+    void UploadLayered();
+
     void ClearSelection();
     void SelectOnly(DesktopIconView* e);
     void ToggleSelection(DesktopIconView* e);
@@ -160,6 +178,9 @@ private:
     int iconPx_ = 48;
     bool textShadow_ = true;
     bool showLabels_ = true;
+
+    DesktopIconView* hover_ = nullptr;   // 当前悬停的桌面图标
+    bool mouseTracking_ = false;          // 已经注册了 TME_LEAVE
 
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;

@@ -28,6 +28,11 @@ const int kPadR = 34;       // 右侧：子菜单箭头
 const int kPadV = 5;        // 上下边距
 const int kShadow = 10;     // 阴影留白
 const int kRound = 8;       // 圆角
+// 阴影单圈 alpha 的基准：第 i 圈取 (kShadowAlpha - i)，越靠外越淡。
+// 注意这些圈是**叠加**的（同一像素会被多圈覆盖），所以单圈 alpha 必须压得很低：
+// 原来用 16-i（6..15），叠到卡片边缘接近 46% 的黑，看起来像一圈灰边；
+// 改成 11-i（3..10）叠完约 20%，柔和很多。
+const int kShadowAlpha = 11;
 // 定时检查「鼠标是不是已经跑到菜单外面并按下了键」，用来收菜单。
 // 只依赖 WM_ACTIVATE 不够：菜单窗口有时拿不到前台（没有真实用户输入时
 // SetForegroundWindow 会被系统拒绝），那就永远等不到失活。
@@ -163,7 +168,7 @@ void PopupMenu::Paint() {
 
         // 阴影：由外到内叠几层，越外越淡
         for (int i = kShadow; i >= 1; --i) {
-            const int a = std::max(3, 16 - i);
+            const int a = std::max(3, kShadowAlpha - i);
             GraphicsPath sp;
             AddRoundRect(sp, RectF(body.X - i * 0.45f, body.Y - i * 0.35f + 2.0f,
                                    body.Width + i * 0.9f, body.Height + i * 0.8f),

@@ -221,7 +221,10 @@ static void InsertIntoFence(DesktopIconView* e, int fi, int vis) {
     }
 
     auto it = std::find(g_icons.begin(), g_icons.end(), e);
-    if (it != g_icons.end()) g_icons.erase(it);
+    if (it != g_icons.end()) {
+        g_surface.ForgetHover();   // 悬停指针可能正指着 e，搬列表之前先丢掉
+        g_icons.erase(it);
+    }
     e->owner = fi;
     e->selected = false;
     e->dragPos = e->pos;
@@ -429,6 +432,7 @@ static void ReloadDesktopIcons() {
     for (size_t i = 0; i < g_icons.size();) {
         DesktopIconView* e = g_icons[i];
         if (std::find(seen.begin(), seen.end(), e) == seen.end()) {
+            g_surface.ForgetHover();   // 马上要析构 e，先丢掉可能指着它的悬停指针
             if (e && e->pidl) FreeDesktopPidl(e->pidl);
             auto it = std::find_if(g_iconStore.begin(), g_iconStore.end(),
                                    [&](const std::unique_ptr<DesktopIconView>& p) {
@@ -890,6 +894,8 @@ static void Cleanup() {
     g_fences.clear();
     g_surface.Destroy();
 
+    // 盒子/桌面层都已 Destroy，这里必须先把悬停指针丢掉再析构图标对象
+    g_surface.ForgetHover();
     for (auto* e : g_icons) {
         if (e && e->pidl) { FreeDesktopPidl(e->pidl); e->pidl = nullptr; }
     }
