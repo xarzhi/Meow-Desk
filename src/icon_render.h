@@ -77,8 +77,10 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// 桌面图标标签：白字 + 黑色柔和光晕，一次性合成成单张预乘 DIB
+// 图标标签：一次性合成成单张预乘 DIB（字形 + 可选柔和光晕）
 //   boxW/boxH 是文字的排版盒子；pad 是光晕外扩，贴图时左上角要偏移 -pad
+//   color 是文字颜色（桌面标签用白色，盒子内跟随卡片深浅色）
+//   maxLines 允许的行数（桌面 2 行，盒子内按格子高度定）
 // ---------------------------------------------------------------------------
 struct LabelDib {
     HDC dc = nullptr;
@@ -89,7 +91,8 @@ struct LabelDib {
     int pad = 0;
 
     // glow = 0 表示不要阴影
-    bool Build(const std::wstring& text, HFONT font, int boxW, int boxH, int glow);
+    bool Build(const std::wstring& text, HFONT font, int boxW, int boxH, int glow,
+               COLORREF color = RGB(255, 255, 255), int maxLines = 2);
     void Free();
     bool valid() const { return dc && bits && w > 0 && h > 0; }
 

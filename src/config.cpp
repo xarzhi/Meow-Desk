@@ -91,6 +91,9 @@ void AppConfig::Load() {
         if (!inFence) {
             if (k == L"textShadow") textShadow = ToInt(v, 1);
             else if (k == L"shortcutArrow") shortcutArrow = ToInt(v, 1);
+            else if (k == L"showLabels") showLabels = ToInt(v, 1);
+            else if (k == L"headerHeight") headerHeight = ToInt(v, 44);
+            else if (k == L"autoExpandOnHover") autoExpandOnHover = ToInt(v, 0);
             continue;
         }
         if (k == L"x") cur.x = ToInt(v, 100);
@@ -114,6 +117,9 @@ void AppConfig::Save() const {
     fwprintf(f, L"# meow-desk config\n");
     fwprintf(f, L"textShadow=%d\n", textShadow);
     fwprintf(f, L"shortcutArrow=%d\n", shortcutArrow);
+    fwprintf(f, L"showLabels=%d\n", showLabels);
+    fwprintf(f, L"headerHeight=%d\n", headerHeight);
+    fwprintf(f, L"autoExpandOnHover=%d\n", autoExpandOnHover);
     for (size_t i = 0; i < fences.size(); ++i) {
         const FenceConfig& c = fences[i];
         fwprintf(f, L"\n[fence%u]\n", (unsigned)i);

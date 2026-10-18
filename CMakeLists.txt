@@ -23,6 +23,7 @@ add_executable(meow-desk WIN32
     src/zorder.cpp
     src/tray.cpp
     src/settings_window.cpp
+    src/search_window.cpp
 )
 
 target_include_directories(meow-desk PRIVATE
@@ -34,7 +35,7 @@ set_property(TARGET meow-desk PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 target_link_libraries(meow-desk PRIVATE
-    gdiplus user32 gdi32 shell32 ole32 shlwapi dwmapi comctl32 msimg32 uxtheme
+    gdiplus user32 gdi32 shell32 ole32 shlwapi dwmapi comctl32 msimg32 uxtheme imm32
 )
 
 target_compile_definitions(meow-desk PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)

@@ -5,6 +5,9 @@
 
 #include <objidl.h>
 #include <ole2.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -53,6 +56,118 @@ void LogSurface(const char* fmt, ...) {
     va_end(ap);
     fputc('\n', f);
     fclose(f);
+}
+
+bool TraceOn() {
+    static int on = -1;
+    if (on < 0) on = GetEnvironmentVariableW(L"MEOW_TRACE", nullptr, 0) > 0 ? 1 : 0;
+    return on == 1;
+}
+
+// ---------------------------------------------------------------------------
+// 桌面右键菜单：因为整层桌面都被我们接管了（不接管就没法框选），
+// 原生桌面的右键菜单不会再出现，这里把资源管理器的原生 IContextMenu 接回来——
+// 「查看 / 排序方式 / 刷新 / 新建 / 显示设置 / 个性化」全是系统提供的真菜单。
+// ---------------------------------------------------------------------------
+
+// 菜单弹出期间，带图标的项是自绘的：WM_MEASUREITEM / WM_DRAWITEM /
+// WM_INITMENUPOPUP 必须转给 IContextMenu2，否则这些项会变成 0 高度看不见
+// （现象：只剩「创建快捷方式 / 删除 / 属性」三项）。
+IContextMenu2* g_menuOwner = nullptr;
+
+// 估算弹出菜单的像素高度。系统自带的翻转逻辑在「菜单比两个方向都高」时会直接裁掉
+// 下半部分（现象：屏幕底部的图标右键只显示 3 项），所以先自己把锚点挪进来。
+int EstimateMenuHeight(HMENU menu) {
+    const int n = GetMenuItemCount(menu);
+    if (n <= 0) return 0;
+    const int itemH = GetSystemMetrics(SM_CYMENUCHECK) + 2;  // 单行项高度
+    const int sepH = GetSystemMetrics(SM_CYMENUCHECK) / 2 + 2;
+    int h = 0;
+    for (int i = 0; i < n; ++i) {
+        wchar_t txt[2]{};
+        GetMenuStringW(menu, i, txt, 1, MF_BYPOSITION);
+        const UINT st = GetMenuState(menu, i, MF_BYPOSITION);
+        h += (st == 0xFFFFFFFFu || (txt[0] == 0 && st & MF_SEPARATOR)) ? sepH : itemH;
+    }
+    return h + GetSystemMetrics(SM_CYEDGE) * 2 + 4;
+}
+
+void InvokeShellMenu(HWND hwnd, IContextMenu* cm, HMENU menu, POINT pt) {
+    IContextMenu2* cm2 = nullptr;
+    cm->QueryInterface(IID_IContextMenu2, (void**)&cm2);
+    g_menuOwner = cm2;
+
+    // 把锚点钳制到「整张菜单都放得下」的位置
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi)) {
+        const int mh = EstimateMenuHeight(menu);
+        if (mh > 0) {
+            const int maxY = mi.rcWork.bottom - mh;
+            if (pt.y > maxY) pt.y = maxY;
+            if (pt.y < mi.rcWork.top) pt.y = mi.rcWork.top;
+        }
+    }
+
+    const int cmd = TrackPopupMenuEx(
+        menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, hwnd,
+        nullptr);
+
+    g_menuOwner = nullptr;
+    if (cm2) cm2->Release();
+    if (cmd <= 0) return;
+
+    CMINVOKECOMMANDINFOEX info{};
+    info.cbSize = sizeof(info);
+    info.hwnd = hwnd;
+    info.lpVerb = MAKEINTRESOURCEA(cmd - 1);
+    info.lpVerbW = MAKEINTRESOURCEW(cmd - 1);
+    info.nShow = SW_SHOWNORMAL;
+    info.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
+    info.ptInvoke = pt;
+    cm->InvokeCommand(reinterpret_cast<LPCMINVOKECOMMANDINFO>(&info));
+}
+
+// 桌面空白处
+void ShowBackgroundMenu(HWND hwnd, POINT pt) {
+    IShellFolder* desktop = nullptr;
+    if (FAILED(SHGetDesktopFolder(&desktop)) || !desktop) return;
+    IContextMenu* cm = nullptr;
+    const HRESULT hr = desktop->CreateViewObject(hwnd, IID_IContextMenu, (void**)&cm);
+    desktop->Release();
+    if (FAILED(hr) || !cm) return;
+
+    HMENU menu = CreatePopupMenu();
+    if (menu && SUCCEEDED(cm->QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL)))
+        InvokeShellMenu(hwnd, cm, menu, pt);
+    if (menu) DestroyMenu(menu);
+    cm->Release();
+}
+
+// 某个图标（文件/文件夹/快捷方式）
+void ShowItemMenu(HWND hwnd, const std::wstring& path, POINT pt) {
+    if (path.empty()) return;
+    // 走 IShellItem → BHID_SFUIObject：比 SHBindToParent + GetUIObjectOf 更稳，
+    // 拿到的菜单和资源管理器里右键一个文件完全一致（打开/打开方式/发送到/剪切/复制…）
+    if (TraceOn()) LogSurface("ctx item path=%ls", path.c_str());
+    IShellItem* item = nullptr;
+    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_IShellItem,
+                                          (void**)&item)) ||
+        !item)
+        return;
+    IContextMenu* cm = nullptr;
+    item->BindToHandler(nullptr, BHID_SFUIObject, IID_IContextMenu, (void**)&cm);
+    item->Release();
+    if (!cm) return;
+
+    HMENU menu = CreatePopupMenu();
+    HRESULT hrq = E_FAIL;
+    if (menu) hrq = cm->QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL | CMF_EXPLORE);
+    if (TraceOn()) LogSurface("item menu hr=0x%08lX count=%d", (unsigned long)hrq,
+                              menu ? GetMenuItemCount(menu) : -1);
+    if (menu && SUCCEEDED(hrq)) InvokeShellMenu(hwnd, cm, menu, pt);
+    if (menu) DestroyMenu(menu);
+    cm->Release();
 }
 
 }  // namespace
@@ -125,9 +240,75 @@ void DesktopSurface::SetTextShadow(bool on) {
     Redraw();
 }
 
+void DesktopSurface::SetShowLabels(bool on) {
+    if (showLabels_ == on) return;
+    showLabels_ = on;
+    if (impl_) {
+        impl_->labels.clear();
+        impl_->labelKeys.clear();
+    }
+    Redraw();
+}
+
 void DesktopSurface::InvalidateCache() {
     if (impl_) impl_->Clear();
     Redraw();
+}
+
+POINT DesktopSurface::SnapToFreeCell(POINT want,
+                                    const std::vector<DesktopIconView*>& exclude) const {
+    const int cw = cellW_ > 0 ? cellW_ : 75;
+    const int ch = cellH_ > 0 ? cellH_ : 98;
+    const int maxX = origin_.x + width_ - cw;
+    const int maxY = origin_.y + height_ - ch;
+
+    auto clampX = [&](int v) {
+        if (v < origin_.x) v = origin_.x;
+        if (v > maxX && maxX >= origin_.x) v = maxX;
+        return v;
+    };
+    auto clampY = [&](int v) {
+        if (v < origin_.y) v = origin_.y;
+        if (v > maxY && maxY >= origin_.y) v = maxY;
+        return v;
+    };
+
+    const int baseX = clampX((int)std::lround((double)want.x / cw) * cw);
+    const int baseY = clampY((int)std::lround((double)want.y / ch) * ch);
+
+    auto freeAt = [&](int x, int y) {
+        RECT a{x, y, x + cw, y + ch};
+        if (!icons_) return true;
+        for (auto* o : *icons_) {
+            if (!o || !o->OnDesktop()) continue;
+            if (std::find(exclude.begin(), exclude.end(), o) != exclude.end()) continue;
+            RECT b{o->pos.x, o->pos.y, o->pos.x + cw, o->pos.y + ch};
+            if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom)
+                return false;
+        }
+        return true;
+    };
+
+    if (freeAt(baseX, baseY)) return POINT{baseX, baseY};
+
+    // 由近及远逐环搜索最近的空闲格子
+    for (int ring = 1; ring <= 32; ++ring) {
+        int bestX = 0, bestY = 0, bestD = 0x7fffffff;
+        bool found = false;
+        for (int dy = -ring; dy <= ring; ++dy) {
+            for (int dx = -ring; dx <= ring; ++dx) {
+                if (std::max(std::abs(dx), std::abs(dy)) != ring) continue;
+                const int x = clampX(baseX + dx * cw);
+                const int y = clampY(baseY + dy * ch);
+                if (x == baseX && y == baseY) continue;
+                if (!freeAt(x, y)) continue;
+                const int d = dx * dx + dy * dy;
+                if (d < bestD) { bestD = d; bestX = x; bestY = y; found = true; }
+            }
+        }
+        if (found) return POINT{bestX, bestY};
+    }
+    return POINT{baseX, baseY};
 }
 
 RECT DesktopSurface::CellRect(const DesktopIconView* e) const {
@@ -216,6 +397,7 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         pressScreen_ = POINT{origin_.x + pt.x, origin_.y + pt.y};
         curScreen_ = pressScreen_;
         moved_ = false;
+        dragLayerShown_ = false;
         dragSet_.clear();
         dragStartPos_.clear();
 
@@ -245,6 +427,10 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             marqueeA_ = marqueeB_ = pt;
         }
         SetCapture(h);
+        if (TraceOn()) {
+            LogSurface("LBUTTONDOWN pt=%ld,%ld hit=%d mode=%d sel=%zu", (long)pt.x, (long)pt.y,
+                       hit ? 1 : 0, (int)mode_, dragSet_.size());
+        }
         Redraw();
         return 0;
     }
@@ -259,21 +445,28 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             int rawDy = curScreen_.y - pressScreen_.y;
             if (std::abs(rawDx) > 3 || std::abs(rawDy) > 3) moved_ = true;
 
-            bool over = overTarget && overTarget(curScreen_);
-            int dx = over ? rawDx : SnapTo(rawDx, cellW_);
-            int dy = over ? rawDy : SnapTo(rawDy, cellH_);
-
-            if (!opaque_) Redraw();               // 分层路径要整屏重合成
-            else for (auto* e : dragSet_) InvalidateCell(e, e->dragPos);  // 擦掉旧位置
+            // 图标严格跟着鼠标走，不再吸附格子（吸附会让图标在目标格子之间跳）
+            if (!opaque_) {
+                // 进入拖拽的那一帧把图标从桌面层擦掉，之后桌面层内容不再变化，
+                // 跟手全交给拖拽浮层 → 拖动过程零重合成，一点都不卡
+                if (moved_ && !dragLayerShown_) {
+                    dragLayerShown_ = true;
+                    Redraw();
+                }
+            } else {
+                for (auto* e : dragSet_) InvalidateCell(e, e->dragPos);  // 擦掉旧位置
+            }
 
             for (size_t i = 0; i < dragSet_.size(); ++i) {
-                dragSet_[i]->dragPos = POINT{dragStartPos_[i].x + dx, dragStartPos_[i].y + dy};
+                dragSet_[i]->dragPos = POINT{dragStartPos_[i].x + rawDx,
+                                             dragStartPos_[i].y + rawDy};
             }
             if (opaque_) {
                 for (auto* e : dragSet_) InvalidateCell(e, e->dragPos);
                 FlushDirty();
             }
             if (onDragUpdate) onDragUpdate(dragSet_);
+            if (onDragHover) onDragHover(curScreen_);
             return 0;
         }
 
@@ -307,18 +500,30 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
         if (mode_ == Mode::Move) {
             bool over = overTarget && overTarget(curScreen_);
+            if (TraceOn()) {
+                LogSurface("LBUTTONUP pt=%ld,%ld over=%d moved=%d n=%zu", (long)curScreen_.x,
+                           (long)curScreen_.y, over ? 1 : 0, moved_ ? 1 : 0, dragSet_.size());
+            }
             if (over && onDrop && !dragSet_.empty()) {
                 if (onDrop(dragSet_, curScreen_)) {
                     for (auto* e : dragSet_) e->selected = false;
                     dragSet_.clear();
                     moved_ = false;
+                    dragLayerShown_ = false;
                     mode_ = Mode::None;
                     Redraw();
                     return 0;
                 }
             }
             if (moved_ && !dragSet_.empty()) {
-                for (auto* e : dragSet_) e->pos = e->dragPos;
+                // 松手才落位：吸附到最近的空闲格子，绝不和已有图标重叠
+                std::vector<DesktopIconView*> pending = dragSet_;
+                for (auto* e : dragSet_) {
+                    pending.erase(std::remove(pending.begin(), pending.end(), e), pending.end());
+                    POINT cell = SnapToFreeCell(e->dragPos, pending);
+                    e->pos = cell;
+                    e->dragPos = cell;
+                }
                 if (onMoved) onMoved(dragSet_);
             } else {
                 for (auto* e : dragSet_) e->dragPos = e->pos;
@@ -327,8 +532,38 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         dragSet_.clear();
         dragStartPos_.clear();
         moved_ = false;
+        dragLayerShown_ = false;
         mode_ = Mode::None;
         Redraw();
+        return 0;
+    }
+
+    case WM_MEASUREITEM:
+    case WM_DRAWITEM:
+    case WM_INITMENUPOPUP:
+        // 右键菜单里的自绘项（带图标的那几个）交给 shell 自己画
+        if (g_menuOwner) {
+            const HRESULT r = g_menuOwner->HandleMenuMsg(msg, wp, lp);
+            if (SUCCEEDED(r)) return TRUE;
+        }
+        break;
+
+    case WM_RBUTTONUP: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        POINT sp{origin_.x + pt.x, origin_.y + pt.y};
+        DesktopIconView* hit = HitTest(pt);
+        if (hit) {
+            // 图标上：打开文件的右键菜单（打开方式 / 属性 / 删除 …）
+            if (!hit->selected) SelectOnly(hit);
+            Redraw();
+            ShowItemMenu(h, hit->path, sp);
+        } else {
+            ClearSelection();
+            Redraw();
+            ShowBackgroundMenu(h, sp);
+        }
+        // 菜单里可能改了名字/删了东西，回来重新枚举一次
+        if (onContextInvoked) onContextInvoked();
         return 0;
     }
 
@@ -405,7 +640,7 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging) {
                   reinterpret_cast<const BYTE*>(e->bmp.pixels.data()), iw, ih, ix, iy);
     }
 
-    if (e->name.empty()) return;
+    if (e->name.empty() || !showLabels_) return;
 
     int textTop = y + kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap;
     int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);
@@ -431,7 +666,9 @@ void DesktopSurface::PaintLayered() {
     // 先画不动的，再画正在拖的，让拖动的图标压在上面
     for (auto* e : *icons_) {
         if (!e || !e->OnDesktop()) continue;
-        bool inDrag = mode_ == Mode::Move && e->selected;
+        // 只有真的拖动起来（moved_）才交给浮层画。
+        // 否则「按下鼠标还没动」的那一瞬间图标会从桌面层消失，看起来像是点一下图标就没了。
+        bool inDrag = mode_ == Mode::Move && moved_ && e->selected;
         if (!inDrag) DrawOneLayered(e, false);
     }
     // 正在拖的图标交给拖拽浮层画（桌面层在所有盒子下面，不然会被盒子挡住）
@@ -449,6 +686,17 @@ void DesktopSurface::PaintLayered() {
             FillRectAlpha(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, r, 160, RGB(0, 120, 215));
     }
 
+    MakeHitTestable();
+}
+
+// per-pixel alpha 的分层窗口有个坑：alpha == 0 的像素不接收鼠标消息（点击直接穿透到
+// 真实桌面），所以桌面空白处永远收不到 WM_LBUTTONDOWN —— 框选框不起来。
+// 把整层的 alpha 抬到 1（0.4% 的黑，肉眼不可见）让整片区域都能命中。
+void DesktopSurface::MakeHitTestable() {
+    if (!bits_ || bufW_ <= 0 || bufH_ <= 0) return;
+    auto* p = reinterpret_cast<uint32_t*>(bits_);
+    const size_t n = (size_t)bufW_ * (size_t)bufH_;
+    for (size_t i = 0; i < n; ++i) p[i] |= 0x01000000u;   // alpha 字节 |= 1
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +751,7 @@ void DesktopSurface::PaintOpaque(HDC hdc) {
         for (auto* e : *icons_) {
             if (!e || !e->OnDesktop()) continue;
             // 拖动中的图标交给拖拽浮层画（桌面层在所有盒子下面，会被挡住）
-            if (mode_ == Mode::Move && e->selected) continue;
+            if (mode_ == Mode::Move && moved_ && e->selected) continue;
             DrawOneGdi(hdc, e, false);
         }
     }
@@ -558,7 +806,7 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging) {
         }
     }
 
-    if (e->name.empty()) return;
+    if (e->name.empty() || !showLabels_) return;
 
     int textTop = y + kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap;
     int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);

@@ -619,8 +619,11 @@ bool SearchWindow::Create() {
     wc.hbrBackground = nullptr;
     RegisterClassExW(&wc);
 
+    // WS_CLIPCHILDREN：面板是「GDI+ 画满整张位图再 BitBlt」的，没有这个样式时
+    // 每次重绘都会把输入框那块一起刷掉 —— 上屏的中文就这样被"擦"成看不见。
     hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kClass, L"meow-desk \u641c\u7d22",
-                            WS_POPUP, 0, 0, kWidth, 400, nullptr, nullptr, inst, this);
+                            WS_POPUP | WS_CLIPCHILDREN, 0, 0, kWidth, 400, nullptr, nullptr,
+                            inst, this);
     if (!hwnd_) return false;
 
     DWORD corner = 2;  // DWMWCP_ROUND

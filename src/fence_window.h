@@ -22,13 +22,17 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "config.h"
 #include "desktop_surface.h"
+#include "icon_render.h"
 
 class FenceWindow {
 public:
+    static constexpr int kCellHCompact = 62;   // 不显示标题时的格子高度
     bool Create(int index, int x, int y, int w, int h);
     void Destroy();
 
@@ -47,11 +51,30 @@ public:
     void SetCollapsed(bool collapsed);
     bool collapsed() const { return collapsed_; }
 
+    // 拖动时用来避让的其他盒子矩形（屏幕坐标），由 main 提供
+    void SetObstacles(std::function<std::vector<RECT>()> fn) { obstacles_ = std::move(fn); }
+
     // 屏幕坐标是否落在盒子矩形内（含收起后的头部）
     bool HitTest(POINT screenPt) const;
 
     // 盒子内容区（去掉头部）的屏幕矩形，用来判断"松手时算不算放进了盒子"
     RECT bodyRect() const;
+
+    // ---- 拖拽落点提示 ----
+    // zone: -1 = 插到这个图标左边，+1 = 插到右边，0 = 中间（用拖拽文件打开该图标的程序）
+    struct DropHint {
+        int item = -1;    // 目标图标下标（-1 = 没有落在任何图标上）
+        int zone = 0;     // -1/0/+1
+        int insert = -1;  // 插入位置（0..count），-1 表示追加到末尾
+        bool active() const { return item >= 0; }
+        bool openWith() const { return item >= 0 && zone == 0; }
+    };
+    // 由外部（main）在拖拽过程中每帧调用：pt 为屏幕坐标
+    void UpdateDropHint(POINT screenPt);
+    void ClearDropHint();
+    DropHint dropHint() const { return drop_; }
+    // 提示区域对应的屏幕矩形（用于算"插到第几个"）
+    int itemCount() const;
 
     // 几何变化（移动后）→ 外部保存配置
     std::function<void()> onGeometryChanged;
@@ -72,10 +95,31 @@ private:
     void RefreshBackdrop();
 
     void Collect(std::vector<DesktopIconView*>& out) const;
+    // 实际参与布局/绘制的图标（排除正在被拖出的那个）
+    void CollectVisible(std::vector<DesktopIconView*>& out) const;
     int HitItem(POINT clientPt) const;
+    // 当前宽度下能放几列（拖拽改宽度后要跟着变）
+    int CellCols() const;
     // 第 index 个格子的客户区原点；放不下返回 false
     bool ItemOrigin(int index, int& x, int& y) const;
 
+    // ---- 四条边/四角拖拽改大小 ----
+    enum class Edge { None, L, R, T, B, TL, TR, BL, BR };
+    Edge HitEdge(POINT clientPt) const;
+    void BeginPress(HWND h, POINT pt);
+    void ApplyResize(POINT screenPt);
+
+    int minW() const;
+    int minH() const;
+
+    int headerH() const { return headerH_; }
+    // 显示标题时格子要高一些（图标 + 两行字）
+    int cellH() const { return showLabels_ ? 84 : kCellHCompact; }
+
+    // 拖动位置夹取：不出屏幕、不压到别的盒子
+    void ResolveDragPos(RECT want, int& outX, int& outY) const;
+
+    LabelDib* LabelOf(DesktopIconView* e, int boxW, int boxH, int glow);
     HWND hwnd_ = nullptr;
     int index_ = 0;
     FenceConfig* cfg_ = nullptr;
@@ -85,8 +129,19 @@ private:
     int curH_ = 0;
     int targetH_ = 0;
     bool collapsed_ = false;
+    bool autoExpanded_ = false;   // 这次展开是「悬停自动展开」造成的
+    // 刚用箭头手动收起时，光标还停在头部上；抑制一次自动展开，
+    // 否则会「点了收起又立刻展开」，用户永远收不起来
+    bool suppressAutoExpand_ = false;
+    int headerH_ = 44;
+    bool showLabels_ = true;
 
     std::vector<DesktopIconView*>* all_ = nullptr;
+    std::function<std::vector<RECT>()> obstacles_;
+
+    // 盒内标签缓存（按 图标+尺寸+颜色 复用）
+    std::unordered_map<DesktopIconView*, LabelDib> labels_;
+    std::unordered_map<DesktopIconView*, std::wstring> labelKeys_;
 
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;
@@ -96,16 +151,25 @@ private:
 
     // 亚克力底图
     std::vector<uint8_t> backdrop_;
+    int backdropW_ = 0, backdropH_ = 0;   // 抓取时的尺寸（总是展开尺寸）
     int backdropX_ = 0, backdropY_ = 0;
+
+    DropHint drop_;
 
     DesktopIconView* dragged_ = nullptr;   // 正在拖出盒子的那个图标
     int hot_ = -1;
+    int sel_ = -1;            // 单击选中的图标（双击才打开，所以要有个选中态）
     int pressItem_ = -1;
     bool pressArrow_ = false;
     bool pressHeader_ = false;
     bool pressBody_ = false;
     bool dragging_ = false;
     bool itemDragging_ = false;
+    bool resizing_ = false;
+    Edge resizeEdge_ = Edge::None;
+    RECT resizeStartRect_{};
+    int resizeStartW_ = 0;
+    int resizeStartH_ = 0;
     bool trackingLeave_ = false;
     POINT pressPt_{0, 0};
     POINT pressScreenPt_{0, 0};

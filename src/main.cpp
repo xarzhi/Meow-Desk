@@ -16,6 +16,7 @@
 #include "desktop_surface.h"
 #include "drag_layer.h"
 #include "fence_window.h"
+#include "search_window.h"
 #include "settings_window.h"
 #include "shell_icons.h"
 #include "tray.h"
@@ -47,6 +48,10 @@ static std::vector<std::unique_ptr<FenceWindow>> g_fences;
 
 static TrayIcon g_tray;
 static SettingsWindow g_settings;
+static SearchWindow g_search;
+
+// 全局快捷键：Ctrl+Alt+D 唤出搜索面板
+static const int kHotkeyId = 1;
 
 static bool g_systemIconsHidden = false;
 static bool g_surfaceVisible = true;
@@ -153,29 +158,76 @@ static void CommitPositions(const std::vector<DesktopIconView*>& list) {
     }
 }
 
-// 把图标移交给 owner（-1 = 桌面），dropPt 为屏幕坐标
-static void MoveIconTo(DesktopIconView* e, int owner, POINT dropPt) {
-    if (!e) return;
-    const int old = e->owner;
-    if (old == owner) return;
-
-    if (owner < 0) {
-        // 回到桌面：以光标为中心落位，并对齐到格子
-        int x = SnapTo(dropPt.x - g_cellW / 2, g_cellW);
-        int y = SnapTo(dropPt.y - g_cellH / 2, g_cellH);
-        if (x < 0) x = 0;
-        if (y < 0) y = 0;
-        e->pos = POINT{x, y};
-        e->dragPos = e->pos;
-    }
-    e->owner = owner;
+// 把图标插到盒子 fi 的第 vis 个可见位置（vis < 0 = 追加到末尾）。
+// 盒子的显示顺序 = g_icons 里过滤 owner 后的顺序，所以这里只挪指针的位置。
+static void InsertIntoFence(DesktopIconView* e, int fi, int vis) {
+    if (!e || fi < 0 || fi >= (int)g_fences.size()) return;
+    auto it = std::find(g_icons.begin(), g_icons.end(), e);
+    if (it != g_icons.end()) g_icons.erase(it);
+    e->owner = fi;
     e->selected = false;
+    e->dragPos = e->pos;
 
-    if (owner < 0) {
-        std::vector<DesktopIconView*> one{e};
-        CommitPositions(one);
+    if (vis < 0) {
+        g_icons.push_back(e);
+        return;
     }
-    RedrawAll();
+    std::vector<DesktopIconView*> mine;
+    for (auto* o : g_icons)
+        if (o && o->owner == fi) mine.push_back(o);
+    if (vis >= (int)mine.size()) {
+        g_icons.push_back(e);
+        return;
+    }
+    auto anchor = std::find(g_icons.begin(), g_icons.end(), mine[vis]);
+    g_icons.insert(anchor, e);
+}
+
+// 把图标放回桌面：吸附到离光标最近的空闲格子，绝不和已有图标重叠
+static void PlaceOnDesktop(DesktopIconView* e, POINT dropPt,
+                           const std::vector<DesktopIconView*>& pending) {
+    if (!e) return;
+    POINT want{dropPt.x - g_cellW / 2, dropPt.y - g_cellH / 2};
+    e->pos = g_surface.SnapToFreeCell(want, pending);
+    e->dragPos = e->pos;
+    e->owner = -1;
+    e->selected = false;
+    std::vector<DesktopIconView*> one{e};
+    CommitPositions(one);
+}
+
+// 盒子里第 idx 个可见图标（skip 用来跳过正在被拖的那个）
+static DesktopIconView* FenceItemAt(int fi, int idx, DesktopIconView* skip) {
+    if (fi < 0 || idx < 0) return nullptr;
+    int k = 0;
+    for (auto* o : g_icons) {
+        if (!o || o->owner != fi || o == skip) continue;
+        if (k == idx) return o;
+        ++k;
+    }
+    return nullptr;
+}
+
+// 落在目标图标的「中间」区域松手：把拖拽的文件交给目标图标的程序打开
+static void OpenWithDragged(DesktopIconView* src, DesktopIconView* tgt) {
+    if (!src || !tgt || src == tgt) return;
+    ShellExecuteW(nullptr, L"open", tgt->path.c_str(), src->path.c_str(), nullptr,
+                  SW_SHOWNORMAL);
+}
+
+static void ClearAllDropHints() {
+    for (auto& f : g_fences)
+        if (f) f->ClearDropHint();
+}
+
+// 拖拽过程中每帧刷新「插入缝隙线」提示
+static void UpdateAllDropHints(POINT pt) {
+    const int fi = FenceIndexAt(pt);
+    for (size_t i = 0; i < g_fences.size(); ++i) {
+        if (!g_fences[i]) continue;
+        if ((int)i == fi) g_fences[i]->UpdateDropHint(pt);
+        else g_fences[i]->ClearDropHint();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +303,6 @@ static void ReloadDesktopIcons() {
 static void ApplySettings() {
     if (g_config.shortcutArrow != g_lastArrow) {
         g_lastArrow = g_config.shortcutArrow;
-    g_lastAcrylic = g_config.fences.empty() ? 0 : g_config.fences[0].acrylic;
         ApplyIconAppearance();
     }
     const int acrylic = g_config.fences.empty() ? 0 : g_config.fences[0].acrylic;
@@ -259,6 +310,7 @@ static void ApplySettings() {
     g_lastAcrylic = acrylic;
 
     g_surface.SetTextShadow(g_config.textShadow != 0);
+    g_surface.SetShowLabels(g_config.showLabels != 0);
     for (auto& f : g_fences) if (f) f->ApplyConfig(recapture);
 }
 
@@ -284,7 +336,9 @@ static void SetDesktopIconsShown(bool shown) {
 // 退出
 // ---------------------------------------------------------------------------
 static void Cleanup() {
+    UnregisterHotKey(nullptr, kHotkeyId);
     g_tray.Destroy();
+    g_search.Destroy();
     g_settings.Destroy();
     g_drag.Destroy();
     for (auto& f : g_fences) if (f) f->Destroy();
@@ -371,12 +425,30 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_surface.SetCellSize(g_cellW, g_cellH);
     g_surface.SetIconPx(kIconPx);
     g_surface.SetTextShadow(g_config.textShadow != 0);
+    g_surface.SetShowLabels(g_config.showLabels != 0);
     g_surface.onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
+    g_surface.onContextInvoked = [] { ReloadDesktopIcons(); };
     g_surface.overTarget = [](POINT pt) { return FenceIndexAt(pt) >= 0; };
+    g_surface.onDragHover = [](POINT pt) { UpdateAllDropHints(pt); };
     g_surface.onDrop = [](const std::vector<DesktopIconView*>& list, POINT pt) -> bool {
         const int fi = FenceIndexAt(pt);
         if (fi < 0) return false;
-        for (auto* e : list) MoveIconTo(e, fi, pt);
+
+        FenceWindow::DropHint h;
+        if (g_fences[fi]) h = g_fences[fi]->dropHint();
+        ClearAllDropHints();
+
+        // 中间区域 + 单个文件 → 用目标图标的程序打开它
+        if (h.openWith() && list.size() == 1) {
+            OpenWithDragged(list[0], FenceItemAt(fi, h.item, nullptr));
+            return true;
+        }
+        int k = 0;
+        for (auto* e : list) {
+            InsertIntoFence(e, fi, h.active() ? h.insert + k : -1);
+            ++k;
+        }
+        RedrawAll();
         return true;
     };
     g_surface.onMoved = [](const std::vector<DesktopIconView*>& list) { CommitPositions(list); };
@@ -415,12 +487,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (i < g_config.fences.size()) {
                 g_config.fences[i].x = r.left;
                 g_config.fences[i].y = r.top;
+                g_config.fences[i].w = r.right - r.left;
+                g_config.fences[i].h = r.bottom - r.top;
                 g_config.Save();
             }
             g_fences[i]->ApplyConfig(true);   // 亚克力底图要跟着新位置重抓
         };
         f->onItemDragStart = [](DesktopIconView* e, POINT pt) {
             g_draggingIcon = e;
+            ClearAllDropHints();
             std::vector<DragGhost> ghosts;
             DragGhost gh;
             gh.bmp = &e->bmp;
@@ -440,15 +515,25 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             gh.y = pt.y - bm->height / 2;
             ghosts.push_back(gh);
             g_drag.Show(ghosts);
+            UpdateAllDropHints(pt);
         };
         f->onItemDrop = [](DesktopIconView* e, POINT pt) {
             g_drag.Hide();
             g_draggingIcon = nullptr;
+
             const int fi = FenceIndexAt(pt);
+            FenceWindow::DropHint h;
+            if (fi >= 0 && g_fences[fi]) h = g_fences[fi]->dropHint();
+            ClearAllDropHints();
+
             if (fi >= 0) {
-                MoveIconTo(e, fi, pt);   // 盒子 → 盒子
+                if (h.openWith())
+                    OpenWithDragged(e, FenceItemAt(fi, h.item, e));   // 盒子内：中间 → 打开方式
+                else
+                    InsertIntoFence(e, fi, h.active() ? h.insert : -1);
             } else {
-                MoveIconTo(e, -1, pt);   // 盒子 → 桌面
+                std::vector<DesktopIconView*> pending;
+                PlaceOnDesktop(e, pt, pending);   // 盒子 → 桌面
             }
             RedrawAll();
         };
@@ -461,12 +546,32 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     for (size_t i = 0; i < g_fences.size(); ++i) {
         InstallKeepAbove(g_fences[i]->hwnd(), [i] { return FenceAnchor((int)i); });
         PlaceAbove(g_fences[i]->hwnd(), FenceAnchor((int)i));
+        // 拖动时避让其他盒子（用实时窗口矩形，收起状态的盒子只占一条头部）
+        g_fences[i]->SetObstacles([i] {
+            std::vector<RECT> v;
+            for (size_t k = 0; k < g_fences.size(); ++k) {
+                if (k == i) continue;
+                if (g_fences[k] && g_fences[k]->hwnd()) v.push_back(g_fences[k]->rect());
+            }
+            return v;
+        });
     }
     LogStep("fences created: " + std::to_string(g_fences.size()));
 
-    // 7. 设置窗口 + 托盘
+    // 7. 设置窗口 + 托盘 + 搜索面板
     g_settings.Create(nullptr);
     g_settings.onChanged = [] { ApplySettings(); };
+    g_settings.onReloadIcons = [] { ReloadDesktopIcons(); };
+    g_settings.getSystemIconsShown = [] { return !g_systemIconsHidden; };
+    g_settings.setSystemIconsShown = [](bool shown) { SetDesktopIconsShown(shown); };
+
+    g_search.SetIcons(&g_icons);
+    g_search.onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
+    if (!g_search.Create()) LogStep("search window create FAILED");
+    if (!RegisterHotKey(nullptr, kHotkeyId, MOD_ALT, 'F'))
+        LogStep("RegisterHotKey(Alt+F) FAILED");
+    else
+        LogStep("hotkey Alt+F registered");
 
     g_tray.onSettings = [] {
         if (g_settings.hwnd()) g_settings.Show();
@@ -488,6 +593,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 9. 消息循环
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        // 全局快捷键：RegisterHotKey(nullptr, ...) 投递到线程队列，hwnd == nullptr
+        if (msg.message == WM_HOTKEY && msg.hwnd == nullptr) {
+            if ((int)msg.wParam == kHotkeyId) g_search.Toggle();
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

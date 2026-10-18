@@ -26,8 +26,11 @@ struct FenceConfig {
 };
 
 struct AppConfig {
-    int textShadow = 1;      // 桌面图标文字阴影
-    int shortcutArrow = 1;   // 快捷方式箭头
+    int textShadow = 1;         // 桌面图标文字阴影
+    int shortcutArrow = 1;      // 快捷方式箭头
+    int showLabels = 1;         // 显示图标标题（桌面 + 盒子）
+    int headerHeight = 44;      // 盒子头部高度
+    int autoExpandOnHover = 0;  // 鼠标移到收起盒子的头部时自动展开，移出整个盒子再收起
     std::vector<FenceConfig> fences;
 
     void Load();

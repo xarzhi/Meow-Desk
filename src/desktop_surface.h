@@ -59,6 +59,8 @@ public:
 
     // 文字阴影开关
     void SetTextShadow(bool on);
+    // 是否显示图标标题
+    void SetShowLabels(bool on);
     // 强制重建全部缓存（字体/DPI 变化时）
     void InvalidateCache();
 
@@ -69,10 +71,16 @@ public:
     HWND hwnd() const { return hwnd_; }
     bool dragging() const { return mode_ != Mode::None; }
 
+    // 找一个离 wantCell 最近的空闲格子（屏幕坐标，格子左上角）。
+    // exclude 里的图标不算占位。放不下即返回原值。
+    POINT SnapToFreeCell(POINT wantCell, const std::vector<DesktopIconView*>& exclude) const;
+
     // 拖到外部（盒子）时询问是否接收；返回 true 表示这批图标被拿走
     std::function<bool(const std::vector<DesktopIconView*>&, POINT screenPt)> onDrop;
     // 拖动中判断光标是否落在外部目标（盒子）上：是则图标跟手走，不再吸附格子
     std::function<bool(POINT screenPt)> overTarget;
+    // 拖动中每帧回调（屏幕坐标）：外部据此更新盒子的「插入缝隙线」提示
+    std::function<void(POINT screenPt)> onDragHover;
     // 拖动结束、位置变了 → 外部负责写回资源管理器
     std::function<void(const std::vector<DesktopIconView*>&)> onMoved;
     // 拖动中：外部用拖拽浮层把图标画到盒子上面（否则会被盒子盖住）
@@ -80,6 +88,8 @@ public:
     std::function<void()> onDragEnd;
     // 双击打开
     std::function<void(DesktopIconView*)> onOpen;
+    // 右键菜单执行完（可能改名/删除了文件）→ 外部重新枚举
+    std::function<void()> onContextInvoked;
     // 周期性心跳（约 500ms）
     std::function<void()> onTick;
 
@@ -104,6 +114,9 @@ private:
     void DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging);
     void FillRectBlend(HDC hdc, const RECT& r, int a, COLORREF color);
     void InvalidateCell(const DesktopIconView* e, POINT pos);
+    // 桌面空白处的点击也要能收到：per-pixel alpha 分层窗口里 alpha==0 的像素
+    // 会让鼠标消息穿透，所以把整层的 alpha 抬到 1（视觉上不可见）
+    void MakeHitTestable();
     void Dirty(const RECT& r);
     void FlushDirty();
     bool EnsureSolidDib();
@@ -118,6 +131,7 @@ private:
     int cellH_ = 98;
     int iconPx_ = 48;
     bool textShadow_ = true;
+    bool showLabels_ = true;
 
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;
@@ -136,6 +150,7 @@ private:
 
     Mode mode_ = Mode::None;
     bool moved_ = false;
+    bool dragLayerShown_ = false;   // 拖拽浮层已经开始接管这批图标
     bool marqueeAdditive_ = false;
     std::vector<DesktopIconView*> dragSet_;
     std::vector<POINT> dragStartPos_;

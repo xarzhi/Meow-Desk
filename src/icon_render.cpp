@@ -108,8 +108,22 @@ std::wstring WrapLabel(HDC dc, const std::wstring& text, int maxW, int maxLines)
         if (ch == L" " && lines.back().empty()) continue;
         std::wstring trial = lines.back() + ch;
         if (MeasureCx(dc, trial) <= maxW) { lines.back() = std::move(trial); continue; }
+        // 单个 token 就比整格还宽（例如 "92015e61f37b71b8a1583477627.ttf" 这种长文件名）。
+        // 以前这里直接 break 会让 lines.back() 保持空串，整个标签 DIB 建不出来 →
+        // 「有的图标有名字、有的没名字」。现在硬截断 + 省略号，至少能看到开头几个字。
+        if (lines.back().empty()) {
+            std::wstring t = ch;
+            while (!t.empty() && MeasureCx(dc, t + L"...") > maxW) t.pop_back();
+            if (t.empty()) {
+                t = ch.substr(0, 1);   // 窄到连一个字符都放不下，也要画出来
+                lines.back() = std::move(t);
+            } else {
+                lines.back() = std::move(t) + L"...";
+            }
+            truncated = false;   // 已经自带省略号，别再叠加
+            break;
+        }
         if ((int)lines.size() >= maxLines) { truncated = true; break; }
-        if (lines.back().empty()) { lines.back() = ch; truncated = true; break; }
         if (ch == L" ") continue;
         lines.emplace_back(ch);
     }
@@ -297,9 +311,11 @@ void IconDib::Free() {
 // ---------------------------------------------------------------------------
 // LabelDib
 // ---------------------------------------------------------------------------
-bool LabelDib::Build(const std::wstring& text, HFONT font, int boxW, int boxH, int glow) {
+bool LabelDib::Build(const std::wstring& text, HFONT font, int boxW, int boxH, int glow,
+                     COLORREF color, int maxLines) {
     Free();
     if (text.empty() || boxW <= 0 || boxH <= 0 || !font) return false;
+    if (maxLines < 1) maxLines = 1;
 
     // 1) 先按格子宽度折行，再按「实际文字宽度」收窄 DIB。
     //    绝大多数标签远窄于格子，收窄后每个文字 DIB 能小一半以上（206 个图标很可观）。
@@ -309,7 +325,7 @@ bool LabelDib::Build(const std::wstring& text, HFONT font, int boxW, int boxH, i
         if (!measure) return false;
         HGDIOBJ oldFont = SelectObject(measure, font);
         int oldMode = SetBkMode(measure, TRANSPARENT);
-        wrapped = WrapLabel(measure, text, boxW, 2);
+        wrapped = WrapLabel(measure, text, boxW, maxLines);
         SetBkMode(measure, oldMode);
         SelectObject(measure, oldFont);
         DeleteDC(measure);
@@ -359,15 +375,18 @@ bool LabelDib::Build(const std::wstring& text, HFONT font, int boxW, int boxH, i
     SetBkMode(mdc, oldMode);
     SelectObject(mdc, oldFont);
 
-    // 3) 亮度 → alpha，得到预乘白字形遮罩
+    // 3) 亮度 → alpha，再按目标颜色预乘（DIB 里是 BGRA）
     auto* mp = reinterpret_cast<BYTE*>(mbits);
     const size_t n = (size_t)boxW * boxH;
+    const BYTE cb = GetBValue(color), cg = GetGValue(color), cr = GetRValue(color);
     for (size_t i = 0; i < n; ++i) {
         BYTE* p = mp + i * 4;
         BYTE a = p[0];
         if (p[1] > a) a = p[1];
         if (p[2] > a) a = p[2];
-        p[0] = p[1] = p[2] = a;
+        p[0] = (BYTE)MulDiv255(cb, a);
+        p[1] = (BYTE)MulDiv255(cg, a);
+        p[2] = (BYTE)MulDiv255(cr, a);
         p[3] = a;
     }
 
