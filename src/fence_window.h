@@ -36,6 +36,12 @@ public:
     bool Create(int index, int x, int y, int w, int h);
     void Destroy();
 
+    // g_config.fences 是 vector：新建盒子时 push_back 可能把元素搬到新地址，
+    // 盒子手里指向自己那条配置的指针就悬空了。往容器里加过东西之后必须重绑一次。
+    void RebindConfig() {
+        if (index_ >= 0 && index_ < (int)g_config.fences.size()) cfg_ = &g_config.fences[index_];
+    }
+
     // 全局图标表（内部按 owner 过滤）
     void SetIcons(std::vector<DesktopIconView*>* all) { all_ = all; }
 
@@ -98,13 +104,35 @@ public:
     // 提示区域对应的屏幕矩形（用于算"插到第几个"）
     int itemCount() const;
 
-    // 几何变化（移动后）→ 外部保存配置
     // 头部右侧的锁按钮：锁上之后盒子不能拖动、也不能拖边缘改尺寸
     RECT LockRect() const;
     bool locked() const { return cfg_ && cfg_->locked; }
     void SetLocked(bool on);
     void ToggleLock() { SetLocked(!locked()); }
 
+    // ---- 分组（头部的一排标签）----
+    // 没有分组时 groupCount()==1，头部照旧只显示盒子标题；一旦「创建分组」，
+    // groups[0] 就变成盒子标题本身，后面追加的才是新分组。
+    // 每个图标只属于一个分组（DesktopIconView::group），切分组等于换一批图标。
+    int groupCount() const {
+        return (cfg_ && !cfg_->groups.empty()) ? (int)cfg_->groups.size() : 1;
+    }
+    bool hasTabs() const { return groupCount() > 1; }
+    int activeGroup() const;
+    void SetActiveGroup(int g);
+    // 新建一个分组并切过去，返回新分组下标
+    int AddGroup(const std::wstring& name = std::wstring());
+    // 删掉当前分组（第 0 个是盒子标题，删不掉）。组里的图标退回第 0 组。
+    void RemoveActiveGroup();
+    void SetGroupName(int i, const std::wstring& n);
+    std::wstring GroupName(int i) const;
+    std::wstring activeGroupName() const { return GroupName(activeGroup()); }
+    // 各标签的客户区矩形（只含放得下的那些；顺序和分组下标一致）
+    std::vector<RECT> TabRects() const;
+    // 命中哪个标签，-1 = 没命中
+    int HitTab(POINT clientPt) const;
+
+    // 几何变化（移动后）→ 外部保存配置
     std::function<void()> onGeometryChanged;
     // 点击盒内图标
     std::function<void(DesktopIconView*)> onOpen;
@@ -268,6 +296,10 @@ private:
     int pressItem_ = -1;
     bool pressArrow_ = false;
     bool pressLock_ = false;
+    // 「鼠标移入就切分组」是延迟触发的：光标扫过标签栏时不能一路乱切，
+    // 所以记下当前悬停的标签，等一个短定时器到期、光标还在原地才真切。
+    int pressTab_ = -1;
+    int hoverTab_ = -1;
     bool pressHeader_ = false;
     bool pressBody_ = false;
     bool dragging_ = false;

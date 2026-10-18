@@ -34,6 +34,10 @@ const int kColInset = 10;
 // 四条边/四角可以拖拽改大小的判定宽度
 const int kEdgeMargin = 6;
 const UINT_PTR kAnimTimer = 2;
+// 「鼠标移入切分组」的延迟：光标扫过标签栏时不能一路乱切，
+// 停在一个标签上够久（200ms）才真的切过去。
+const UINT_PTR kTabHoverTimer = 3;
+const int kTabHoverDelayMs = 200;
 
 void AddRoundRect(GraphicsPath& p, const RectF& r, float rad) {
     float d = rad * 2.0f;
@@ -97,6 +101,53 @@ bool IsLight(COLORREF c) {
     double l = 0.299 * GetRValue(c) + 0.587 * GetGValue(c) + 0.114 * GetBValue(c);
     return l > 140.0;
 }
+
+// ---- 头部标签栏的度量 ----
+// 标签的宽度得按文字自己算（自绘标签栏没有控件帮忙排版）。量宽度用 GDI
+// （每次鼠标移动都可能量一次，比建 Graphics 快），画文字仍然走 GDI+。
+// 只有两个字号档位，各缓存一个 HFONT，用完不还原字体也能被下一轮复用。
+HFONT TabMeasureFont(int px) {
+    static HFONT cache[2] = {nullptr, nullptr};
+    const int i = (px >= 13) ? 1 : 0;
+    if (!cache[i]) {
+        LOGFONTW lf{};
+        lf.lfHeight = -(i ? 14 : 13);
+        lf.lfWeight = FW_NORMAL;
+        lf.lfQuality = CLEARTYPE_QUALITY;
+        lstrcpynW(lf.lfFaceName, L"Microsoft YaHei UI", LF_FACESIZE);
+        cache[i] = CreateFontIndirectW(&lf);
+    }
+    return cache[i];
+}
+
+int MeasureTabText(const std::wstring& s, int px) {
+    if (s.empty()) return 0;
+    HDC dc = GetDC(nullptr);
+    if (!dc) return (int)s.size() * (px / 2);
+    HGDIOBJ old = SelectObject(dc, TabMeasureFont(px));
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, s.c_str(), (int)s.size(), &sz);
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
+    return sz.cx;
+}
+
+const int kTabPadX = 11;    // 标签左右内边距
+const int kTabGap = 4;      // 相邻标签之间
+const int kTabLeft = 12;    // 第一个标签离卡片左边
+const int kTabMinW = 34;
+const int kTabMaxW = 148;
+// 头部右侧被锁按钮（width-52±9）和箭头（最右 40px）占掉了，标签不能压过去
+const int kTabRightReserve = 74;
+
+int TabWidthFor(const std::wstring& name, int fontPx) {
+    int w = MeasureTabText(name, fontPx) + kTabPadX * 2;
+    if (w < kTabMinW) w = kTabMinW;
+    if (w > kTabMaxW) w = kTabMaxW;
+    return w;
+}
+
+ARGB WithAlpha(ARGB c, BYTE a) { return ((ARGB)a << 24) | (c & 0x00FFFFFFu); }
 
 // 标签字体的行高：LabelDib 里 DrawTextW 是 DT_TOP，所以盒子高度给到行高、
 // 再按 (行高 - 行高)/2 自然就垂直居中了。量一次缓存起来。
@@ -214,11 +265,15 @@ LRESULT CALLBACK FenceWindow::WndProcStatic(HWND h, UINT m, WPARAM w, LPARAM l) 
     return DefWindowProcW(h, m, w, l);
 }
 
+// 本盒子「当前分组」里的图标。
+// 注意：所有以「第几个图标」为准的下标（命中、落点、flip 槽位）都是相对这个
+// 列表的，所以这里必须带上 group 过滤 —— 否则切了分组图标还对不上号。
 void FenceWindow::Collect(std::vector<DesktopIconView*>& out) const {
     out.clear();
     if (!all_) return;
+    const int g = activeGroup();
     for (auto* e : *all_) {
-        if (e && e->owner == index_) out.push_back(e);
+        if (e && e->owner == index_ && e->group == g) out.push_back(e);
     }
 }
 
@@ -382,6 +437,7 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     pressItem_ = -1;
     pressArrow_ = false;
     pressLock_ = false;
+    pressTab_ = -1;
     pressHeader_ = false;
     pressBody_ = false;
 
@@ -393,6 +449,9 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
             SetCapture(h);
             return;
         }
+        // 点在标签上：先记下来，松手时（没拖动过）再切分组。
+        // 注意不能在这里直接切 —— 用户可能只是想按住头部拖盒子。
+        pressTab_ = HitTab(pt);
     }
 
     // 先判边缘：边缘优先于头部拖动/图标
@@ -536,8 +595,9 @@ void FenceWindow::SetViewMode(int m) {
 void FenceWindow::BuildDetailInfo() {
     detailInfo_.clear();
     if (!all_) return;
+    const int g = activeGroup();
     for (auto* e : *all_) {
-        if (!e || e->owner != index_) continue;
+        if (!e || e->owner != index_ || e->group != g) continue;
 
         DetailInfo d;
         WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -727,11 +787,147 @@ float FenceWindow::FlipProgress() const {
 void FenceWindow::SetTitle(const std::wstring& t) {
     if (!cfg_) return;
     cfg_->title = t;
+    // 有分组时第一个标签就是盒子标题，改名要跟着走
+    if (!cfg_->groups.empty()) cfg_->groups[0] = t;
     Redraw();
     if (onStateChanged) onStateChanged();
 }
 
 std::wstring FenceWindow::title() const { return cfg_ ? cfg_->title : std::wstring(); }
+
+// ---------------------------------------------------------------------------
+// 分组（头部标签栏）
+// ---------------------------------------------------------------------------
+std::wstring FenceWindow::GroupName(int i) const {
+    if (!cfg_) return std::wstring();
+    if (cfg_->groups.empty()) return (i == 0) ? cfg_->title : std::wstring();
+    if (i < 0 || i >= (int)cfg_->groups.size()) return std::wstring();
+    return cfg_->groups[i];
+}
+
+int FenceWindow::activeGroup() const {
+    if (!cfg_) return 0;
+    const int n = groupCount();
+    if (cfg_->activeGroup < 0) return 0;
+    if (cfg_->activeGroup >= n) return n - 1;
+    return cfg_->activeGroup;
+}
+
+// 切分组：换一批图标，所以所有「指向某个图标」的下标都要作废
+void FenceWindow::SetActiveGroup(int g) {
+    if (!cfg_) return;
+    const int n = groupCount();
+    if (g < 0) g = 0;
+    if (g >= n) g = n - 1;
+    cfg_->activeGroup = g;
+
+    hot_ = -1;
+    sel_ = -1;
+    pressItem_ = -1;
+    pressTab_ = -1;
+    hoverTab_ = -1;
+    drop_ = DropHint{};
+    dragged_ = nullptr;
+    itemDragging_ = false;
+    StopFlip();
+    InvalidateDetail();
+
+    Redraw();
+    if (onStateChanged) onStateChanged();   // 存配置（activeGroup 要落盘）
+}
+
+int FenceWindow::AddGroup(const std::wstring& name) {
+    if (!cfg_) return -1;
+    // 第一次创建分组时把盒子标题补成第 0 条：这样「标题」和「分组」是同一套下标
+    if (cfg_->groups.empty()) cfg_->groups.push_back(cfg_->title);
+
+    std::wstring n = name;
+    if (n.empty()) n = L"\u5206\u7ec4 " + std::to_wstring(cfg_->groups.size());
+    cfg_->groups.push_back(n);
+
+    const int idx = (int)cfg_->groups.size() - 1;
+    SetActiveGroup(idx);
+    return idx;
+}
+
+void FenceWindow::RemoveActiveGroup() {
+    if (!cfg_) return;
+    const int g = activeGroup();
+    // 第 0 个标签就是盒子标题本身，删掉它盒子就没名字了
+    if (g <= 0 || cfg_->groups.size() <= 1) return;
+
+    cfg_->groups.erase(cfg_->groups.begin() + g);
+    // 这个分组里的图标退回第 0 组（盒子标题页），后面分组的图标下标各减一 ——
+    // 不这么做的话它们会指向一个不存在的分组，变成「怎么也看不见的图标」。
+    if (all_) {
+        for (auto* e : *all_) {
+            if (!e || e->owner != index_) continue;
+            if (e->group == g) e->group = 0;
+            else if (e->group > g) --e->group;
+        }
+    }
+
+    const int n = (int)cfg_->groups.size();
+    cfg_->activeGroup = std::min(g, n - 1);
+    hot_ = -1;
+    sel_ = -1;
+    drop_ = DropHint{};
+    StopFlip();
+    InvalidateDetail();
+    Redraw();
+    if (onStateChanged) onStateChanged();
+}
+
+// 改某个标签的名字。下标 0 就是盒子标题（两边同步），没有分组时等同于改标题。
+void FenceWindow::SetGroupName(int i, const std::wstring& n) {
+    if (!cfg_ || n.empty()) return;
+    if (cfg_->groups.empty() || i <= 0) {
+        SetTitle(n);
+        return;
+    }
+    if (i >= (int)cfg_->groups.size()) return;
+    cfg_->groups[i] = n;
+    Redraw();
+    if (onStateChanged) onStateChanged();
+}
+
+// 标签的排版：从左边 12px 开始一个个排，放不下就截断（锁按钮和箭头占右边）。
+std::vector<RECT> FenceWindow::TabRects() const {
+    std::vector<RECT> out;
+    const int n = groupCount();
+    if (n <= 0 || !showTitle_) return out;
+    const int hh = HeadH();
+    if (hh < 16) return out;
+
+    const int fontPx = (headerH_ >= 40) ? 14 : 13;
+    const int th = std::min(hh - 10, 26);
+    const int top = (hh - th) / 2;
+    const int rightLimit = width_ - kTabRightReserve;
+
+    int x = kTabLeft;
+    for (int i = 0; i < n; ++i) {
+        int w = TabWidthFor(GroupName(i), fontPx);
+        if (x + w > rightLimit) {
+            if (i > 0) break;
+            w = std::max(kTabMinW, rightLimit - x);   // 第一个再挤也要留一块
+        }
+        out.push_back(RECT{x, top, x + w, top + th});
+        x += w + kTabGap;
+    }
+    return out;
+}
+
+int FenceWindow::HitTab(POINT clientPt) const {
+    if (!showTitle_ || !hasTabs()) return -1;
+    const auto rects = TabRects();
+    for (size_t i = 0; i < rects.size(); ++i) {
+        const RECT& r = rects[i];
+        if (clientPt.x >= r.left && clientPt.x < r.right && clientPt.y >= r.top &&
+            clientPt.y < r.bottom)
+            return (int)i;
+    }
+    return -1;
+}
 
 // 重排本盒子图标在全局表里的相对顺序。
 // 只动 owner == index_ 的那些槽位，盒子里第 k 个图标因此变成第 k 个排序结果 ——
@@ -741,9 +937,11 @@ void FenceWindow::SortNow() {
     const int key = cfg_->sortKey;
     if (key < 0 || key > 3) return;   // 4 = 自定义：保持用户自己拖出来的顺序
 
+    // 只排当前分组：别的分组各自有各自的顺序，不能被这次排序带走
+    const int g = activeGroup();
     std::vector<DesktopIconView*> mine;
     for (auto* e : *all_)
-        if (e && e->owner == index_) mine.push_back(e);
+        if (e && e->owner == index_ && e->group == g) mine.push_back(e);
     if (mine.size() < 2) return;
 
     std::vector<SortInfo> info(mine.size());
@@ -787,7 +985,7 @@ void FenceWindow::SortNow() {
     size_t k = 0;
     for (size_t i = 0; i < all_->size() && k < ordered.size(); ++i) {
         DesktopIconView* e = (*all_)[i];
-        if (e && e->owner == index_) (*all_)[i] = ordered[k++];
+        if (e && e->owner == index_ && e->group == g) (*all_)[i] = ordered[k++];
     }
 }
 
@@ -1017,6 +1215,10 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
                 }
+                if (HitTab(pt) >= 0) {
+                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    return TRUE;
+                }
             }
             LPCWSTR id = nullptr;
             switch (HitEdge(pt)) {
@@ -1101,6 +1303,25 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             hot_ = hot;
             Redraw();
         }
+
+        // 分组标签：设置成「鼠标移入就切」时，光标要在一个标签上停够 kTabHoverDelayMs
+        // 才切 —— 否则从左边划到右边时途经的每个标签都会被切一遍。
+        // 设置成「点击才切」时这里什么都不做，交给 WM_LBUTTONUP 里的 tabPress 分支。
+        {
+            const int t = (g_config.switchTabOnHover && showTitle_ && pt.y < HeadH())
+                              ? HitTab(pt)
+                              : -1;
+            if (t >= 0 && t != activeGroup()) {
+                if (hoverTab_ != t) {
+                    hoverTab_ = t;
+                    SetTimer(h, kTabHoverTimer, kTabHoverDelayMs, nullptr);
+                }
+            } else if (hoverTab_ != -1) {
+                hoverTab_ = -1;
+                KillTimer(h, kTabHoverTimer);
+            }
+        }
+
         if (!trackingLeave_) {
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
             if (TrackMouseEvent(&tme)) trackingLeave_ = true;
@@ -1111,6 +1332,10 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSELEAVE:
         trackingLeave_ = false;
         suppressAutoExpand_ = false;   // 离开过一次，下次悬停又能展开了
+        if (hoverTab_ != -1) {
+            hoverTab_ = -1;
+            KillTimer(h, kTabHoverTimer);
+        }
         if (hot_ != -1) { hot_ = -1; Redraw(); }
         if (autoExpanded_) {
             if (itemDragging_ || dragging_) {
@@ -1141,6 +1366,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         const int item = pressItem_;
         const bool arrow = pressArrow_;
         const bool lockPress = pressLock_;
+        const int tabPress = pressTab_;
         const bool wasDragging = dragging_;
         const bool wasItemDrag = itemDragging_;
         const bool wasResizing = resizing_;
@@ -1152,6 +1378,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         pressItem_ = -1;
         pressArrow_ = false;
         pressLock_ = false;
+        pressTab_ = -1;
         pressHeader_ = false;
         pressBody_ = false;
 
@@ -1187,6 +1414,11 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             suppressAutoExpand_ = collapsed_;   // 刚收起且光标还在头上，别又弹开
             return 0;
         }
+        // 点标签：没拖动过才切分组（拖着走 = 用户只是想挪盒子）
+        if (tabPress >= 0 && !wasDragging && tabPress != activeGroup()) {
+            SetActiveGroup(tabPress);
+            return 0;
+        }
         if (item >= 0) {
             // 单击只选中，双击（WM_LBUTTONDBLCLK）才打开
             sel_ = item;
@@ -1200,6 +1432,19 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER: {
+        if (wp == kTabHoverTimer) {
+            KillTimer(h, kTabHoverTimer);
+            const int t = hoverTab_;
+            hoverTab_ = -1;
+            if (t >= 0 && t != activeGroup()) {
+                // 这 200ms 里光标可能已经走开了，确认还停在这个标签上再切
+                POINT c{};
+                GetCursorPos(&c);
+                ScreenToClient(h, &c);
+                if (c.y >= 0 && c.y < HeadH() && HitTab(c) == t) SetActiveGroup(t);
+            }
+            return 0;
+        }
         if (wp != kAnimTimer) break;
         bool busy = false;
 
@@ -1362,7 +1607,12 @@ void FenceWindow::Paint() {
                                         : (BYTE)std::min(255, alpha + 42);
             SolidBrush headBrush{Color(hA, (BYTE)Lighten(r, 0.45), (BYTE)Lighten(g, 0.45),
                                         (BYTE)Lighten(b, 0.45))};
+            // 头部这个路径是「上圆下方」的，只适合贴在卡片顶上。盒子收起时
+            // 卡片只剩头部那么高，它的两个下直角就落到卡片圆角外面去了 ——
+            // 表现为头部左右下角「多出两个直角」。按卡片形状裁一刀就干净了。
+            gfx.SetClip(&shape);
             gfx.FillPath(&headBrush, &head);
+            gfx.ResetClip();
         }
 
         // ---- 描边 / 分隔线 ----
@@ -1375,8 +1625,39 @@ void FenceWindow::Paint() {
 
         const ARGB fg = light ? 0xFF1B1B1F : 0xFFF2F2F5;
 
-        // ---- 标题（受「显示图标标题」开关控制）----
-        if (showTitle_ && g_config.showLabels) {
+        // ---- 头部：分组标签 / 单一标题 ----
+        // 有分组时整个头部变成一排标签（当前分组高亮）。标签是导航控件，
+        // 不受「显示图标标题」开关影响 —— 关掉它标签就没了，等于切不了分组。
+        if (showTitle_ && hasTabs()) {
+            const std::vector<RECT> tabs = TabRects();
+            const int act = activeGroup();
+            FontFamily family(L"Microsoft YaHei UI");
+            const int fontPx = (headerH_ >= 40) ? 14 : 13;
+            Font tabFont(&family, (float)fontPx, FontStyleRegular, UnitPixel);
+            Font tabFontBold(&family, (float)fontPx, FontStyleBold, UnitPixel);
+            StringFormat tf;
+            tf.SetAlignment(StringAlignmentCenter);
+            tf.SetLineAlignment(StringAlignmentCenter);
+            tf.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsNoClip);
+            tf.SetTrimming(StringTrimmingEllipsisCharacter);
+            for (size_t i = 0; i < tabs.size(); ++i) {
+                const RECT& tr = tabs[i];
+                const bool on = ((int)i == act);
+                const RectF rr((float)tr.left, (float)tr.top, (float)(tr.right - tr.left),
+                               (float)(tr.bottom - tr.top));
+                if (on) {
+                    // 当前分组：浅色卡片压一层淡黑、深色卡片提一层淡白，做出「选中」的块
+                    SolidBrush bg{light ? Color(28, 0, 0, 0) : Color(54, 255, 255, 255)};
+                    GraphicsPath pill;
+                    AddRoundRect(pill, rr, 6.0f);
+                    gfx.FillPath(&bg, &pill);
+                }
+                SolidBrush txt{on ? Color(fg) : WithAlpha(fg, (BYTE)(light ? 118 : 148))};
+                const std::wstring name = GroupName((int)i);
+                const RectF box(rr.X + 2.0f, rr.Y, std::max(4.0f, rr.Width - 4.0f), rr.Height);
+                gfx.DrawString(name.c_str(), -1, on ? &tabFontBold : &tabFont, box, &tf, &txt);
+            }
+        } else if (showTitle_ && g_config.showLabels) {
             FontFamily family(L"Microsoft YaHei UI");
             const float fs = headerH_ >= 40 ? 14.0f : 12.5f;
             Font titleFont(&family, fs, FontStyleRegular, UnitPixel);

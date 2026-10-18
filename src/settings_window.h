@@ -104,6 +104,7 @@ private:
     // ---- 交互 ----
     RECT rcHoverExpand_{};
     RECT rcSortAnim_{};
+    RECT rcTabHover_{};     // 分组标签：鼠标移入就切 / 点击才切
 
     // ---- 整理规则 ----
     RECT rcAutoOrganize_{};

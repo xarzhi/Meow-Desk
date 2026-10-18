@@ -7,7 +7,7 @@
 // 用 path（解析名）当主键：显示名可能重名，path 唯一且稳定。
 //
 // 表结构见 storage.cpp 的 Upgrade()：
-//   icon_layout(path TEXT PK, owner INT, ord INT, x INT, y INT)
+//   icon_layout(path TEXT PK, owner INT, ord INT, x INT, y INT, grp INT)
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -25,6 +25,7 @@ struct LayoutEntry {
     std::wstring path;
     int owner = -1;   // -1 = 桌面；>=0 = 盒子下标
     int order = 0;    // 盒内顺序（owner >= 0 时有效）
+    int group = 0;    // 盒内分组（标签下标，owner >= 0 时有效）
     POINT pos{0, 0};  // 桌面坐标（owner < 0 时有效）
 };
 

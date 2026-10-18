@@ -22,7 +22,9 @@ std::wstring g_file;
 //   v1 — 初版：app / fence / icon_layout
 //   v2 — fence 表加 viewMode / sortKey / sortAsc（每个盒子各自的「查看」「排序」）
 //   v3 — fence 表加 locked（盒子锁定）；新增 rule 表（整理规则）
-const int kSchemaVersion = 3;
+//   v4 — fence 表加 activeGroup；新增 fence_group 表（盒子内的分组标签）；
+//        icon_layout 加 grp（图标属于哪个分组）
+const int kSchemaVersion = 4;
 
 void SetError(const char* what) {
     g_lastError = what ? what : "";
@@ -57,7 +59,16 @@ bool Upgrade(int from) {
         "  viewMode INTEGER NOT NULL DEFAULT 1,"
         "  sortKey  INTEGER NOT NULL DEFAULT 4,"
         "  sortAsc  INTEGER NOT NULL DEFAULT 1,"
-        "  locked   INTEGER NOT NULL DEFAULT 0"
+        "  locked   INTEGER NOT NULL DEFAULT 0,"
+        "  activeGroup INTEGER NOT NULL DEFAULT 0"
+        ");"
+        // 盒子内的分组（头部那一排标签）。ord=0 就是盒子自己的标题，
+        // 所以一个盒子只要有分组，第一条一定是它。
+        "CREATE TABLE IF NOT EXISTS fence_group ("
+        "  fence INTEGER NOT NULL,"
+        "  ord   INTEGER NOT NULL,"
+        "  name  TEXT NOT NULL DEFAULT '',"
+        "  PRIMARY KEY(fence, ord)"
         ");"
         "CREATE TABLE IF NOT EXISTS rule ("
         "  id INTEGER PRIMARY KEY,"     // 0,1,2… 对应 rules 下标（顺序就是匹配优先级）
@@ -70,7 +81,8 @@ bool Upgrade(int from) {
         "  path  TEXT PRIMARY KEY,"     // 解析名，唯一且稳定
         "  owner INTEGER NOT NULL,"     // -1 = 桌面，>=0 = 盒子下标
         "  ord   INTEGER NOT NULL,"     // 盒内顺序（order 是 SQL 关键字，改名 ord）
-        "  x INTEGER NOT NULL, y INTEGER NOT NULL"
+        "  x INTEGER NOT NULL, y INTEGER NOT NULL,"
+        "  grp INTEGER NOT NULL DEFAULT 0"   // 盒内分组（标签下标）
         ");";
     if (sqlite3_exec(g_db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) {
         SetError("create tables");
@@ -86,6 +98,11 @@ bool Upgrade(int from) {
         AddColumn("fence", "locked", "INTEGER NOT NULL DEFAULT 0");
         // rule 表在上面那段 kSchema 里已经 CREATE IF NOT EXISTS 过了，
         // 老库走这里也一样会建出来（kSchema 每次都执行），不会丢数据。
+    }
+    if (from < 4) {
+        AddColumn("fence", "activeGroup", "INTEGER NOT NULL DEFAULT 0");
+        AddColumn("icon_layout", "grp", "INTEGER NOT NULL DEFAULT 0");
+        // fence_group 同样由 kSchema 建好
     }
 
     const std::string ver = "PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";";

@@ -37,6 +37,7 @@ struct DesktopIconView {
     POINT dragPos{0, 0};     // 拖动中的临时位置
     IconBitmap bmp;          // 图标位图（预乘 alpha）
     int owner = -1;          // -1 = 桌面；>=0 = 第几个盒子
+    int group = 0;           // 所属分组（盒子内标签页下标，owner >= 0 时有效）
     bool selected = false;   // 选中
     bool hover = false;      // 鼠标悬停（画一层半透明底）
     void* pidl = nullptr;    // 资源管理器的 PIDL（写回位置用），由调用方持有

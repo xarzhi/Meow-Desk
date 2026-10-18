@@ -130,12 +130,13 @@ bool ConfigFromDb(AppConfig& c) {
             else if (k == L"sortAnim") c.sortAnim = n;
             else if (k == L"showFenceTitle") c.showFenceTitle = n;
             else if (k == L"autoOrganize") c.autoOrganize = n;
+            else if (k == L"switchTabOnHover") c.switchTabOnHover = n;
         }
     }
     {
         storage::Stmt st(
-            "SELECT x,y,w,h,color,alpha,radius,acrylic,title,viewMode,sortKey,sortAsc,locked"
-            " FROM fence ORDER BY id");
+            "SELECT x,y,w,h,color,alpha,radius,acrylic,title,viewMode,sortKey,sortAsc,locked,"
+            "activeGroup FROM fence ORDER BY id");
         if (!st.ok()) return false;
         while (st.step()) {
             FenceConfig f;
@@ -152,7 +153,19 @@ bool ConfigFromDb(AppConfig& c) {
             f.sortKey = st.colInt(10);
             f.sortAsc = st.colInt(11);
             f.locked = st.colInt(12);
+            f.activeGroup = st.colInt(13);
             c.fences.push_back(std::move(f));
+        }
+    }
+    {
+        // 分组：一个盒子可能有 0..N 条，按 ord 排好塞回各自的 FenceConfig
+        storage::Stmt st("SELECT fence,ord,name FROM fence_group ORDER BY fence,ord");
+        if (st.ok()) {
+            while (st.step()) {
+                const int fi = st.colInt(0);
+                if (fi < 0 || fi >= (int)c.fences.size()) continue;
+                c.fences[fi].groups.push_back(st.colText(2));
+            }
         }
     }
     {
@@ -285,7 +298,7 @@ void AppConfig::Save() const {
     if (!storage::Begin()) return;
 
     bool ok = storage::Exec("DELETE FROM app;") && storage::Exec("DELETE FROM fence;") &&
-              storage::Exec("DELETE FROM rule;");
+              storage::Exec("DELETE FROM rule;") && storage::Exec("DELETE FROM fence_group;");
     if (ok) {
         storage::Stmt st("INSERT OR REPLACE INTO app(k,v) VALUES(?1,?2)");
         auto put = [&st](const wchar_t* k, int v) {
@@ -303,11 +316,12 @@ void AppConfig::Save() const {
         put(L"sortAnim", sortAnim);
         put(L"showFenceTitle", showFenceTitle);
         put(L"autoOrganize", autoOrganize);
+        put(L"switchTabOnHover", switchTabOnHover);
 
         storage::Stmt fs(
             "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title,"
-            "viewMode,sortKey,sortAsc,locked)"
-            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)");
+            "viewMode,sortKey,sortAsc,locked,activeGroup)"
+            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)");
         for (size_t i = 0; i < fences.size() && fs.ok(); ++i) {
             const FenceConfig& c = fences[i];
             fs.bindInt(1, (int)i);
@@ -324,8 +338,23 @@ void AppConfig::Save() const {
             fs.bindInt(12, c.sortKey);
             fs.bindInt(13, c.sortAsc);
             fs.bindInt(14, c.locked);
+            fs.bindInt(15, c.activeGroup);
             ok = fs.done() && ok;
             fs.reset();
+        }
+
+        if (ok) {
+            storage::Stmt gs("INSERT INTO fence_group(fence,ord,name) VALUES(?1,?2,?3)");
+            for (size_t i = 0; i < fences.size() && gs.ok(); ++i) {
+                const FenceConfig& c = fences[i];
+                for (size_t k = 0; k < c.groups.size() && gs.ok(); ++k) {
+                    gs.bindInt(1, (int)i);
+                    gs.bindInt(2, (int)k);
+                    gs.bindText(3, c.groups[k]);
+                    ok = gs.done() && ok;
+                    gs.reset();
+                }
+            }
         }
 
         if (ok) {

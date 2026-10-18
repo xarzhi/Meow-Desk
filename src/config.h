@@ -27,6 +27,11 @@ struct FenceConfig {
     int locked = 0;
     std::wstring title;
 
+    // 盒子内的分组（头部那一排标签）。空 = 没有分组，标题栏直接显示 title。
+    // 一旦有分组，groups[0] 就是盒子自己的标题，后面的才是「创建分组」加出来的。
+    std::vector<std::wstring> groups;
+    int activeGroup = 0;   // 当前显示第几个分组
+
     // 「查看」：0=小 1=中 2=大 3=超大 4=列表 5=详情
     // 每个盒子各自记，右键菜单改的是「当前这个盒子」
     int viewMode = 1;
@@ -66,6 +71,8 @@ struct AppConfig {
     int showFenceTitle = 1;
     // 桌面上新出现的文件几秒后自动按整理规则归类（监视桌面文件夹）
     int autoOrganize = 0;
+    // 分组标签的切换方式：1 = 鼠标移入标签就切，0 = 点击才切
+    int switchTabOnHover = 1;
 
     std::vector<FenceConfig> fences;
     std::vector<OrganizeRule> rules;

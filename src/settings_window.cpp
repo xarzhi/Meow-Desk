@@ -44,6 +44,7 @@ enum : int {
     ID_SHOW_LABELS = 26,
     ID_HOVER_EXPAND = 27,
     ID_SORT_ANIM = 28,
+    ID_TAB_HOVER = 29,
     ID_SHOW_FENCE_TITLE = 30,
     ID_AUTO_ORGANIZE = 31,
     ID_ADD_RULE = 32,
@@ -203,6 +204,7 @@ void SettingsWindow::Layout() {
         const int tr = kContentX + kCardW - 24;
         rcHoverExpand_ = RECT{tr - 36, c1 + 46, tr, c1 + 68};
         rcSortAnim_ = RECT{tr - 36, c1 + 98, tr, c1 + 120};
+        rcTabHover_ = RECT{tr - 36, c1 + 150, tr, c1 + 172};
     }
 
     // ---- 关于页 ----
@@ -255,6 +257,7 @@ int SettingsWindow::HitTest(POINT pt) const {
     case Page::Interaction:
         if (in(rcHoverExpand_, 150, 18)) return ID_HOVER_EXPAND;
         if (in(rcSortAnim_, 150, 18)) return ID_SORT_ANIM;
+        if (in(rcTabHover_, 150, 18)) return ID_TAB_HOVER;
         break;
     case Page::Rules:
         if (in(rcAutoOrganize_, 150, 16)) return ID_AUTO_ORGANIZE;
@@ -654,7 +657,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      RectF((float)kContentX + 2, 56.0f, 460.0f, 18.0f), &sf, &brSub);
 
         const int c1 = 100;
-        drawCard(c1, 150);
+        drawCard(c1, 200);
         g.DrawString(L"\u76d2\u5b50\u884c\u4e3a", -1, &fSection,
                      RectF((float)kContentX + 20, (float)c1 + 14.0f, 260.0f, 22.0f), &sf,
                      &brText);
@@ -678,6 +681,16 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      RectF((float)kRowLeft, (float)(rcSortAnim_.top + 12), 420.0f, 16.0f),
                      &sf, &brSub);
         drawToggle(rcSortAnim_, g_config.sortAnim != 0);
+
+        g.DrawString(L"\u5206\u7ec4\u6807\u7b7e\u79fb\u5165\u5c31\u5207\u6362", -1, &fBody,
+                     RectF((float)kRowLeft, (float)(rcTabHover_.top - 10), 360.0f, 26.0f),
+                     &sf, &brText);
+        g.DrawString(L"\u5173\u95ed\u540e\u9700\u8981\u70b9\u51fb\u5934\u90e8\u7684\u6807\u7b7e"
+                     L"\u624d\u80fd\u5207\u6362\u5206\u7ec4",
+                     -1, &fSub,
+                     RectF((float)kRowLeft, (float)(rcTabHover_.top + 12), 420.0f, 16.0f),
+                     &sf, &brSub);
+        drawToggle(rcTabHover_, g_config.switchTabOnHover != 0);
         break;
     }
 
@@ -963,6 +976,9 @@ void SettingsWindow::Toggle(int id) {
     case ID_SORT_ANIM:
         g_config.sortAnim = g_config.sortAnim ? 0 : 1;
         break;
+    case ID_TAB_HOVER:
+        g_config.switchTabOnHover = g_config.switchTabOnHover ? 0 : 1;
+        break;
     case ID_SYSICONS:
         if (setSystemIconsShown) {
             const bool shown = getSystemIconsShown ? getSystemIconsShown() : false;
@@ -1179,7 +1195,7 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (id == ID_ACRYLIC || id == ID_SHADOW || id == ID_ARROW || id == ID_SHOW_LABELS ||
             id == ID_HOVER_EXPAND || id == ID_SORT_ANIM || id == ID_SYSICONS ||
-            id == ID_SHOW_FENCE_TITLE || id == ID_AUTO_ORGANIZE) {
+            id == ID_TAB_HOVER || id == ID_SHOW_FENCE_TITLE || id == ID_AUTO_ORGANIZE) {
             Toggle(id);
             return 0;
         }

@@ -121,7 +121,7 @@ bool LoadLegacyIni(std::vector<LayoutEntry>& out) {
 
 bool LayoutFromDb(std::vector<LayoutEntry>& out) {
     out.clear();
-    storage::Stmt st("SELECT path,owner,ord,x,y FROM icon_layout");
+    storage::Stmt st("SELECT path,owner,ord,x,y,grp FROM icon_layout");
     if (!st.ok()) return false;
     while (st.step()) {
         LayoutEntry e;
@@ -130,6 +130,7 @@ bool LayoutFromDb(std::vector<LayoutEntry>& out) {
         e.order = st.colInt(2);
         e.pos.x = st.colInt(3);
         e.pos.y = st.colInt(4);
+        e.group = st.colInt(5);
         if (e.path.empty()) continue;
         if (e.owner < 0) e.owner = -1;
         out.push_back(std::move(e));
@@ -164,8 +165,8 @@ bool SaveLayout(const std::vector<LayoutEntry>& in) {
     bool ok = storage::Exec("DELETE FROM icon_layout;");
     if (ok) {
         storage::Stmt st(
-            "INSERT OR REPLACE INTO icon_layout(path,owner,ord,x,y)"
-            " VALUES(?1,?2,?3,?4,?5)");
+            "INSERT OR REPLACE INTO icon_layout(path,owner,ord,x,y,grp)"
+            " VALUES(?1,?2,?3,?4,?5,?6)");
         for (const auto& e : in) {
             if (!st.ok()) {
                 ok = false;
@@ -176,6 +177,7 @@ bool SaveLayout(const std::vector<LayoutEntry>& in) {
             st.bindInt(3, e.order);
             st.bindInt(4, e.pos.x);
             st.bindInt(5, e.pos.y);
+            st.bindInt(6, e.group);
             ok = st.done() && ok;
             st.reset();
         }

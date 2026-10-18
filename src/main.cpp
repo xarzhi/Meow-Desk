@@ -212,15 +212,19 @@ static void EnsureFenceIconSize(int fi) {
 static void InsertIntoFence(DesktopIconView* e, int fi, int vis) {
     if (!e || fi < 0 || fi >= (int)g_fences.size()) return;
 
+    // 落到哪个分组：就是盒子当前显示的那个分组（拖进来的图标跟当前标签页走）
+    const int grp = g_fences[fi] ? g_fences[fi]->activeGroup() : 0;
+
     // 拖拽期间布局不再排除被拖图标（原位保留、画暗当空位），所以 DropHint 给的
     // 插入下标是按「完整列表」算的。删掉自己之后，它后面的下标都要减 1。
-    const bool sameFence = (e->owner == fi);
+    // 只有「本来就在同一个盒子的同一个分组里」才需要减 —— 换组相当于新插入。
+    const bool sameFence = (e->owner == fi && e->group == grp);
     int srcIdx = -1;
     if (sameFence) {
         srcIdx = 0;
         for (auto* o : g_icons) {
             if (o == e) break;
-            if (o && o->owner == fi) ++srcIdx;
+            if (o && o->owner == fi && o->group == grp) ++srcIdx;
         }
     }
 
@@ -230,6 +234,7 @@ static void InsertIntoFence(DesktopIconView* e, int fi, int vis) {
         g_icons.erase(it);
     }
     e->owner = fi;
+    e->group = grp;
     e->selected = false;
     e->dragPos = e->pos;
 
@@ -242,7 +247,7 @@ static void InsertIntoFence(DesktopIconView* e, int fi, int vis) {
     }
     std::vector<DesktopIconView*> mine;
     for (auto* o : g_icons)
-        if (o && o->owner == fi) mine.push_back(o);
+        if (o && o->owner == fi && o->group == grp) mine.push_back(o);
     if (vis >= (int)mine.size()) {
         g_icons.push_back(e);
         FitIconToOwner(e);
@@ -290,7 +295,10 @@ static void SaveIconLayout() {
         LayoutEntry le;
         le.path = e->path;
         le.owner = (e->owner >= 0 && e->owner < (int)g_fences.size()) ? e->owner : -1;
-        if (le.owner >= 0) le.order = nextOrder[le.owner]++;
+        if (le.owner >= 0) {
+            le.order = nextOrder[le.owner]++;
+            le.group = e->group;   // 图标属于盒子里的哪个分组
+        }
         le.pos = e->pos;
         out.push_back(std::move(le));
     }
@@ -319,6 +327,9 @@ static void ApplyIconLayout() {
         const LayoutEntry* le = it->second;
         if (le->owner >= 0 && le->owner < (int)g_fences.size()) {
             e->owner = le->owner;
+            // 分组可能被删过，越界的一律退回第 0 组（否则图标会「消失」）
+            const int gn = g_fences[le->owner] ? g_fences[le->owner]->groupCount() : 1;
+            e->group = (le->group >= 0 && le->group < gn) ? le->group : 0;
             orderOf[e] = le->order;
             ++toFence;
         } else {
@@ -350,11 +361,14 @@ static void ApplyIconLayout() {
 }
 
 // 盒子里第 idx 个可见图标（skip 用来跳过正在被拖的那个）
+// 「可见」= 属于盒子当前分组，和 FenceWindow::CollectVisible 的口径保持一致，
+// 否则 DropHint 里的下标会指到别的分组去。
 static DesktopIconView* FenceItemAt(int fi, int idx, DesktopIconView* skip) {
-    if (fi < 0 || idx < 0) return nullptr;
+    if (fi < 0 || idx < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return nullptr;
+    const int grp = g_fences[fi]->activeGroup();
     int k = 0;
     for (auto* o : g_icons) {
-        if (!o || o->owner != fi || o == skip) continue;
+        if (!o || o->owner != fi || o->group != grp || o == skip) continue;
         if (k == idx) return o;
         ++k;
     }
@@ -524,10 +538,15 @@ enum {
     kCmdSettings = 4040,
     kCmdRename = 4041,
     kCmdLock = 4042,
+    kCmdNewGroup = 4043,      // 在头部新建一个分组标签
+    kCmdRenameGroup = 4044,   // 重命名当前分组
+    kCmdDeleteGroup = 4045,   // 删除当前分组
+    kCmdMoveToGroup = 4100,   // 4100..4127：盒内图标「移动到第 N 个分组」
 };
 
 static void AddFenceWindow(int i);
-static void ShowFenceMenu(int fi, POINT sp);
+static void ShowFenceMenu(int fi, POINT sp, int item = -1);
+static void BeginRenameGroup(int fi, int gi);
 static void BeginRenameFence(int fi);
 
 // 新建盒子：摆在当前盒子右边，超出工作区就换到下一行
@@ -559,6 +578,9 @@ static void NewFenceNear(int fi) {
     c.h = h;
     c.title = L"新盒子";
     g_config.fences.push_back(c);
+    // 容器可能重新分配：先把已有盒子手里的配置指针重绑一遍，再建新的那个
+    for (auto& f : g_fences)
+        if (f) f->RebindConfig();
     AddFenceWindow((int)g_config.fences.size() - 1);
     g_config.Save();
     LogStep("new fence #" + std::to_string((int)g_config.fences.size() - 1) + " at " +
@@ -647,6 +669,8 @@ static int CreateRuleFence(const std::wstring& title) {
     c.h = h;
     c.title = title;
     g_config.fences.push_back(c);
+    for (auto& f : g_fences)
+        if (f) f->RebindConfig();   // 容器可能重分配，先把已有盒子重绑
     const int idx = (int)g_config.fences.size() - 1;
     AddFenceWindow(idx);
     LogStep("rule fence \"" + Narrow(title) + "\" #" + std::to_string(idx));
@@ -736,10 +760,12 @@ static HWND g_renameWnd = nullptr;
 static HWND g_renameEdit = nullptr;
 static WNDPROC g_renameEditProc = nullptr;
 static int g_renameFence = -1;
+static int g_renameGroup = -1;   // >= 0 = 改的是这个分组标签；-1 = 改盒子标题
 
 static void FinishRename(bool commit) {
     if (!g_renameWnd) return;
     const int fi = g_renameFence;
+    const int gi = g_renameGroup;
     std::wstring text;
     if (commit && g_renameEdit) {
         // 用 WM_GETTEXT 而不是 GetWindowTextW：输入框的文本可能是别的进程
@@ -756,11 +782,15 @@ static void FinishRename(bool commit) {
     g_renameWnd = nullptr;
     g_renameEdit = nullptr;
     g_renameFence = -1;
+    g_renameGroup = -1;
     DestroyWindow(wnd);
 
     if (commit && !text.empty() && fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) {
-        g_fences[fi]->SetTitle(text);   // SetTitle 内部会存盘
-        LogStep("rename fence #" + std::to_string(fi) + " -> " + Narrow(text));
+        // SetTitle / SetGroupName 内部都会存盘
+        if (gi >= 0) g_fences[fi]->SetGroupName(gi, text);
+        else g_fences[fi]->SetTitle(text);
+        LogStep("rename fence #" + std::to_string(fi) + (gi >= 0 ? " group " : " -> ") +
+                (gi >= 0 ? std::to_string(gi) + " -> " : std::string()) + Narrow(text));
     }
 }
 
@@ -794,15 +824,11 @@ static LRESULT CALLBACK RenameProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static void BeginRenameFence(int fi) {
+// 真正建输入框：x 是屏幕坐标（改分组时贴在对应标签上），w 是输入框宽度
+static void BeginRenameBoxAt(int fi, int group, const std::wstring& initial, int x, int w,
+                             int headH) {
     if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
-    FenceWindow* f = g_fences[fi].get();
-
-    if (g_renameWnd) FinishRename(false);
-
-    RECT r = f->rect();
-    const int headH = f->headerH();
-    const int w = std::min<int>((int)(r.right - r.left) - 24, 260);
+    RECT r = g_fences[fi]->rect();
     const int h = std::max(24, headH - 14);
     if (w < 40) return;
 
@@ -817,15 +843,17 @@ static void BeginRenameFence(int fi) {
     RegisterClassExW(&wc);
 
     g_renameFence = fi;
+    g_renameGroup = group;
     g_renameWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"MeowDeskRename", L"",
-                                  WS_POPUP, r.left + 12, r.top + (headH - h) / 2, w, h,
-                                  nullptr, nullptr, inst, nullptr);
+                                  WS_POPUP, x, r.top + (headH - h) / 2, w, h, nullptr, nullptr,
+                                  inst, nullptr);
     if (!g_renameWnd) {
         g_renameFence = -1;
+        g_renameGroup = -1;
         return;
     }
 
-    g_renameEdit = CreateWindowExW(0, L"EDIT", f->title().c_str(),
+    g_renameEdit = CreateWindowExW(0, L"EDIT", initial.c_str(),
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 3, 2,
                                    w - 6, h - 4, g_renameWnd, (HMENU)1, inst, nullptr);
     if (g_renameEdit) {
@@ -839,7 +867,40 @@ static void BeginRenameFence(int fi) {
     if (g_renameEdit) SetFocus(g_renameEdit);
 }
 
-static void ShowFenceMenu(int fi, POINT sp) {
+// group < 0 = 改盒子标题；group >= 0 = 改第 group 个分组标签
+static void BeginRenameBox(int fi, int group, const std::wstring& initial) {
+    if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
+    FenceWindow* f = g_fences[fi].get();
+    if (g_renameWnd) FinishRename(false);
+
+    RECT r = f->rect();
+    const int headH = f->headerH();
+    int x = r.left + 12;
+    int w = std::min<int>((int)(r.right - r.left) - 24, 260);
+    // 改分组时输入框摆到那个标签上（宽度也跟着标签走），改标题就贴头部左边
+    if (group >= 0) {
+        const auto tabs = f->TabRects();
+        if (group < (int)tabs.size() && tabs[group].right > tabs[group].left) {
+            x = r.left + tabs[group].left;
+            const int avail = (int)(r.right - r.left) - (int)(x - r.left) - 8;
+            const int tabW = (int)(tabs[group].right - tabs[group].left) + 48;
+            w = std::max(60, std::min(avail, tabW));
+        }
+    }
+    BeginRenameBoxAt(fi, group, initial, x, w, headH);
+}
+
+static void BeginRenameFence(int fi) {
+    if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
+    BeginRenameBox(fi, -1, g_fences[fi]->title());
+}
+
+static void BeginRenameGroup(int fi, int gi) {
+    if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
+    BeginRenameBox(fi, gi, g_fences[fi]->GroupName(gi));
+}
+
+static void ShowFenceMenu(int fi, POINT sp, int item) {
     if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
     FenceWindow* f = g_fences[fi].get();
 
@@ -883,6 +944,21 @@ static void ShowFenceMenu(int fi, POINT sp) {
     }
 
     std::vector<PopupMenuItem> items;
+    // 右键点在某张图标上 + 盒子有分组：给一条「把这个图标挪到别的分组」的路。
+    // （标签页只显示一个分组，拖拽没法跨分组，只能走菜单。）
+    if (item >= 0 && f->hasTabs()) {
+        std::vector<PopupMenuItem> moveSub;
+        const int n = std::min(28, f->groupCount());
+        for (int g = 0; g < n; ++g) {
+            PopupMenuItem m(f->GroupName(g), kCmdMoveToGroup + g);
+            m.checked = (g == f->activeGroup());
+            moveSub.push_back(std::move(m));
+        }
+        PopupMenuItem m(L"\u79fb\u52a8\u5230\u5206\u7ec4", 0);   // 移动到分组
+        m.sub = std::move(moveSub);
+        items.push_back(std::move(m));
+        items.push_back(PopupMenuItem::Sep());
+    }
     items.push_back(PopupMenuItem(L"\u65b0\u5efa\u76d2\u5b50", kCmdNewFence));      // 新建盒子
     items.push_back(PopupMenuItem(L"\u65b0\u5efa\u6587\u4ef6\u5939", kCmdNewFolder));  // 新建文件夹
     items.push_back(PopupMenuItem::Sep());
@@ -900,6 +976,14 @@ static void ShowFenceMenu(int fi, POINT sp) {
     items.push_back(
         PopupMenuItem(L"\u6253\u5f00\u8bbe\u7f6e\u9762\u677f", kCmdSettings));  // 打开设置面板
     items.push_back(PopupMenuItem(L"\u91cd\u547d\u540d\u5206\u533a", kCmdRename));  // 重命名分区
+    // 分组：头部的标签页。切分组 = 换一批图标，所以「新建分组」进来是空的。
+    items.push_back(PopupMenuItem(L"\u521b\u5efa\u5206\u7ec4", kCmdNewGroup));  // 创建分组
+    if (f->hasTabs()) {
+        items.push_back(PopupMenuItem(L"\u91cd\u547d\u540d\u5206\u7ec4", kCmdRenameGroup));
+        // 第 0 个标签就是盒子标题，删不掉（要删就删盒子）
+        if (f->activeGroup() > 0)
+            items.push_back(PopupMenuItem(L"\u5220\u9664\u5f53\u524d\u5206\u7ec4", kCmdDeleteGroup));
+    }
     // 头部右侧的锁按钮在「显示盒子标题」关掉时是看不见的，这里留一个出口，
     // 免得锁上之后没法再解开。
     items.push_back(PopupMenuItem(f->locked() ? L"\u89e3\u9501\u4f4d\u7f6e"    // 解锁位置
@@ -908,13 +992,42 @@ static void ShowFenceMenu(int fi, POINT sp) {
 
     if (!g_fenceMenu.Create()) return;
     g_fenceMenu.SetOwner(f->hwnd());
-    g_fenceMenu.onCommand = [fi](int id) {
+    g_fenceMenu.onCommand = [fi, item](int id) {
         FenceWindow* w = (fi < (int)g_fences.size()) ? g_fences[fi].get() : nullptr;
         if (!w) return;
+        if (id >= kCmdMoveToGroup && id < kCmdMoveToGroup + 28) {
+            const int g = id - kCmdMoveToGroup;
+            DesktopIconView* e = FenceItemAt(fi, item, nullptr);
+            if (e && g >= 0 && g < w->groupCount() && g != e->group) {
+                // 从当前位置摘出来再追加到目标分组末尾：分组内的顺序就是
+                // g_icons 里的相对顺序，所以「追加」= 排到那一组的最后。
+                auto it = std::find(g_icons.begin(), g_icons.end(), e);
+                if (it != g_icons.end()) {
+                    g_surface.ForgetHover();
+                    g_icons.erase(it);
+                }
+                e->group = g;
+                g_surface.ForgetHover();
+                g_icons.push_back(e);
+                SaveIconLayout();
+                RedrawAll();
+            }
+            return;
+        }
         if (id == kCmdNewFence) { NewFenceNear(fi); return; }
         if (id == kCmdNewFolder) { NewDesktopFolder(); return; }
         if (id == kCmdSettings) { g_settings.Show(); return; }
         if (id == kCmdRename) { BeginRenameFence(fi); return; }
+        if (id == kCmdNewGroup) {
+            // 先建出来（默认名「分组 N」并切过去），再直接打开输入框让人改名 ——
+            // 空标签既没法点也不好认，不如一步到位。
+            const int gi = w->AddGroup(std::wstring());
+            RedrawAll();
+            if (gi >= 0) BeginRenameGroup(fi, gi);
+            return;
+        }
+        if (id == kCmdRenameGroup) { BeginRenameGroup(fi, w->activeGroup()); return; }
+        if (id == kCmdDeleteGroup) { w->RemoveActiveGroup(); RedrawAll(); return; }
         if (id == kCmdLock) { w->ToggleLock(); return; }
         if (id >= kCmdSortName && id < kCmdSortName + 5) {
             // 换排序字段时保留当前的正序/倒序
@@ -953,7 +1066,7 @@ static void AddFenceWindow(int i) {
         }
         g_fences[i]->ApplyConfig(true);   // 亚克力底图要跟着新位置重抓
     };
-    f->onContextMenu = [i](int item, POINT sp) { ShowFenceMenu(i, sp); };
+    f->onContextMenu = [i](int item, POINT sp) { ShowFenceMenu(i, sp, item); };
     // 「查看 / 排序 / 重命名」改完之后存盘：配置（viewMode 等）+ 图标顺序
     f->onStateChanged = [i] {
         EnsureFenceIconSize(i);
