@@ -17,6 +17,7 @@
 #include "drag_layer.h"
 #include "fence_window.h"
 #include "layout_store.h"
+#include "popup_menu.h"
 #include "search_window.h"
 #include "settings_window.h"
 #include "shell_icons.h"
@@ -53,6 +54,9 @@ static std::vector<std::unique_ptr<FenceWindow>> g_fences;
 static TrayIcon g_tray;
 static SettingsWindow g_settings;
 static SearchWindow g_search;
+
+// 盒子的右键菜单（自绘，不是系统菜单）
+static PopupMenu g_fenceMenu;
 
 // 全局快捷键：Ctrl+Alt+D 唤出搜索面板
 static const int kHotkeyId = 1;
@@ -181,18 +185,52 @@ static void CommitPositions(const std::vector<DesktopIconView*>& list) {
     }
 }
 
+// 图标的位图尺寸跟着「所属盒子」的查看档位走：
+// 盒子里是「大图标」就真的加载 64px 的位图，回到桌面再换回 48px。
+// 只对盒子里的图标做（数量有限），桌面上 200 个图标始终是 48px。
+static void FitIconToOwner(DesktopIconView* e) {
+    if (!e) return;
+    int px = kIconPx;
+    if (e->owner >= 0 && e->owner < (int)g_fences.size() && g_fences[e->owner])
+        px = g_fences[e->owner]->iconPx();
+    if (e->bmp.width == px && e->bmp.height == px) return;
+    LoadShellIcon(e->path, px, e->bmp, g_config.shortcutArrow != 0);
+}
+
+// 某个盒子换了查看档位：把它的图标位图统一换到新尺寸
+static void EnsureFenceIconSize(int fi) {
+    for (auto* e : g_icons)
+        if (e && e->owner == fi) FitIconToOwner(e);
+}
+
 // 把图标插到盒子 fi 的第 vis 个可见位置（vis < 0 = 追加到末尾）。
 // 盒子的显示顺序 = g_icons 里过滤 owner 后的顺序，所以这里只挪指针的位置。
 static void InsertIntoFence(DesktopIconView* e, int fi, int vis) {
     if (!e || fi < 0 || fi >= (int)g_fences.size()) return;
+
+    // 拖拽期间布局不再排除被拖图标（原位保留、画暗当空位），所以 DropHint 给的
+    // 插入下标是按「完整列表」算的。删掉自己之后，它后面的下标都要减 1。
+    const bool sameFence = (e->owner == fi);
+    int srcIdx = -1;
+    if (sameFence) {
+        srcIdx = 0;
+        for (auto* o : g_icons) {
+            if (o == e) break;
+            if (o && o->owner == fi) ++srcIdx;
+        }
+    }
+
     auto it = std::find(g_icons.begin(), g_icons.end(), e);
     if (it != g_icons.end()) g_icons.erase(it);
     e->owner = fi;
     e->selected = false;
     e->dragPos = e->pos;
 
+    if (vis >= 0 && sameFence && vis > srcIdx) --vis;
+
     if (vis < 0) {
         g_icons.push_back(e);
+        FitIconToOwner(e);
         return;
     }
     std::vector<DesktopIconView*> mine;
@@ -200,10 +238,12 @@ static void InsertIntoFence(DesktopIconView* e, int fi, int vis) {
         if (o && o->owner == fi) mine.push_back(o);
     if (vis >= (int)mine.size()) {
         g_icons.push_back(e);
+        FitIconToOwner(e);
         return;
     }
     auto anchor = std::find(g_icons.begin(), g_icons.end(), mine[vis]);
     g_icons.insert(anchor, e);
+    FitIconToOwner(e);
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +266,7 @@ static void PlaceOnDesktop(DesktopIconView* e, POINT dropPt,
     e->dragPos = e->pos;
     e->owner = -1;
     e->selected = false;
+    FitIconToOwner(e);   // 回桌面 → 位图换回 48px
     std::vector<DesktopIconView*> one{e};
     CommitPositions(one);
     SaveIconLayout();
@@ -342,6 +383,8 @@ static void ApplyIconAppearance() {
     for (auto* e : g_icons) {
         if (e) LoadShellIcon(e->path, kIconPx, e->bmp, g_config.shortcutArrow != 0);
     }
+    // 盒子里可能是「大图标」，刚被统一成 48px 的得换回去
+    for (int i = 0; i < (int)g_fences.size(); ++i) EnsureFenceIconSize(i);
     g_surface.InvalidateCache();
     for (auto& f : g_fences) if (f) f->Redraw();
 }
@@ -441,6 +484,386 @@ static void SetDesktopIconsShown(bool shown) {
         RestoreZOrder();
     }
     g_tray.SetDesktopIconsVisible(shown);
+}
+
+// ---------------------------------------------------------------------------
+// 盒子右键菜单（自绘）——「新建盒子 / 新建文件夹 / 排序方式 / 查看 /
+// 打开设置面板 / 重命名分区」。排序方式、查看带二级菜单，和资源管理器一致。
+// ---------------------------------------------------------------------------
+enum {
+    kCmdNewFence = 4001,
+    kCmdNewFolder = 4002,
+    kCmdSortName = 4010,    // 4010..4014：名称 / 类型 / 大小 / 修改日期 / 自定义
+    kCmdSortAsc = 4020,
+    kCmdSortDesc = 4021,
+    kCmdViewSmall = 4030,   // 4030..4035：小 / 中 / 大 / 超大 / 列表 / 详情
+    kCmdSettings = 4040,
+    kCmdRename = 4041,
+};
+
+static void AddFenceWindow(int i);
+static void ShowFenceMenu(int fi, POINT sp);
+static void BeginRenameFence(int fi);
+
+// 新建盒子：摆在当前盒子右边，超出工作区就换到下一行
+static void NewFenceNear(int fi) {
+    const int w = 340, h = 380;
+    RECT base{200, 200, 200 + w, 200 + h};
+    if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) base = g_fences[fi]->rect();
+
+    RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromPoint(POINT{base.left, base.top}, MONITOR_DEFAULTTONEAREST);
+    if (mon && GetMonitorInfoW(mon, &mi)) lim = mi.rcWork;
+
+    int x = base.right + 20;
+    int y = base.top;
+    if (x + w > lim.right) {
+        x = lim.left + 40;
+        y = base.bottom + 20;
+    }
+    if (y + h > lim.bottom) y = lim.bottom - h;
+    if (x < lim.left) x = lim.left;
+    if (y < lim.top) y = lim.top;
+
+    FenceConfig c;
+    c.x = x;
+    c.y = y;
+    c.w = w;
+    c.h = h;
+    c.title = L"新盒子";
+    g_config.fences.push_back(c);
+    AddFenceWindow((int)g_config.fences.size() - 1);
+    g_config.Save();
+    LogStep("new fence #" + std::to_string((int)g_config.fences.size() - 1) + " at " +
+            std::to_string(x) + "," + std::to_string(y));
+}
+
+// 在真实桌面上新建文件夹（和资源管理器一样挑一个不重名的名字）
+static void NewDesktopFolder() {
+    PWSTR p = nullptr;
+    std::wstring dir;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &p)) && p) {
+        dir = p;
+        CoTaskMemFree(p);
+    }
+    if (dir.empty()) return;
+
+    std::wstring made;
+    for (int i = 1; i <= 200 && made.empty(); ++i) {
+        std::wstring path = dir + L"\\\u65b0\u5efa\u6587\u4ef6\u5939";
+        if (i > 1) path += L" (" + std::to_wstring(i) + L")";
+        if (CreateDirectoryW(path.c_str(), nullptr))
+            made = path;
+        else if (GetLastError() != ERROR_ALREADY_EXISTS)
+            break;
+    }
+    if (made.empty()) return;
+    LogStep("new folder " + Narrow(made));
+    // 不依赖 shell 通知，自己重新枚举一次，图标立刻出现
+    ReloadDesktopIcons();
+}
+
+// ---- 重命名分区 ----
+// 盒子是 WS_EX_NOACTIVATE 的分层窗口，拿不到键盘焦点，所以用一个能激活的小弹窗
+// 贴着盒子头部显示（回车提交 / Esc 取消 / 失去焦点也提交）。
+static HWND g_renameWnd = nullptr;
+static HWND g_renameEdit = nullptr;
+static WNDPROC g_renameEditProc = nullptr;
+static int g_renameFence = -1;
+
+static void FinishRename(bool commit) {
+    if (!g_renameWnd) return;
+    const int fi = g_renameFence;
+    std::wstring text;
+    if (commit && g_renameEdit) {
+        // 用 WM_GETTEXT 而不是 GetWindowTextW：输入框的文本可能是别的进程
+        // （自动化脚本）通过 WM_SETTEXT 写进来的，让 EDIT 自己回答更可靠
+        wchar_t buf[256]{};
+        SendMessageW(g_renameEdit, WM_GETTEXT, (WPARAM)255, (LPARAM)buf);
+        text = buf;
+        size_t a = 0, b = text.size();
+        while (a < b && (text[a] == L' ' || text[a] == L'\t')) ++a;
+        while (b > a && (text[b - 1] == L' ' || text[b - 1] == L'\t')) --b;
+        text = text.substr(a, b - a);
+    }
+    HWND wnd = g_renameWnd;
+    g_renameWnd = nullptr;
+    g_renameEdit = nullptr;
+    g_renameFence = -1;
+    DestroyWindow(wnd);
+
+    if (commit && !text.empty() && fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) {
+        g_fences[fi]->SetTitle(text);   // SetTitle 内部会存盘
+        LogStep("rename fence #" + std::to_string(fi) + " -> " + Narrow(text));
+    }
+}
+
+static LRESULT CALLBACK RenameEditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_KEYDOWN) {
+        if (w == VK_RETURN) {
+            FinishRename(true);
+            return 0;
+        }
+        if (w == VK_ESCAPE) {
+            FinishRename(false);
+            return 0;
+        }
+    }
+    // 回车/ESC 已经被吃掉，别再走 WM_CHAR，否则每敲一下都 ding
+    if (m == WM_CHAR && (w == L'\r' || w == L'\n' || w == 27)) return 0;
+    return CallWindowProcW(g_renameEditProc, h, m, w, l);
+}
+
+static LRESULT CALLBACK RenameProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ACTIVATE:
+        if (LOWORD(w) == WA_INACTIVE) FinishRename(true);
+        return 0;
+    case WM_CLOSE:
+        FinishRename(false);
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void BeginRenameFence(int fi) {
+    if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
+    FenceWindow* f = g_fences[fi].get();
+
+    if (g_renameWnd) FinishRename(false);
+
+    RECT r = f->rect();
+    const int headH = f->headerH();
+    const int w = std::min<int>((int)(r.right - r.left) - 24, 260);
+    const int h = std::max(24, headH - 14);
+    if (w < 40) return;
+
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = RenameProc;
+    wc.hInstance = inst;
+    wc.lpszClassName = L"MeowDeskRename";
+    wc.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassExW(&wc);
+
+    g_renameFence = fi;
+    g_renameWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"MeowDeskRename", L"",
+                                  WS_POPUP, r.left + 12, r.top + (headH - h) / 2, w, h,
+                                  nullptr, nullptr, inst, nullptr);
+    if (!g_renameWnd) {
+        g_renameFence = -1;
+        return;
+    }
+
+    g_renameEdit = CreateWindowExW(0, L"EDIT", f->title().c_str(),
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 3, 2,
+                                   w - 6, h - 4, g_renameWnd, (HMENU)1, inst, nullptr);
+    if (g_renameEdit) {
+        SendMessageW(g_renameEdit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+        SendMessageW(g_renameEdit, EM_SETSEL, 0, -1);
+        g_renameEditProc = (WNDPROC)SetWindowLongPtrW(g_renameEdit, GWLP_WNDPROC,
+                                                      (LONG_PTR)RenameEditProc);
+    }
+    ShowWindow(g_renameWnd, SW_SHOW);
+    SetForegroundWindow(g_renameWnd);
+    if (g_renameEdit) SetFocus(g_renameEdit);
+}
+
+static void ShowFenceMenu(int fi, POINT sp) {
+    if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
+    FenceWindow* f = g_fences[fi].get();
+
+    const int curSort = f->sortKey();
+    const bool asc = f->sortAsc();
+    const int curView = f->viewMode();
+
+    std::vector<PopupMenuItem> sortSub;
+    static const wchar_t* kSortNames[] = {L"\u540d\u79f0", L"\u7c7b\u578b", L"\u5927\u5c0f",
+                                          L"\u4fee\u6539\u65e5\u671f",
+                                          L"\u81ea\u5b9a\u4e49\u6392\u5e8f"};
+    for (int i = 0; i < 5; ++i) {
+        PopupMenuItem m(kSortNames[i], kCmdSortName + i);
+        m.checked = (curSort == i);
+        sortSub.push_back(std::move(m));
+    }
+    sortSub.push_back(PopupMenuItem::Sep());
+    {
+        PopupMenuItem m(L"\u6b63\u5e8f", kCmdSortAsc);   // 正序
+        m.checked = asc;
+        sortSub.push_back(std::move(m));
+    }
+    {
+        PopupMenuItem m(L"\u5012\u5e8f", kCmdSortDesc);  // 倒序
+        m.checked = !asc;
+        sortSub.push_back(std::move(m));
+    }
+
+    std::vector<PopupMenuItem> viewSub;
+    static const wchar_t* kViewNames[] = {
+        L"\u5c0f\u56fe\u6807",       // 小图标
+        L"\u4e2d\u7b49\u56fe\u6807",  // 中等图标
+        L"\u5927\u56fe\u6807",       // 大图标
+        L"\u8d85\u5927\u56fe\u6807",  // 超大图标
+        L"\u5217\u8868",             // 列表
+        L"\u8be6\u7ec6\u4fe1\u606f"};  // 详细信息
+    for (int i = 0; i < 6; ++i) {
+        PopupMenuItem m(kViewNames[i], kCmdViewSmall + i);
+        m.checked = (curView == i);
+        viewSub.push_back(std::move(m));
+    }
+
+    std::vector<PopupMenuItem> items;
+    items.push_back(PopupMenuItem(L"\u65b0\u5efa\u76d2\u5b50", kCmdNewFence));      // 新建盒子
+    items.push_back(PopupMenuItem(L"\u65b0\u5efa\u6587\u4ef6\u5939", kCmdNewFolder));  // 新建文件夹
+    items.push_back(PopupMenuItem::Sep());
+    {
+        PopupMenuItem m(L"\u6392\u5e8f\u65b9\u5f0f", 0);   // 排序方式
+        m.sub = std::move(sortSub);
+        items.push_back(std::move(m));
+    }
+    {
+        PopupMenuItem m(L"\u67e5\u770b", 0);                // 查看
+        m.sub = std::move(viewSub);
+        items.push_back(std::move(m));
+    }
+    items.push_back(PopupMenuItem::Sep());
+    items.push_back(
+        PopupMenuItem(L"\u6253\u5f00\u8bbe\u7f6e\u9762\u677f", kCmdSettings));  // 打开设置面板
+    items.push_back(PopupMenuItem(L"\u91cd\u547d\u540d\u5206\u533a", kCmdRename));  // 重命名分区
+
+    if (!g_fenceMenu.Create()) return;
+    g_fenceMenu.SetOwner(f->hwnd());
+    g_fenceMenu.onCommand = [fi](int id) {
+        FenceWindow* w = (fi < (int)g_fences.size()) ? g_fences[fi].get() : nullptr;
+        if (!w) return;
+        if (id == kCmdNewFence) { NewFenceNear(fi); return; }
+        if (id == kCmdNewFolder) { NewDesktopFolder(); return; }
+        if (id == kCmdSettings) { g_settings.Show(); return; }
+        if (id == kCmdRename) { BeginRenameFence(fi); return; }
+        if (id >= kCmdSortName && id < kCmdSortName + 5) {
+            // 换排序字段时保留当前的正序/倒序
+            w->SetSort(id - kCmdSortName, w->sortAsc());
+            return;
+        }
+        if (id == kCmdSortAsc) { w->SetSort(w->sortKey(), true); return; }
+        if (id == kCmdSortDesc) { w->SetSort(w->sortKey(), false); return; }
+        if (id >= kCmdViewSmall && id < kCmdViewSmall + 6) {
+            w->SetViewMode(id - kCmdViewSmall);
+            return;
+        }
+    };
+    g_fenceMenu.Show(sp, std::move(items));
+    LogStep("fence menu #" + std::to_string(fi));
+}
+
+// ---------------------------------------------------------------------------
+// 盒子（动态增删：菜单里的「新建盒子」要能加）
+// ---------------------------------------------------------------------------
+static void AddFenceWindow(int i) {
+    if (i < 0 || i >= (int)g_config.fences.size()) return;
+    auto f = std::make_unique<FenceWindow>();
+    const FenceConfig c = g_config.fences[i];
+    f->SetIcons(&g_icons);
+    f->onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
+    f->onGeometryChanged = [i] {
+        if (i >= (int)g_fences.size()) return;
+        RECT r = g_fences[i]->rect();
+        if (i < (int)g_config.fences.size()) {
+            g_config.fences[i].x = r.left;
+            g_config.fences[i].y = r.top;
+            g_config.fences[i].w = r.right - r.left;
+            g_config.fences[i].h = r.bottom - r.top;
+            g_config.Save();
+        }
+        g_fences[i]->ApplyConfig(true);   // 亚克力底图要跟着新位置重抓
+    };
+    f->onContextMenu = [i](int item, POINT sp) { ShowFenceMenu(i, sp); };
+    // 「查看 / 排序 / 重命名」改完之后存盘：配置（viewMode 等）+ 图标顺序
+    f->onStateChanged = [i] {
+        EnsureFenceIconSize(i);
+        g_config.Save();
+        SaveIconLayout();
+        RedrawAll();
+    };
+    f->onItemDragStart = [](DesktopIconView* e, POINT pt) {
+        g_draggingIcon = e;
+        ClearAllDropHints();
+        g_surface.SetDropPreview(false);
+        std::vector<DragGhost> ghosts;
+        DragGhost gh;
+        gh.bmp = &e->bmp;
+        gh.x = pt.x - e->bmp.width / 2;
+        gh.y = pt.y - e->bmp.height / 2;
+        gh.name = &e->name;
+        ghosts.push_back(gh);
+        g_drag.Show(ghosts);
+        RestoreZOrder();
+    };
+    f->onItemDragMove = [](DesktopIconView*, POINT pt) {
+        const IconBitmap* bm = (g_draggingIcon) ? &g_draggingIcon->bmp : nullptr;
+        if (!bm) return;
+        std::vector<DragGhost> ghosts;
+        DragGhost gh;
+        gh.bmp = bm;
+        gh.x = pt.x - bm->width / 2;
+        gh.y = pt.y - bm->height / 2;
+        if (g_draggingIcon) gh.name = &g_draggingIcon->name;
+        ghosts.push_back(gh);
+        g_drag.Show(ghosts);
+        UpdateAllDropHints(pt);
+        // 拖离所有盒子 → 在真实桌面上的落点画预览框
+        if (FenceIndexAt(pt) < 0)
+            g_surface.SetDropPreview(true, g_surface.CellForCursor(pt, bm));
+        else
+            g_surface.SetDropPreview(false);
+    };
+    f->onItemDrop = [](DesktopIconView* e, POINT pt) {
+        g_drag.Hide();
+        g_draggingIcon = nullptr;
+        g_surface.SetDropPreview(false);
+
+        const int fi = FenceIndexAt(pt);
+        FenceWindow::DropHint h;
+        if (fi >= 0 && g_fences[fi]) h = g_fences[fi]->dropHint();
+        ClearAllDropHints();
+
+        if (fi >= 0) {
+            if (h.openWith())
+                OpenWithDragged(e, FenceItemAt(fi, h.item, e));   // 盒子内：中间 → 打开方式
+            else
+                InsertIntoFence(e, fi, h.active() ? h.insert : -1);
+        } else {
+            std::vector<DesktopIconView*> pending;
+            PlaceOnDesktop(e, pt, pending);   // 盒子 → 桌面
+        }
+        SaveIconLayout();
+        RedrawAll();
+    };
+
+    if (!f->Create(i, c.x, c.y, c.w, c.h))
+        LogStep("fence create FAILED " + std::to_string(i));
+    // 即使创建失败也占位，保证 g_fences 下标 == 配置下标
+    g_fences.push_back(std::move(f));
+
+    if (g_fences[i] && g_fences[i]->hwnd()) {
+        InstallKeepAbove(g_fences[i]->hwnd(), [i] { return FenceAnchor(i); });
+        PlaceAbove(g_fences[i]->hwnd(), FenceAnchor(i));
+        // 拖动时避让其他盒子（用实时窗口矩形，收起状态的盒子只占一条头部）
+        g_fences[i]->SetObstacles([i] {
+            std::vector<RECT> v;
+            for (size_t k = 0; k < g_fences.size(); ++k) {
+                if ((int)k == i) continue;
+                if (g_fences[k] && g_fences[k]->hwnd()) v.push_back(g_fences[k]->rect());
+            }
+            return v;
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -613,100 +1036,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 
     // 6. 盒子
-    for (size_t i = 0; i < g_config.fences.size(); ++i) {
-        auto f = std::make_unique<FenceWindow>();
-        const FenceConfig& c = g_config.fences[i];
-        f->SetIcons(&g_icons);
-        f->onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
-        f->onGeometryChanged = [i] {
-            if (i >= g_fences.size()) return;
-            RECT r = g_fences[i]->rect();
-            if (i < g_config.fences.size()) {
-                g_config.fences[i].x = r.left;
-                g_config.fences[i].y = r.top;
-                g_config.fences[i].w = r.right - r.left;
-                g_config.fences[i].h = r.bottom - r.top;
-                g_config.Save();
-            }
-            g_fences[i]->ApplyConfig(true);   // 亚克力底图要跟着新位置重抓
-        };
-        f->onItemDragStart = [](DesktopIconView* e, POINT pt) {
-            g_draggingIcon = e;
-            ClearAllDropHints();
-            g_surface.SetDropPreview(false);
-            std::vector<DragGhost> ghosts;
-            DragGhost gh;
-            gh.bmp = &e->bmp;
-            gh.x = pt.x - e->bmp.width / 2;
-            gh.y = pt.y - e->bmp.height / 2;
-            gh.name = &e->name;
-            ghosts.push_back(gh);
-            g_drag.Show(ghosts);
-            RestoreZOrder();
-        };
-        f->onItemDragMove = [](DesktopIconView*, POINT pt) {
-            const IconBitmap* bm = (g_draggingIcon) ? &g_draggingIcon->bmp : nullptr;
-            if (!bm) return;
-            std::vector<DragGhost> ghosts;
-            DragGhost gh;
-            gh.bmp = bm;
-            gh.x = pt.x - bm->width / 2;
-            gh.y = pt.y - bm->height / 2;
-            if (g_draggingIcon) gh.name = &g_draggingIcon->name;
-            ghosts.push_back(gh);
-            g_drag.Show(ghosts);
-            UpdateAllDropHints(pt);
-            // 拖离所有盒子 → 在真实桌面上的落点画预览框
-            if (FenceIndexAt(pt) < 0)
-                g_surface.SetDropPreview(true, g_surface.CellForCursor(pt, bm));
-            else
-                g_surface.SetDropPreview(false);
-        };
-        f->onItemDrop = [](DesktopIconView* e, POINT pt) {
-            g_drag.Hide();
-            g_draggingIcon = nullptr;
-            g_surface.SetDropPreview(false);
-
-            const int fi = FenceIndexAt(pt);
-            FenceWindow::DropHint h;
-            if (fi >= 0 && g_fences[fi]) h = g_fences[fi]->dropHint();
-            ClearAllDropHints();
-
-            if (fi >= 0) {
-                if (h.openWith())
-                    OpenWithDragged(e, FenceItemAt(fi, h.item, e));   // 盒子内：中间 → 打开方式
-                else
-                    InsertIntoFence(e, fi, h.active() ? h.insert : -1);
-            } else {
-                std::vector<DesktopIconView*> pending;
-                PlaceOnDesktop(e, pt, pending);   // 盒子 → 桌面
-            }
-            SaveIconLayout();
-            RedrawAll();
-        };
-
-        if (!f->Create((int)i, c.x, c.y, c.w, c.h))
-            LogStep("fence create FAILED " + std::to_string(i));
-        // 即使创建失败也占位，保证 g_fences 下标 == 配置下标
-        g_fences.push_back(std::move(f));
-    }
-    for (size_t i = 0; i < g_fences.size(); ++i) {
-        InstallKeepAbove(g_fences[i]->hwnd(), [i] { return FenceAnchor((int)i); });
-        PlaceAbove(g_fences[i]->hwnd(), FenceAnchor((int)i));
-        // 拖动时避让其他盒子（用实时窗口矩形，收起状态的盒子只占一条头部）
-        g_fences[i]->SetObstacles([i] {
-            std::vector<RECT> v;
-            for (size_t k = 0; k < g_fences.size(); ++k) {
-                if (k == i) continue;
-                if (g_fences[k] && g_fences[k]->hwnd()) v.push_back(g_fences[k]->rect());
-            }
-            return v;
-        });
-    }
+    for (int i = 0; i < (int)g_config.fences.size(); ++i) AddFenceWindow(i);
     LogStep("fences created: " + std::to_string(g_fences.size()));
 
     // 盒子建好之后才能校验盒号 → 在这里还原上次的图标布局
     ApplyIconLayout();
+    // 还原完归属才知道哪些图标在盒子里，这时再把它们换成「查看」档位对应的尺寸
+    for (int i = 0; i < (int)g_fences.size(); ++i) EnsureFenceIconSize(i);
     RedrawAll();   // 盒子创建时就已经画过一次（那时还是空的），还原后必须重画
 
     // 7. 设置窗口 + 托盘 + 搜索面板

@@ -26,6 +26,7 @@ add_executable(meow-desk WIN32
     src/tray.cpp
     src/settings_window.cpp
     src/search_window.cpp
+    src/popup_menu.cpp
     src/pinyin.cpp
     src/layout_store.cpp
     # 本地存储用 SQLite 3 的 amalgamation（单文件，无外部依赖）。
@@ -68,4 +69,20 @@ target_compile_definitions(meow-desk PRIVATE
 
 if(MSVC)
     target_compile_options(meow-desk PRIVATE /W3 /utf-8)
+endif()
+
+# ---------------------------------------------------------------------------
+# 安装程序：把一个 meow-desk.exe 复制到用户选定位置，
+# 并决定数据放 %APPDATA% 还是 exe 同目录（便携模式）。
+# 它从自己所在目录读 meow-desk.exe，所以两者要放在一起分发（见 package.sh）。
+# ---------------------------------------------------------------------------
+add_executable(meow-setup WIN32 setup/setup.cpp)
+
+set_property(TARGET meow-setup PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+target_link_libraries(meow-setup PRIVATE user32 gdi32 shell32 ole32 shlwapi comctl32 dwmapi)
+target_compile_definitions(meow-setup PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+
+if(MSVC)
+    target_compile_options(meow-setup PRIVATE /W3 /utf-8)
 endif()

@@ -2,6 +2,8 @@
 
 #include <shlobj.h>
 
+#include <string>
+
 #include "sqlite3.h"
 
 #pragma comment(lib, "shell32.lib")
@@ -17,7 +19,9 @@ std::wstring g_dir;
 std::wstring g_file;
 
 // schema 版本：以后加字段就 +1，并在 Upgrade() 里补一段迁移
-const int kSchemaVersion = 1;
+//   v1 — 初版：app / fence / icon_layout
+//   v2 — fence 表加 viewMode / sortKey / sortAsc（每个盒子各自的「查看」「排序」）
+const int kSchemaVersion = 2;
 
 void SetError(const char* what) {
     g_lastError = what ? what : "";
@@ -27,8 +31,16 @@ void SetError(const char* what) {
     }
 }
 
-bool Upgrade() {
-    // 全新的库：建表
+// 只用于迁移：列已经存在时 ALTER 会报错，这里直接忽略（幂等）
+void AddColumn(const char* table, const char* col, const char* decl) {
+    if (!g_db) return;
+    const std::string sql =
+        std::string("ALTER TABLE ") + table + " ADD COLUMN " + col + " " + decl;
+    sqlite3_exec(g_db, sql.c_str(), nullptr, nullptr, nullptr);
+}
+
+bool Upgrade(int from) {
+    // 全新的库：建表（带最新列）
     const char* kSchema =
         "CREATE TABLE IF NOT EXISTS app ("
         "  k TEXT PRIMARY KEY,"
@@ -40,7 +52,10 @@ bool Upgrade() {
         "  w INTEGER NOT NULL, h INTEGER NOT NULL,"
         "  color INTEGER NOT NULL, alpha INTEGER NOT NULL,"
         "  radius INTEGER NOT NULL, acrylic INTEGER NOT NULL,"
-        "  title TEXT NOT NULL"
+        "  title TEXT NOT NULL,"
+        "  viewMode INTEGER NOT NULL DEFAULT 1,"
+        "  sortKey  INTEGER NOT NULL DEFAULT 4,"
+        "  sortAsc  INTEGER NOT NULL DEFAULT 1"
         ");"
         "CREATE TABLE IF NOT EXISTS icon_layout ("
         "  path  TEXT PRIMARY KEY,"     // 解析名，唯一且稳定
@@ -52,7 +67,15 @@ bool Upgrade() {
         SetError("create tables");
         return false;
     }
-    if (sqlite3_exec(g_db, "PRAGMA user_version=1;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+
+    if (from < 2) {
+        AddColumn("fence", "viewMode", "INTEGER NOT NULL DEFAULT 1");
+        AddColumn("fence", "sortKey", "INTEGER NOT NULL DEFAULT 4");
+        AddColumn("fence", "sortAsc", "INTEGER NOT NULL DEFAULT 1");
+    }
+
+    const std::string ver = "PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";";
+    if (sqlite3_exec(g_db, ver.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {
         SetError("set user_version");
         return false;
     }
@@ -61,16 +84,47 @@ bool Upgrade() {
 
 }  // namespace
 
+// 程序自己所在的目录（便携模式用）
+std::wstring ExeDir() {
+    wchar_t buf[MAX_PATH * 2]{};
+    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH * 2);
+    if (n == 0) return std::wstring();
+    std::wstring p(buf, n);
+    const size_t k = p.find_last_of(L'\\');
+    return k == std::wstring::npos ? std::wstring() : p.substr(0, k);
+}
+
+// 数据目录的优先级：
+//   1) 环境变量 MEOW_DATA_DIR —— 调试 / 自动化测试用，能指到临时目录
+//   2) exe 同目录存在 meow-desk.portable —— 便携模式（setup 里选「与程序同目录」时写的）
+//   3) 默认 %APPDATA%\meow-desk
+// 安装程序只负责创建/删除那个标记文件，具体用哪个目录由这里说了算，
+// 这样即使 marker 被手工删掉也能干净地回到 %APPDATA% 行为。
 const std::wstring& Dir() {
     if (!g_dir.empty()) return g_dir;
-    wchar_t* appdata = nullptr;
+
     std::wstring dir;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata)) && appdata) {
-        dir = appdata;
-        CoTaskMemFree(appdata);
+    wchar_t env[MAX_PATH * 2]{};
+    if (GetEnvironmentVariableW(L"MEOW_DATA_DIR", env, MAX_PATH * 2) > 0) {
+        dir = env;
+    } else {
+        const std::wstring exe = ExeDir();
+        const bool portable =
+            !exe.empty() &&
+            GetFileAttributesW((exe + L"\\meow-desk.portable").c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (portable) {
+            dir = exe;
+        } else {
+            wchar_t* appdata = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata)) &&
+                appdata) {
+                dir = appdata;
+                CoTaskMemFree(appdata);
+            }
+            if (dir.empty()) dir = L".";
+            dir += L"\\meow-desk";
+        }
     }
-    if (dir.empty()) dir = L".";
-    dir += L"\\meow-desk";
     CreateDirectoryW(dir.c_str(), nullptr);
     g_dir = dir;
     return g_dir;
@@ -111,7 +165,7 @@ bool Open() {
     Stmt st("PRAGMA user_version");
     if (st.ok() && st.step()) version = st.colInt(0);
     if (version < kSchemaVersion) {
-        if (!Upgrade()) {
+        if (!Upgrade(version)) {
             sqlite3_close(g_db);
             g_db = nullptr;
             return false;

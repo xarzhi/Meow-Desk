@@ -102,6 +102,9 @@ void LoadLegacyIni(AppConfig& c) {
         else if (k == L"radius") cur.radius = ToInt(v, 12);
         else if (k == L"acrylic") cur.acrylic = ToInt(v, 0);
         else if (k == L"title") cur.title = v;
+        else if (k == L"viewMode") cur.viewMode = ToInt(v, 1);
+        else if (k == L"sortKey") cur.sortKey = ToInt(v, 4);
+        else if (k == L"sortAsc") cur.sortAsc = ToInt(v, 1);
     }
     if (inFence && hasFence) c.fences.push_back(cur);
     fclose(f);
@@ -125,7 +128,8 @@ bool ConfigFromDb(AppConfig& c) {
     }
     {
         storage::Stmt st(
-            "SELECT x,y,w,h,color,alpha,radius,acrylic,title FROM fence ORDER BY id");
+            "SELECT x,y,w,h,color,alpha,radius,acrylic,title,viewMode,sortKey,sortAsc"
+            " FROM fence ORDER BY id");
         if (!st.ok()) return false;
         while (st.step()) {
             FenceConfig f;
@@ -138,6 +142,9 @@ bool ConfigFromDb(AppConfig& c) {
             f.radius = st.colInt(6);
             f.acrylic = st.colInt(7);
             f.title = st.colText(8);
+            f.viewMode = st.colInt(9);
+            f.sortKey = st.colInt(10);
+            f.sortAsc = st.colInt(11);
             c.fences.push_back(std::move(f));
         }
     }
@@ -208,8 +215,9 @@ void AppConfig::Save() const {
         put(L"autoExpandOnHover", autoExpandOnHover);
 
         storage::Stmt fs(
-            "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title)"
-            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
+            "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title,"
+            "viewMode,sortKey,sortAsc)"
+            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)");
         for (size_t i = 0; i < fences.size() && fs.ok(); ++i) {
             const FenceConfig& c = fences[i];
             fs.bindInt(1, (int)i);
@@ -222,6 +230,9 @@ void AppConfig::Save() const {
             fs.bindInt(8, c.radius);
             fs.bindInt(9, c.acrylic);
             fs.bindText(10, c.title);
+            fs.bindInt(11, c.viewMode);
+            fs.bindInt(12, c.sortKey);
+            fs.bindInt(13, c.sortAsc);
             ok = fs.done() && ok;
             fs.reset();
         }

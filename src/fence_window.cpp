@@ -3,6 +3,7 @@
 #include <windowsx.h>
 #include <objidl.h>
 #include <propidl.h>
+#include <shlwapi.h>
 #include <gdiplus.h>
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include "icon_render.h"
 
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 using namespace Gdiplus;
 
@@ -23,8 +25,7 @@ namespace {
 const wchar_t* kClass = L"MeowDeskFence";
 
 const int kPad = 14;
-const int kCellW = 74;
-const int kCellH = 62;
+const int kCellWDefault = 74;
 
 // 四条边/四角可以拖拽改大小的判定宽度
 const int kEdgeMargin = 6;
@@ -48,6 +49,45 @@ void AddRoundRect(GraphicsPath& p, const RectF& r, float rad) {
 }
 
 int Lighten(int v, double k) { return (int)(v + (255 - v) * k + 0.5); }
+
+// 「查看」各档对应的格子宽度。和资源管理器一样：档位越大格子越宽（每行放得更少），
+// 列表 / 详情直接变成宽格子，一行一个。
+int CellWForMode(int m) {
+    switch (m) {
+    case 0: return 58;                    // 小图标
+    case 2: return 92;                    // 大图标
+    case 3: return 110;                   // 超大图标
+    case 4: return 190;                   // 列表
+    case 5: return 240;                   // 详情
+    default: return kCellWDefault;        // 中等图标
+    }
+}
+
+// 排序用的元数据：只有用户点「排序方式」时才批量读一次，平时不读。
+struct SortInfo {
+    std::wstring name;
+    std::wstring ext;      // 小写扩展名，代表「类型」
+    long long size = 0;
+    FILETIME mtime{};
+    bool isDir = false;
+};
+
+void FillSortInfo(DesktopIconView* e, SortInfo& s) {
+    s.name = e->name;
+    const size_t dot = e->name.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot + 1 < e->name.size())
+        s.ext = e->name.substr(dot + 1);
+    for (auto& c : s.ext)
+        if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!e->path.empty() &&
+        GetFileAttributesExW(e->path.c_str(), GetFileExInfoStandard, &fad)) {
+        s.isDir = (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        s.size = ((long long)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        s.mtime = fad.ftLastWriteTime;
+    }
+}
 
 bool IsLight(COLORREF c) {
     double l = 0.299 * GetRValue(c) + 0.587 * GetGValue(c) + 0.114 * GetBValue(c);
@@ -76,13 +116,13 @@ void FenceWindow::Collect(std::vector<DesktopIconView*>& out) const {
 }
 
 int FenceWindow::CellCols() const {
-    int n = (width_ - kPad * 2) / kCellW;
+    int n = (width_ - kPad * 2) / cellW_;
     if (n < 1) n = 1;
     return n;
 }
 
 int FenceWindow::minW() const {
-    return kPad * 2 + kCellW;   // 至少放得下一列
+    return kPad * 2 + cellW_;   // 至少放得下一列
 }
 
 int FenceWindow::minH() const {
@@ -202,16 +242,178 @@ void FenceWindow::ApplyResize(POINT screenPt) {
     Redraw();
 }
 
+// ---------------------------------------------------------------------------
+// 查看 / 排序（右键菜单驱动）
+// ---------------------------------------------------------------------------
+int FenceWindow::cellH() const {
+    switch (viewMode()) {
+    case 0: return showLabels_ ? 64 : 50;     // 小图标
+    case 2: return showLabels_ ? 102 : 82;    // 大图标
+    case 3: return showLabels_ ? 126 : 102;   // 超大图标
+    case 4:                                    // 列表
+    case 5: return showLabels_ ? 52 : 44;      // 详情（图标 48px，行高留到 52）
+    default: return showLabels_ ? 84 : kCellHCompact;   // 中等图标
+    }
+}
+
+int FenceWindow::viewMode() const { return cfg_ ? cfg_->viewMode : 1; }
+int FenceWindow::sortKey() const { return cfg_ ? cfg_->sortKey : 4; }
+bool FenceWindow::sortAsc() const { return cfg_ ? cfg_->sortAsc != 0 : true; }
+
+// 「查看」档位对应的图标像素尺寸。
+// 图标位图是每个图标一份，盒子里的数量有限（十几个），按档位重载是划算的：
+// 真的放大图标才有「大图标」的样子，只把格子撑大看起来只是间距变松。
+int FenceWindow::iconPx() const {
+    switch (viewMode()) {
+    case 0: return 32;    // 小
+    case 2: return 64;    // 大
+    case 3: return 96;    // 超大
+    case 4: return 32;    // 列表
+    default: return 48;   // 中等 / 详情
+    }
+}
+
+void FenceWindow::SetViewMode(int m) {
+    if (m < 0 || m > 5) return;
+    if (cfg_) cfg_->viewMode = m;
+
+    const int w = CellWForMode(m);
+    if (w != cellW_) {
+        cellW_ = w;
+        // 格子宽了/窄了，标签可用的宽度也变了，缓存得重做
+        labels_.clear();
+        labelKeys_.clear();
+    }
+    if (m == 5) BuildDetailInfo();
+    else detailInfo_.clear();
+    sel_ = -1;
+    hot_ = -1;
+    Redraw();
+    if (onStateChanged) onStateChanged();
+}
+
+// 详情列：「3.2 MB」/「文件夹」这类文本，读一次文件属性缓存起来。
+// 盒子里的图标一般十几个，一次 IO 完全可以接受；渲染时不再碰磁盘。
+void FenceWindow::BuildDetailInfo() {
+    detailInfo_.clear();
+    if (!all_) return;
+    for (auto* e : *all_) {
+        if (!e || e->owner != index_) continue;
+        std::wstring text;
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (!e->path.empty() &&
+            GetFileAttributesExW(e->path.c_str(), GetFileExInfoStandard, &fad)) {
+            if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                text = L"\u6587\u4ef6\u5939";   // 文件夹
+            } else {
+                const long long n =
+                    ((long long)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+                wchar_t buf[64]{};
+                if (n < 1024)
+                    swprintf_s(buf, L"%lld B", n);
+                else if (n < 1024LL * 1024)
+                    swprintf_s(buf, L"%.1f KB", n / 1024.0);
+                else if (n < 1024LL * 1024 * 1024)
+                    swprintf_s(buf, L"%.1f MB", n / (1024.0 * 1024.0));
+                else
+                    swprintf_s(buf, L"%.2f GB", n / (1024.0 * 1024.0 * 1024.0));
+                text = buf;
+            }
+        }
+        detailInfo_[e] = text;
+    }
+}
+
+void FenceWindow::SetSort(int key, bool asc) {
+    if (key < 0 || key > 4) return;
+    if (cfg_) {
+        cfg_->sortKey = key;
+        cfg_->sortAsc = asc ? 1 : 0;
+    }
+    SortNow();
+    sel_ = -1;
+    hot_ = -1;
+    Redraw();
+    if (onStateChanged) onStateChanged();
+}
+
+void FenceWindow::SetTitle(const std::wstring& t) {
+    if (!cfg_) return;
+    cfg_->title = t;
+    Redraw();
+    if (onStateChanged) onStateChanged();
+}
+
+std::wstring FenceWindow::title() const { return cfg_ ? cfg_->title : std::wstring(); }
+
+// 重排本盒子图标在全局表里的相对顺序。
+// 只动 owner == index_ 的那些槽位，盒子里第 k 个图标因此变成第 k 个排序结果 ——
+// 布局完全由「表里的相对顺序」决定，所以排完不用通知任何人。
+void FenceWindow::SortNow() {
+    if (!all_ || !cfg_) return;
+    const int key = cfg_->sortKey;
+    if (key < 0 || key > 3) return;   // 4 = 自定义：保持用户自己拖出来的顺序
+
+    std::vector<DesktopIconView*> mine;
+    for (auto* e : *all_)
+        if (e && e->owner == index_) mine.push_back(e);
+    if (mine.size() < 2) return;
+
+    std::vector<SortInfo> info(mine.size());
+    for (size_t i = 0; i < mine.size(); ++i) FillSortInfo(mine[i], info[i]);
+
+    std::vector<size_t> idx(mine.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+
+    std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+        const SortInfo& x = info[a];
+        const SortInfo& y = info[b];
+        // 目录永远排前面（和资源管理器一致）
+        if (x.isDir != y.isDir) return x.isDir;
+        int c = 0;
+        switch (key) {
+        case 0:   // 名称：用逻辑排序，文件2 排在 文件10 前面
+            c = StrCmpLogicalW(x.name.c_str(), y.name.c_str());
+            break;
+        case 1:   // 类型：按扩展名，同类再按名称
+            c = StrCmpLogicalW(x.ext.c_str(), y.ext.c_str());
+            if (c == 0) c = StrCmpLogicalW(x.name.c_str(), y.name.c_str());
+            break;
+        case 2:   // 大小：同大小按名称
+            c = (x.size < y.size) ? -1 : (x.size > y.size ? 1 : 0);
+            if (c == 0) c = StrCmpLogicalW(x.name.c_str(), y.name.c_str());
+            break;
+        default:  // 修改日期：同一时刻按名称
+            c = CompareFileTime(&x.mtime, &y.mtime);
+            if (c == 0) c = StrCmpLogicalW(x.name.c_str(), y.name.c_str());
+            break;
+        }
+        return c < 0;
+    });
+
+    if (!cfg_->sortAsc) std::reverse(idx.begin(), idx.end());
+
+    std::vector<DesktopIconView*> ordered;
+    ordered.reserve(idx.size());
+    for (size_t i : idx) ordered.push_back(mine[i]);
+
+    size_t k = 0;
+    for (size_t i = 0; i < all_->size() && k < ordered.size(); ++i) {
+        DesktopIconView* e = (*all_)[i];
+        if (e && e->owner == index_) (*all_)[i] = ordered[k++];
+    }
+}
+
 bool FenceWindow::ItemOrigin(int index, int& x, int& y) const {
     const int cols = CellCols();
-    const int gridW = cols * kCellW;
+    const int gridW = cols * cellW_;
     int ox = (width_ - gridW) / 2;
     if (ox < kPad) ox = kPad;
     if (index < 0) return false;
     const int c = index % cols;
     const int r = index / cols;
     const int ch = cellH();
-    x = ox + c * kCellW;
+    x = ox + c * cellW_;
     y = headerH_ + kPad + r * ch;
     return y + ch <= curH_ - kPad;
 }
@@ -304,7 +506,7 @@ int FenceWindow::HitItem(POINT clientPt) const {
     for (size_t i = 0; i < mine.size(); ++i) {
         int ix = 0, iy = 0;
         if (!ItemOrigin((int)i, ix, iy)) continue;
-        if (clientPt.x >= ix && clientPt.x < ix + kCellW &&
+        if (clientPt.x >= ix && clientPt.x < ix + cellW_ &&
             clientPt.y >= iy && clientPt.y < iy + ch)
             return (int)i;
     }
@@ -316,8 +518,8 @@ void FenceWindow::CollectVisible(std::vector<DesktopIconView*>& out) const {
     if (!all_) return;
     for (auto* e : *all_) {
         if (!e || e->owner != index_) continue;
-        // 正在被拖出去的那个不参与布局（视觉上它已经跟着光标走了）
-        if (itemDragging_ && e == dragged_) continue;
+        // 正在被拖出去的那个仍然占着原来的格子：布局不能动，否则后面的图标
+        // 会在松手之前就往前挤。它由 Paint() 画成半透明的「空位」。
         out.push_back(e);
     }
 }
@@ -363,13 +565,13 @@ void FenceWindow::UpdateDropHint(POINT screenPt) {
     if (it >= 0) {
         int ix = 0, iy = 0;
         ItemOrigin(it, ix, iy);
-        const int third = kCellW / 3;
+        const int third = cellW_ / 3;
         const int rx = pt.x - ix;
         d.item = it;
         if (rx < third) {
             d.zone = -1;
             d.insert = it;
-        } else if (rx >= kCellW - third) {
+        } else if (rx >= cellW_ - third) {
             d.zone = 1;
             d.insert = it + 1;
         } else {
@@ -519,6 +721,16 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
+
+    case WM_RBUTTONUP: {
+        // 右键菜单：盒子内是自绘菜单（不是系统菜单）
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        POINT sp = pt;
+        ClientToScreen(h, &sp);
+        const int it = (pt.y >= headerH_ && !collapsed_) ? HitItem(pt) : -1;
+        if (onContextMenu) onContextMenu(it, sp);
+        return 0;
+    }
 
     case WM_LBUTTONUP: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -748,13 +960,13 @@ void FenceWindow::Paint() {
             }
         }
 
-        // ---- 悬停高亮 ----
-        if (!collapsed_ && hot_ >= 0) {
+        // ---- 悬停高亮（拖动中不画：被拖的那个已变成"空位"，再套一层高亮很乱）----
+        if (!collapsed_ && hot_ >= 0 && !itemDragging_) {
             int ix = 0, iy = 0;
             if (ItemOrigin(hot_, ix, iy)) {
                 GraphicsPath cell;
                 AddRoundRect(cell, RectF((float)ix + 2, (float)iy + 2,
-                                         (float)kCellW - 4, (float)cellH() - 4),
+                                         (float)cellW_ - 4, (float)cellH() - 4),
                              8.0f);
                 SolidBrush hl{light ? Color(26, 0, 0, 0) : Color(52, 255, 255, 255)};
                 gfx.FillPath(&hl, &cell);
@@ -762,12 +974,12 @@ void FenceWindow::Paint() {
         }
 
         // ---- 单击选中高亮（双击才打开，所以要有可见的选中态）----
-        if (!collapsed_ && sel_ >= 0) {
+        if (!collapsed_ && sel_ >= 0 && !itemDragging_) {
             int sx = 0, sy = 0;
             if (ItemOrigin(sel_, sx, sy)) {
                 GraphicsPath cell;
                 AddRoundRect(cell,
-                             RectF((float)sx + 3.0f, (float)sy + 3.0f, (float)kCellW - 6.0f,
+                             RectF((float)sx + 3.0f, (float)sy + 3.0f, (float)cellW_ - 6.0f,
                                    (float)cellH() - 6.0f),
                              8.0f);
                 // 浅色卡片上用暗一点的高亮，深色卡片上用亮一点的
@@ -788,7 +1000,7 @@ void FenceWindow::Paint() {
                     GraphicsPath cell;
                     AddRoundRect(cell,
                                  RectF((float)ix + 3.0f, (float)iy + 3.0f,
-                                       (float)kCellW - 6.0f, (float)cellH() - 6.0f),
+                                       (float)cellW_ - 6.0f, (float)cellH() - 6.0f),
                                  8.0f);
                     SolidBrush fill{Color(58, 0, 120, 215)};
                     gfx.FillPath(&fill, &cell);
@@ -797,7 +1009,7 @@ void FenceWindow::Paint() {
                 } else {
                     // 左/右：画一条竖缝隙线，告诉用户松手会插在哪
                     const float lx = (drop_.zone < 0) ? (float)ix + 0.5f
-                                                      : (float)(ix + kCellW) - 3.5f;
+                                                      : (float)(ix + cellW_) - 3.5f;
                     GraphicsPath bar;
                     AddRoundRect(bar,
                                  RectF(lx, (float)iy + 6.0f, 3.0f, (float)cellH() - 12.0f),
@@ -837,29 +1049,97 @@ void FenceWindow::Paint() {
             int ix = 0, iy = 0;
             if (!ItemOrigin((int)i, ix, iy)) break;
 
+            // 正在被拖的那个留在原位当「空位」：变淡 + 变暗，松手后才重新排位
+            const bool ghost = itemDragging_ && mine[i] == dragged_;
+            const int ga = ghost ? 110 : 255;   // 不透明度
+            const int gd = ghost ? 120 : 255;   // 额外压暗
+
             const IconBitmap& bm = mine[i]->bmp;
+            const bool listMode = IsListView();
+            const int iconW = bm.valid() ? bm.width : 48;
+            const int iconH = bm.valid() ? bm.height : 48;
+            // 列表 / 详情：图标靠左、文字在右边一行；其它模式：图标居中、文字在下方
+            const int iconX = listMode ? ix + 8 : ix + (cellW_ - iconW) / 2;
+            const int iconY = listMode ? iy + (ch - iconH) / 2
+                                       : iy + (showLabels_ ? 4 : (ch - iconH) / 2);
             if (bm.valid()) {
-                int iyIcon = iy + (showLabels_ ? 4 : (ch - bm.height) / 2);
-                BlendInto(dst, bufW_, bufH_, bm.pixels.data(), bm.width, bm.height,
-                          ix + (kCellW - bm.width) / 2, iyIcon);
+                BlendIntoDim(dst, bufW_, bufH_, bm.pixels.data(), bm.width, bm.height,
+                             iconX, iconY, ga, gd);
             }
 
             if (showLabels_ && !mine[i]->name.empty()) {
-                const int iconBottom = iy + 4 + (bm.valid() ? bm.height : 48);
-                const int textTop = iconBottom + 2;
-                int textH = ch - (textTop - iy);
-                if (textH < 14) textH = 14;
                 // 和桌面图标标题保持一致：白字 + 柔和黑光晕，光晕受「文字阴影」开关控制
                 const int glow = g_config.textShadow ? 2 : 0;
-                LabelDib* lab = LabelOf(mine[i], kCellW - 8, textH, glow);
-                if (lab && lab->valid()) {
-                    int contentW = lab->w - lab->pad * 2;
-                    int left = ix + (kCellW - contentW) / 2 - lab->pad;
-                    BlendInto(dst, bufW_, bufH_,
-                              reinterpret_cast<const BYTE*>(lab->bits), lab->w, lab->h,
-                              left, textTop - lab->pad);
+                if (listMode) {
+                    const int labW = std::max(24, cellW_ - iconW - 24);
+                    LabelDib* lab = LabelOf(mine[i], labW, iconH, glow);
+                    if (lab && lab->valid()) {
+                        const int left = iconX + iconW + 8 - lab->pad;
+                        const int top = iy + (ch - lab->h) / 2;
+                        BlendIntoDim(dst, bufW_, bufH_,
+                                     reinterpret_cast<const BYTE*>(lab->bits), lab->w, lab->h,
+                                     left, top, ga, gd);
+                    }
+                } else {
+                    const int iconBottom = iy + 4 + iconH;
+                    const int textTop = iconBottom + 2;
+                    int textH = ch - (textTop - iy);
+                    if (textH < 14) textH = 14;
+                    LabelDib* lab = LabelOf(mine[i], cellW_ - 8, textH, glow);
+                    if (lab && lab->valid()) {
+                        int contentW = lab->w - lab->pad * 2;
+                        int left = ix + (cellW_ - contentW) / 2 - lab->pad;
+                        BlendIntoDim(dst, bufW_, bufH_,
+                                     reinterpret_cast<const BYTE*>(lab->bits), lab->w, lab->h,
+                                     left, textTop - lab->pad, ga, gd);
+                    }
                 }
             }
+        }
+    }
+
+    // ---- 详情模式：右侧补一列「大小 / 文件夹」，和资源管理器的详细信息对齐 ----
+    if (!collapsed_ && viewMode() == 5) {
+        std::vector<DesktopIconView*> mine;
+        CollectVisible(mine);
+        // 图标数变了（拖进/拖出/被删）才重建，平时渲染不碰磁盘
+        if (detailInfo_.size() != mine.size()) BuildDetailInfo();
+        if (!mine.empty() && !detailInfo_.empty()) {
+            Bitmap target(bufW_, bufH_, bufW_ * 4, PixelFormat32bppPARGB,
+                          reinterpret_cast<BYTE*>(bits_));
+            Graphics g2(&target);
+            g2.SetTextRenderingHint(TextRenderingHintAntiAlias);
+            FontFamily fam2(L"Microsoft YaHei UI");
+            Font font2(&fam2, 11.5f, FontStyleRegular, UnitPixel);
+            // 盒子的底色可能是浅的也可能是深的，白字必须先垫一层黑光晕
+            // （和图标标签一个套路），否则浅色盒子上完全看不见
+            SolidBrush shadowBr(Color((BYTE)150, (BYTE)0, (BYTE)0, (BYTE)0));
+            SolidBrush br(Color((BYTE)245, (BYTE)255, (BYTE)255, (BYTE)255));
+            StringFormat sf;
+            sf.SetAlignment(StringAlignmentFar);
+            sf.SetLineAlignment(StringAlignmentCenter);
+            sf.SetFormatFlags(StringFormatFlagsNoWrap);
+            sf.SetTrimming(StringTrimmingEllipsisCharacter);
+
+            // 光晕走两圈（半径 1 和 2），浅色盒子上白字才立得起来
+            const float kOff[8][2] = {{-1.0f, 0.0f},  {1.0f, 0.0f},  {0.0f, -1.0f}, {0.0f, 1.0f},
+                                      {-2.0f, 0.0f},  {2.0f, 0.0f},  {0.0f, -2.0f}, {0.0f, 2.0f}};
+            const int ch2 = cellH();
+            for (size_t i = 0; i < mine.size(); ++i) {
+                int ix = 0, iy = 0;
+                if (!ItemOrigin((int)i, ix, iy)) break;
+                auto d = detailInfo_.find(mine[i]);
+                if (d == detailInfo_.end() || d->second.empty()) continue;
+                const float bx = (float)(ix + cellW_ - 92);
+                const float by = (float)iy;
+                for (int k = 0; k < 8; ++k) {
+                    const RectF sb(bx + kOff[k][0], by + kOff[k][1], 84.0f, (float)ch2);
+                    g2.DrawString(d->second.c_str(), -1, &font2, sb, &sf, &shadowBr);
+                }
+                const RectF box(bx, by, 84.0f, (float)ch2);
+                g2.DrawString(d->second.c_str(), -1, &font2, box, &sf, &br);
+            }
+            g2.Flush(FlushIntentionSync);
         }
     }
 }
@@ -929,6 +1209,14 @@ void FenceWindow::ApplyConfig(bool recapture) {
     }
 
     if (recapture) RefreshBackdrop();
+
+    // 「查看」可能在外部（右键菜单 / 配置）被改过，格子宽度跟着走
+    const int newCellW = CellWForMode(cfg_->viewMode);
+    if (newCellW != cellW_) {
+        cellW_ = newCellW;
+        labels_.clear();
+        labelKeys_.clear();
+    }
     Redraw();
 }
 
@@ -953,6 +1241,7 @@ bool FenceWindow::Create(int index, int x, int y, int w, int h) {
     height_ = h;
     headerH_ = std::clamp(g_config.headerHeight, 26, 80);
     showLabels_ = g_config.showLabels != 0;
+    cellW_ = CellWForMode(cfg_->viewMode);
     curH_ = h;
     targetH_ = h;
 

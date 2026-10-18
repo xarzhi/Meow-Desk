@@ -23,6 +23,14 @@ struct FenceConfig {
     int radius = 12;                 // 圆角半径
     int acrylic = 0;                 // 1 = Win11 亚克力（模糊壁纸）
     std::wstring title;
+
+    // 「查看」：0=小 1=中 2=大 3=超大 4=列表 5=详情
+    // 每个盒子各自记，右键菜单改的是「当前这个盒子」
+    int viewMode = 1;
+    // 「排序方式」：0=名称 1=类型 2=大小 3=修改日期 4=自定义
+    // 4 表示不排序，保持用户自己拖出来的顺序
+    int sortKey = 4;
+    int sortAsc = 1;                 // 1 = 正序，0 = 倒序
 };
 
 struct AppConfig {
@@ -31,6 +39,7 @@ struct AppConfig {
     int showLabels = 1;         // 显示图标标题（桌面 + 盒子）
     int headerHeight = 44;      // 盒子头部高度
     int autoExpandOnHover = 0;  // 鼠标移到收起盒子的头部时自动展开，移出整个盒子再收起
+
     std::vector<FenceConfig> fences;
 
     void Load();

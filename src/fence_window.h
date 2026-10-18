@@ -60,6 +60,28 @@ public:
     // 盒子内容区（去掉头部）的屏幕矩形，用来判断"松手时算不算放进了盒子"
     RECT bodyRect() const;
 
+    // ---- 布局尺寸（右键菜单的「查看」会改这些）----
+    int headerH() const { return headerH_; }
+    int cellH() const;
+    int cellW() const { return cellW_; }
+
+    // 「查看」菜单：0=小 1=中 2=大 3=超大 4=列表 5=详情
+    // 会顺便重算格子尺寸、清掉标签缓存并重绘
+    void SetViewMode(int m);
+    int viewMode() const;
+    // 当前「查看」档位下图标该画的像素尺寸（32/48/64/96）
+    int iconPx() const;
+
+    // 「排序方式」：0=名称 1=类型 2=大小 3=修改日期 4=自定义
+    // 会立刻重排本盒子的图标顺序（g_icons 里相对顺序），自定义 = 保持原样
+    void SetSort(int key, bool asc);
+    int sortKey() const;
+    bool sortAsc() const;
+
+    // 标题（右键菜单「重命名分区」）
+    void SetTitle(const std::wstring& t);
+    std::wstring title() const;
+
     // ---- 拖拽落点提示 ----
     // zone: -1 = 插到这个图标左边，+1 = 插到右边，0 = 中间（用拖拽文件打开该图标的程序）
     struct DropHint {
@@ -84,6 +106,10 @@ public:
     std::function<void(DesktopIconView*, POINT)> onItemDragStart;
     std::function<void(DesktopIconView*, POINT)> onItemDragMove;
     std::function<void(DesktopIconView*, POINT)> onItemDrop;
+    // 右键（POINT 是屏幕坐标；item 为 -1 表示点在空白/头部）
+    std::function<void(int item, POINT)> onContextMenu;
+    // 「查看 / 排序 / 重命名」改完之后：外部存配置 + 存图标布局
+    std::function<void()> onStateChanged;
 
 private:
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
@@ -103,6 +129,14 @@ private:
     // 第 index 个格子的客户区原点；放不下返回 false
     bool ItemOrigin(int index, int& x, int& y) const;
 
+    // 按 cfg_->sortKey 重排本盒子图标在全局表里的相对顺序（自定义 = 不动）
+    void SortNow();
+    bool IsListView() const { return viewMode() >= 4; }
+    // 详情模式右侧那两列（大小 / 类型）。切到详情时读一次文件属性，
+    // 之后盒子里的图标数变了才重建。
+    void BuildDetailInfo();
+    std::unordered_map<DesktopIconView*, std::wstring> detailInfo_;
+
     // ---- 四条边/四角拖拽改大小 ----
     enum class Edge { None, L, R, T, B, TL, TR, BL, BR };
     Edge HitEdge(POINT clientPt) const;
@@ -112,10 +146,6 @@ private:
     int minW() const;
     int minH() const;
 
-    int headerH() const { return headerH_; }
-    // 显示标题时格子要高一些（图标 + 两行字）
-    int cellH() const { return showLabels_ ? 84 : kCellHCompact; }
-
     // 拖动位置夹取：不出屏幕、不压到别的盒子
     void ResolveDragPos(RECT want, int& outX, int& outY) const;
 
@@ -123,6 +153,9 @@ private:
     HWND hwnd_ = nullptr;
     int index_ = 0;
     FenceConfig* cfg_ = nullptr;
+
+    // 「查看」决定格子宽度；高度看 cellH()
+    int cellW_ = 74;
 
     int width_ = 0;
     int height_ = 0;   // 展开时的高度

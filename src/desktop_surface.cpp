@@ -171,13 +171,31 @@ void InvokeShellMenu(HWND hwnd, IContextMenu* cm, HMENU menu, POINT pt) {
         }
     }
 
+    // 菜单是模态的：必须先有前台窗口，否则 TrackPopupMenu 会立刻返回、
+    // 菜单一闪就没了（surface 是 WS_EX_NOACTIVATE，天然不满足这个条件）。
+    HWND prevFg = GetForegroundWindow();
+    SetForegroundWindow(hwnd);
+
+    const DWORD t0 = GetTickCount();
     const int cmd = TrackPopupMenuEx(
         menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, hwnd,
         nullptr);
+    // 菜单关掉之后必须给自己发一条空消息，否则菜单的鼠标捕获不会释放，
+    // 表现为"点一下别的窗口菜单才真正消失"。
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    if (TraceOn())
+        LogSurface("menu cmd=%d elapsed=%lu ms", cmd, (unsigned long)(GetTickCount() - t0));
+    if (prevFg && prevFg != hwnd) SetForegroundWindow(prevFg);
 
     g_menuOwner = nullptr;
     if (cm2) cm2->Release();
     if (cmd <= 0) return;
+
+    if (TraceOn()) {
+        wchar_t txt[128]{};
+        GetMenuStringW(menu, cmd - 1, txt, 128, MF_BYPOSITION);
+        LogSurface("menu pick cmd=%d item=%ls", cmd, txt);
+    }
 
     CMINVOKECOMMANDINFOEX info{};
     info.cbSize = sizeof(info);
@@ -191,19 +209,42 @@ void InvokeShellMenu(HWND hwnd, IContextMenu* cm, HMENU menu, POINT pt) {
 }
 
 // 桌面空白处
+//
+// 注意这里必须走 IShellView::GetItemObject(SVGIO_BACKGROUND)，
+// 而不是 IShellFolder::CreateViewObject(IID_IContextMenu)：
+// 后者只给「文件夹扩展」那一堆（新建文件夹 / 显示设置 / 个性化 / 各种 IDE 的注入项），
+// 「查看 / 排序方式 / 刷新 / 粘贴」是 shell **视图** 提供的，只有 view 的
+// background 菜单才有 —— 这正是之前和原生桌面右键不一样的原因。
 void ShowBackgroundMenu(HWND hwnd, POINT pt) {
     IShellFolder* desktop = nullptr;
     if (FAILED(SHGetDesktopFolder(&desktop)) || !desktop) return;
+
     IContextMenu* cm = nullptr;
-    const HRESULT hr = desktop->CreateViewObject(hwnd, IID_IContextMenu, (void**)&cm);
+    IShellView* view = nullptr;
+    if (SUCCEEDED(desktop->CreateViewObject(hwnd, IID_IShellView, (void**)&view)) && view) {
+        view->GetItemObject(SVGIO_BACKGROUND, IID_IContextMenu, (void**)&cm);
+    }
+    if (!cm) {
+        // 兜底：拿不到 view 就退回文件夹级菜单（至少还有「新建 / 显示设置」）
+        if (TraceOn()) LogSurface("bg menu: view unavailable, fallback to folder");
+        desktop->CreateViewObject(hwnd, IID_IContextMenu, (void**)&cm);
+    }
     desktop->Release();
-    if (FAILED(hr) || !cm) return;
+
+    if (!cm) {
+        if (view) view->Release();
+        return;
+    }
 
     HMENU menu = CreatePopupMenu();
-    if (menu && SUCCEEDED(cm->QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL)))
-        InvokeShellMenu(hwnd, cm, menu, pt);
+    HRESULT hrq = E_FAIL;
+    if (menu) hrq = cm->QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL | CMF_EXPLORE);
+    if (TraceOn()) LogSurface("bg menu hr=0x%08lX count=%d", (unsigned long)hrq,
+                              menu ? GetMenuItemCount(menu) : -1);
+    if (menu && SUCCEEDED(hrq)) InvokeShellMenu(hwnd, cm, menu, pt);
     if (menu) DestroyMenu(menu);
     cm->Release();
+    if (view) view->Release();
 }
 
 // 某个图标（文件/文件夹/快捷方式）
@@ -742,6 +783,7 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONUP: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         POINT sp{origin_.x + pt.x, origin_.y + pt.y};
+        if (TraceOn()) LogSurface("rbuttonup client=%ld,%ld screen=%ld,%ld", pt.x, pt.y, sp.x, sp.y);
         DesktopIconView* hit = HitTest(pt);
         if (hit) {
             // 图标上：打开文件的右键菜单（打开方式 / 属性 / 删除 …）

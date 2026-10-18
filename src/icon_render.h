@@ -39,6 +39,14 @@ bool CreateDib(int w, int h, HDC& dc, HBITMAP& bmp, void*& bits);
 void BlendInto(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int srcH,
                int x, int y);
 
+// 同上，但整体再乘一个不透明度 alpha（0..255）。用于「原位保留、画暗」的占位图标。
+void BlendIntoAlpha(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int srcH,
+                    int x, int y, int alpha);
+
+// 同上，并额外把 RGB 压暗到 dim/255。alpha 控制"变淡"，dim 控制"变暗"。
+void BlendIntoDim(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int srcH,
+                  int x, int y, int alpha, int dim);
+
 // 用恒定颜色 + alpha 填充矩形（预乘合成）
 void FillRectAlpha(BYTE* dst, int dstW, int dstH, const RECT& r, int a, COLORREF color);
 

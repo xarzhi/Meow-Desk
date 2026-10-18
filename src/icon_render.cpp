@@ -237,6 +237,49 @@ void BlendInto(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int src
     }
 }
 
+void BlendIntoAlpha(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int srcH,
+                    int x, int y, int alpha) {
+    BlendIntoDim(dst, dstW, dstH, src, srcW, srcH, x, y, alpha, 255);
+}
+
+void BlendIntoDim(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int srcH,
+                  int x, int y, int alpha, int dim) {
+    if (!dst || !src || dstW <= 0 || dstH <= 0 || srcW <= 0 || srcH <= 0) return;
+    if (alpha <= 0 || dim <= 0) return;
+    if (alpha >= 255 && dim >= 255) {
+        BlendInto(dst, dstW, dstH, src, srcW, srcH, x, y);
+        return;
+    }
+    const unsigned k = (unsigned)alpha;
+    const unsigned d = (unsigned)dim;
+
+    int sx0 = 0, sy0 = 0, sx1 = srcW, sy1 = srcH;
+    int dx0 = x, dy0 = y;
+    if (dx0 < 0) { sx0 = -dx0; dx0 = 0; }
+    if (dy0 < 0) { sy0 = -dy0; dy0 = 0; }
+    if (dx0 + (sx1 - sx0) > dstW) sx1 = sx0 + (dstW - dx0);
+    if (dy0 + (sy1 - sy0) > dstH) sy1 = sy0 + (dstH - dy0);
+    if (sx1 <= sx0 || sy1 <= sy0) return;
+
+    for (int row = sy0; row < sy1; ++row) {
+        BYTE* dp = dst + ((size_t)(dy0 + (row - sy0)) * dstW + dx0) * 4;
+        const BYTE* s = src + ((size_t)row * srcW + sx0) * 4;
+        for (int col = sx0; col < sx1; ++col, dp += 4, s += 4) {
+            // a 决定"还剩多少不透明度"，rgb 再额外乘 d 让它变暗（预乘下仍合法：rgb <= a）
+            const unsigned a = (unsigned)s[3] * k / 255;
+            if (a == 0) continue;
+            const unsigned sr = (unsigned)s[0] * k / 255 * d / 255;
+            const unsigned sg = (unsigned)s[1] * k / 255 * d / 255;
+            const unsigned sb = (unsigned)s[2] * k / 255 * d / 255;
+            const unsigned inv = 255u - a;
+            dp[0] = (BYTE)(sb + (unsigned)(dp[0] * inv + 127) / 255);
+            dp[1] = (BYTE)(sg + (unsigned)(dp[1] * inv + 127) / 255);
+            dp[2] = (BYTE)(sr + (unsigned)(dp[2] * inv + 127) / 255);
+            dp[3] = (BYTE)(a + (unsigned)(dp[3] * inv + 127) / 255);
+        }
+    }
+}
+
 void FillRectAlpha(BYTE* dst, int dstW, int dstH, const RECT& r, int a, COLORREF color) {
     if (!dst || dstW <= 0 || dstH <= 0 || a <= 0) return;
     if (a > 255) a = 255;
