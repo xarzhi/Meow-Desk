@@ -43,6 +43,7 @@ enum : int {
     ID_HEADER_H = 25,
     ID_SHOW_LABELS = 26,
     ID_HOVER_EXPAND = 27,
+    ID_SORT_ANIM = 28,
     ID_RELOAD = 40,
     ID_SYSICONS = 41,
     ID_OPENFOLDER = 42,
@@ -189,6 +190,7 @@ void SettingsWindow::Layout() {
         const int c1 = 100;
         const int tr = kContentX + kCardW - 24;
         rcHoverExpand_ = RECT{tr - 36, c1 + 46, tr, c1 + 68};
+        rcSortAnim_ = RECT{tr - 36, c1 + 98, tr, c1 + 120};
     }
 
     // ---- 关于页 ----
@@ -229,6 +231,7 @@ int SettingsWindow::HitTest(POINT pt) const {
         break;
     case Page::Interaction:
         if (in(rcHoverExpand_, 150, 18)) return ID_HOVER_EXPAND;
+        if (in(rcSortAnim_, 150, 18)) return ID_SORT_ANIM;
         break;
     case Page::About:
         if (in(rcOpenFolder_, 0, 4)) return ID_OPENFOLDER;
@@ -600,7 +603,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      RectF((float)kContentX + 2, 56.0f, 460.0f, 18.0f), &sf, &brSub);
 
         const int c1 = 100;
-        drawCard(c1, 176);
+        drawCard(c1, 150);
         g.DrawString(L"\u76d2\u5b50\u884c\u4e3a", -1, &fSection,
                      RectF((float)kContentX + 20, (float)c1 + 14.0f, 260.0f, 22.0f), &sf,
                      &brText);
@@ -615,16 +618,15 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      &sf, &brSub);
         drawToggle(rcHoverExpand_, g_config.autoExpandOnHover != 0);
 
-        g.DrawString(L"\u5f00\u542f\u540e\uff0c\u60ac\u505c\u5c31\u80fd\u770b\u5230\u76d2\u5b50\u91cc\u7684\u5185\u5bb9\uff0c"
-                     L"\u4e0d\u7528\u6bcf\u6b21\u90fd\u70b9\u7bad\u5934\u3002",
+        g.DrawString(L"\u6392\u5e8f\u65f6\u64ad\u653e\u7ffb\u8f6c\u52a8\u753b", -1, &fBody,
+                     RectF((float)kRowLeft, (float)(rcSortAnim_.top - 10), 360.0f, 26.0f),
+                     &sf, &brText);
+        g.DrawString(L"\u6539\u6392\u5e8f\u65b9\u5f0f\u65f6\u56fe\u6807\u4f1a\u7ed5\u7ad6\u8f74"
+                     L"\u7ffb\u8fc7\u53bb\u91cd\u6392",
                      -1, &fSub,
-                     RectF((float)kRowLeft, (float)c1 + 118.0f, 460.0f, 18.0f), &sf,
-                     &brSub);
-        g.DrawString(L"\u62d6\u52a8\u76d2\u5b50\u65f6\u4f1a\u81ea\u52a8\u907f\u8ba9\u5c4f\u5e55\u8fb9\u7f18"
-                     L"\u548c\u5176\u4ed6\u76d2\u5b50\u3002",
-                     -1, &fSub,
-                     RectF((float)kRowLeft, (float)c1 + 140.0f, 460.0f, 18.0f), &sf,
-                     &brSub);
+                     RectF((float)kRowLeft, (float)(rcSortAnim_.top + 12), 420.0f, 16.0f),
+                     &sf, &brSub);
+        drawToggle(rcSortAnim_, g_config.sortAnim != 0);
         break;
     }
 
@@ -730,6 +732,9 @@ void SettingsWindow::Toggle(int id) {
     case ID_HOVER_EXPAND:
         g_config.autoExpandOnHover = g_config.autoExpandOnHover ? 0 : 1;
         break;
+    case ID_SORT_ANIM:
+        g_config.sortAnim = g_config.sortAnim ? 0 : 1;
+        break;
     case ID_SYSICONS:
         if (setSystemIconsShown) {
             const bool shown = getSystemIconsShown ? getSystemIconsShown() : false;
@@ -786,7 +791,7 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == ID_ACRYLIC || id == ID_SHADOW || id == ID_ARROW || id == ID_SHOW_LABELS ||
-            id == ID_HOVER_EXPAND || id == ID_SYSICONS) {
+            id == ID_HOVER_EXPAND || id == ID_SORT_ANIM || id == ID_SYSICONS) {
             Toggle(id);
             return 0;
         }

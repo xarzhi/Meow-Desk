@@ -47,6 +47,12 @@ void BlendIntoAlpha(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, in
 void BlendIntoDim(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int srcH,
                   int x, int y, int alpha, int dim);
 
+// 横向缩放合成：把 src 横向压/拉到 outW 宽（纵向不动）再预乘合成。
+// 用于「排序 flip 动画」——图标绕竖轴翻转时，宽度按 cos(θ) 收缩、中间的像素做盒式采样。
+// outW >= srcW 时等价于放大（不常用，但保证不崩）。x/y 是缩放后位图的左上角。
+void BlendIntoDimScaledX(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int srcH,
+                         int x, int y, int outW, int alpha, int dim);
+
 // 用恒定颜色 + alpha 填充矩形（预乘合成）
 void FillRectAlpha(BYTE* dst, int dstW, int dstH, const RECT& r, int a, COLORREF color);
 

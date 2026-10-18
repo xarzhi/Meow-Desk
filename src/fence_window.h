@@ -124,18 +124,74 @@ private:
     // 实际参与布局/绘制的图标（排除正在被拖出的那个）
     void CollectVisible(std::vector<DesktopIconView*>& out) const;
     int HitItem(POINT clientPt) const;
-    // 当前宽度下能放几列（拖拽改宽度后要跟着变）
+    // 当前宽度下能放几列（拖拽改宽度后要跟着变）。列表/详情恒为 1 列。
     int CellCols() const;
-    // 第 index 个格子的客户区原点；放不下返回 false
+    // 两端对齐的列中心：第 0 列的中心 = kPad + 图标宽/2，最后一列 = 右内边距 - 图标宽/2，
+    // 中间等距。满行正好顶满左右内边距；不满的最后一排自然左对齐，且列位置与上一排对齐。
+    int ColCenterX(int c, int cols) const;
+    // 第 index 个格子的客户区矩形（命中、悬停、选中、落点高亮都用它）
+    void ItemRect(int index, RECT& r) const;
+    // 第 index 个图标下方的文字盒（已夹在卡片内边距之内，相邻两列不会重叠）
+    void ItemLabelBox(int index, int& left, int& w) const;
+    // 第 index 个格子的客户区原点（图标左上角）；放不下返回 false
     bool ItemOrigin(int index, int& x, int& y) const;
 
     // 按 cfg_->sortKey 重排本盒子图标在全局表里的相对顺序（自定义 = 不动）
     void SortNow();
     bool IsListView() const { return viewMode() >= 4; }
-    // 详情模式右侧那两列（大小 / 类型）。切到详情时读一次文件属性，
-    // 之后盒子里的图标数变了才重建。
+
+    // ---- 详情模式：每行「图标 + 名称 + 修改日期 + 类型 + 大小」 ----
+    struct DetailInfo {
+        std::wstring date;   // 2024/10/18 14:30
+        std::wstring type;   // 文件夹 / PNG 图片 / 文本文档 …
+        std::wstring size;   // 3.2 MB
+    };
+    // 切到详情 / 盒内图标数变了 / 文件改过才重建，渲染时不再碰磁盘
     void BuildDetailInfo();
-    std::unordered_map<DesktopIconView*, std::wstring> detailInfo_;
+    void InvalidateDetail() { detailInfo_.clear(); }
+    std::unordered_map<DesktopIconView*, DetailInfo> detailInfo_;
+
+    // 详情各列的几何（右侧从右往左依次是 大小 / 类型 / 修改日期）
+    struct DetailCols {
+        bool showDate = false;
+        bool showType = false;
+        bool showSize = false;
+        int nameX = 0, nameW = 0;
+        int dateX = 0, dateW = 0;
+        int typeX = 0, typeW = 0;
+        int sizeX = 0, sizeW = 0;
+        int iconX = 0;
+    };
+    // 盒子变窄时按「大小 → 类型 → 修改日期」的顺序依次隐藏
+    DetailCols DetailLayoutFor(int cellLeft, int cellWidth) const;
+
+    // 详情列文字缓存（同一段文字同一尺寸只栅格化一次）
+    struct DetailTextEntry {
+        LabelDib dib;
+        std::wstring key;
+    };
+    std::unordered_map<std::wstring, DetailTextEntry> detailText_;
+    LabelDib* DetailText(const std::wstring& text, int boxW, int boxH, int glow);
+    void ClearDetailCache();
+
+    // ---- 排序 flip 动画 ----
+    struct FlipNode {
+        DesktopIconView* e = nullptr;
+        int from = 0;   // 排序前的槽位
+        int to = 0;     // 排序后的槽位
+    };
+    void StartFlip(const std::unordered_map<DesktopIconView*, int>& fromSlot,
+                   const std::vector<DesktopIconView*>& after);
+    void StopFlip();
+    bool flipActive_ = false;
+    DWORD flipT0_ = 0;
+    int flipDur_ = 260;
+    std::unordered_map<DesktopIconView*, FlipNode> flipNodes_;
+    // 当前进度 0..1（未在动画时返回 1）
+    float FlipProgress() const;
+    // MEOW_DEBUG_HOOKS=1 时才响应 WM_APP+7（wParam=sortKey | asc<<8），
+    // 给自动化脚本一个确定性的「改排序方式」入口，用来逐帧核对 flip 动画
+    bool debugHooks_ = false;
 
     // ---- 四条边/四角拖拽改大小 ----
     enum class Edge { None, L, R, T, B, TL, TR, BL, BR };

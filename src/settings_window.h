@@ -82,6 +82,7 @@ private:
 
     // ---- 交互 ----
     RECT rcHoverExpand_{};
+    RECT rcSortAnim_{};
 
     // ---- 关于 ----
     RECT rcOpenFolder_{};

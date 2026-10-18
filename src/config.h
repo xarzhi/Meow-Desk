@@ -39,6 +39,7 @@ struct AppConfig {
     int showLabels = 1;         // 显示图标标题（桌面 + 盒子）
     int headerHeight = 44;      // 盒子头部高度
     int autoExpandOnHover = 0;  // 鼠标移到收起盒子的头部时自动展开，移出整个盒子再收起
+    int sortAnim = 1;           // 改排序方式时，盒内图标播 flip 翻转动画
 
     std::vector<FenceConfig> fences;
 

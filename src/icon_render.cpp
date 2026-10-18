@@ -280,8 +280,59 @@ void BlendIntoDim(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int 
     }
 }
 
-void FillRectAlpha(BYTE* dst, int dstW, int dstH, const RECT& r, int a, COLORREF color) {
-    if (!dst || dstW <= 0 || dstH <= 0 || a <= 0) return;
+void BlendIntoDimScaledX(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW, int srcH,
+                         int x, int y, int outW, int alpha, int dim) {
+    if (!dst || !src || dstW <= 0 || dstH <= 0 || srcW <= 0 || srcH <= 0) return;
+    if (outW < 1) outW = 1;
+    if (alpha <= 0 || dim <= 0) return;
+    if (outW == srcW && alpha >= 255 && dim >= 255) {
+        BlendInto(dst, dstW, dstH, src, srcW, srcH, x, y);
+        return;
+    }
+
+    // 目标列 dx（0..outW-1）采样源列 sx0..sx1-1，取平均值。
+    // 缩放比接近 1 时宽度为 1 → 纯拷贝，不会平白把图标糊掉。
+    const int base = srcW / outW;
+    const int rem = srcW % outW;
+
+    for (int row = 0; row < srcH; ++row) {
+        const int dy = y + row;
+        if (dy < 0 || dy >= dstH) continue;
+        const BYTE* s = src + (size_t)row * srcW * 4;
+        int dxi = 0;      // 已消耗的源列
+        for (int col = 0; col < outW; ++col) {
+            const int n = base + (col < rem ? 1 : 0);
+            const int dx = x + col;
+            if (n > 0 && dx >= 0 && dx < dstW) {
+                unsigned sa = 0, sb = 0, sg = 0, sr = 0;
+                const BYTE* p = s + (size_t)dxi * 4;
+                for (int k = 0; k < n; ++k, p += 4) {
+                    sb += p[0];
+                    sg += p[1];
+                    sr += p[2];
+                    sa += p[3];
+                }
+                unsigned a = sa / (unsigned)n;
+                if (a > 0) {
+                    a = a * (unsigned)alpha / 255;
+                    const unsigned d = (unsigned)dim;
+                    BYTE* dp = dst + ((size_t)dy * dstW + dx) * 4;
+                    const unsigned cb = (sb / (unsigned)n) * a / 255 * d / 255;
+                    const unsigned cg = (sg / (unsigned)n) * a / 255 * d / 255;
+                    const unsigned cr = (sr / (unsigned)n) * a / 255 * d / 255;
+                    const unsigned inv = 255u - a;
+                    dp[0] = (BYTE)(cb + (unsigned)(dp[0] * inv + 127) / 255);
+                    dp[1] = (BYTE)(cg + (unsigned)(dp[1] * inv + 127) / 255);
+                    dp[2] = (BYTE)(cr + (unsigned)(dp[2] * inv + 127) / 255);
+                    dp[3] = (BYTE)(a + (unsigned)(dp[3] * inv + 127) / 255);
+                }
+            }
+            dxi += n;
+        }
+    }
+}
+
+void FillRectAlpha(BYTE* dst, int dstW, int dstH, const RECT& r, int a, COLORREF color) {    if (!dst || dstW <= 0 || dstH <= 0 || a <= 0) return;
     if (a > 255) a = 255;
 
     int x0 = std::max<int>(0, r.left);

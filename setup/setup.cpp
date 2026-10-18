@@ -118,7 +118,7 @@ void SetStatus(const wchar_t* text, int percent) {
     }
 }
 
-// 开始菜单里的快捷方式
+// 开始菜单 / 桌面上的快捷方式
 bool CreateShortcut(const std::wstring& exe, const std::wstring& lnk) {
     IShellLinkW* link = nullptr;
     if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
@@ -236,6 +236,11 @@ void DoInstall(HWND hwnd) {
         const std::wstring menu = KnownFolder(FOLDERID_Programs);   // 开始菜单\程序
         if (!menu.empty() && EnsureDir(menu))
             CreateShortcut(dst, menu + L"\\meow-desk.lnk");
+
+        // 桌面快捷方式（用户要求：装完就能在桌面直接点开）
+        const std::wstring desk = KnownFolder(FOLDERID_Desktop);
+        if (!desk.empty())
+            CreateShortcut(dst, desk + L"\\meow-desk.lnk");
     }
 
     SetStatus(L"\u5b89\u88c5\u5b8c\u6210", 100);
@@ -506,7 +511,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     wc.hIcon = LoadIconW(inst, L"IDI_APPLICATION");
     RegisterClassExW(&wc);
 
-    const int W = 560, H = 440;
+    // 客户区高度 = 最下面一排按钮的底边(406) + 10px 内边距
+    const int W = 560, H = 416;
     const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     RECT rc{0, 0, W, H};
     AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, 0);
