@@ -515,6 +515,16 @@ void DesktopSurface::SetDropPreview(bool on, POINT cellTopLeft) {
     Redraw();
 }
 
+void DesktopSurface::SetDropSeam(bool on, int screenX, int top, int h) {
+    const bool same = on && seamOn_ && screenX == seamX_ && top == seamTop_ && h == seamH_;
+    if (on == seamOn_ && (same || !on)) return;
+    seamOn_ = on;
+    seamX_ = screenX;
+    seamTop_ = top;
+    seamH_ = h;
+    Redraw();
+}
+
 RECT DesktopSurface::CellRect(const DesktopIconView* e) const {
     RECT r{};
     r.left = e->pos.x - origin_.x;
@@ -605,6 +615,8 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         dragSet_.clear();
         dragStartPos_.clear();
         previewOn_ = false;
+        seamOn_ = false;
+        seamCellValid_ = false;
         ForgetHover();   // 按下之后要么进拖拽、要么进框选，悬停底色都该收掉
 
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -672,24 +684,41 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 FlushDirty();
             }
 
-            // 落点预览：单个图标拖动时实时把「松手会落到哪个格子」画出来。
-            // 拖到盒子上时盒子自己会画插入缝隙线，这里就不要抢戏。
+            // 落点提示，两种形态只出现一个，避免抢戏：
+            //   · 压到别的桌面图标上 → 竖向缝隙线，告诉用户「松手会插到它左/右边」
+            //     （几何和盒子内的缝隙线一致：线落在两格之间的中线上）
+            //   · 落在空地上 → 整格预览框，告诉用户「会落到这一格」
             if (moved_ && dragSet_.size() == 1) {
                 const bool over = overTarget && overTarget(curScreen_);
-                POINT cell{0, 0};
-                const bool show = !over;
-                // 用 SnapCell（而不是 SnapToFreeCell）：落点被占时是「交换」，
-                // 图标仍然落在光标下的格子，预览框也必须画在那个格子上。
-                if (show) cell = SnapCell(dragSet_[0]->dragPos);
-                if (show != previewOn_ ||
-                    (show && (cell.x != previewCell_.x || cell.y != previewCell_.y))) {
-                    previewOn_ = show;
-                    previewCell_ = cell;
-                    Redraw();   // 只在跨格子时发生，不是每帧
+                DesktopIconView* tgt = nullptr;
+                if (!over) {
+                    DesktopIconView* h0 = HitTest(pt);
+                    if (h0 && std::find(dragSet_.begin(), dragSet_.end(), h0) == dragSet_.end())
+                        tgt = h0;
                 }
-            } else if (previewOn_) {
-                previewOn_ = false;
-                Redraw();
+                if (tgt) {
+                    // 以格子中线为界：光标在左半边 → 插到它左边，右半边 → 右边
+                    const int cx = tgt->pos.x + cellW_ / 2;
+                    const bool left = curScreen_.x < cx;
+                    const int sx = left ? (cx - cellW_ / 2) : (cx + cellW_ / 2);
+                    SetDropPreview(false);
+                    SetDropSeam(true, sx, tgt->pos.y, cellH_);
+                    seamCell_ = POINT{tgt->pos.x + (left ? -cellW_ : cellW_), tgt->pos.y};
+                    seamCellValid_ = true;
+                } else {
+                    SetDropSeam(false, 0, 0, 0);
+                    seamCellValid_ = false;
+                    const bool show = !over;
+                    POINT cell{0, 0};
+                    // 用 SnapCell（而不是 SnapToFreeCell）：落点被占时是「交换」，
+                    // 图标仍然落在光标下的格子，预览框也必须画在那个格子上。
+                    if (show) cell = SnapCell(dragSet_[0]->dragPos);
+                    SetDropPreview(show, cell);   // 没变化时它自己会跳过重画
+                }
+            } else {
+                SetDropPreview(false);
+                SetDropSeam(false, 0, 0, 0);
+                seamCellValid_ = false;
             }
 
             if (onDragUpdate) onDragUpdate(dragSet_);
@@ -766,7 +795,8 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 for (auto* e : dragSet_) {
                     pending.erase(std::remove(pending.begin(), pending.end(), e), pending.end());
                     POINT cell = (dragSet_.size() == 1)
-                                     ? ResolveDropCell(e->dragPos, e, pending, &swapped)
+                                     ? ResolveDropCell(seamCellValid_ ? seamCell_ : e->dragPos, e,
+                                                       pending, &swapped)
                                      : SnapToFreeCell(e->dragPos, pending);
                     e->pos = cell;
                     e->dragPos = cell;
@@ -782,6 +812,8 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         moved_ = false;
         dragLayerShown_ = false;
         previewOn_ = false;
+        seamOn_ = false;
+        seamCellValid_ = false;
         mode_ = Mode::None;
         Redraw();
         return 0;
@@ -871,11 +903,19 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging) {
 
     // 悬停：一层很淡的半透明底 + 更淡的描边（选中态另有一套，颜色更深还带实边，
     // 两者一眼能分开）。拖动中的图标不画，否则跟着鼠标跑一块色斑。
+    // 直角：和盒子里的悬停底色、资源管理器的选中框保持一致（圆角在这个尺寸下
+    // 没有抗锯齿，边缘会明显发毛）。
     if (e->hover && !e->selected && !dragging) {
         RECT hf{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
         auto* b = reinterpret_cast<BYTE*>(bits_);
-        FillRoundRectAlpha(b, bufW_, bufH_, hf, 8, 26, RGB(0, 120, 215));
-        StrokeRoundRectAlpha(b, bufW_, bufH_, hf, 8, 1, 72, RGB(0, 120, 215));
+        FillRectAlpha(b, bufW_, bufH_, hf, 26, RGB(0, 120, 215));
+        RECT edge[4] = {
+            {hf.left, hf.top, hf.right, hf.top + 1},
+            {hf.left, hf.bottom - 1, hf.right, hf.bottom},
+            {hf.left, hf.top, hf.left + 1, hf.bottom},
+            {hf.right - 1, hf.top, hf.right, hf.bottom},
+        };
+        for (const auto& r : edge) FillRectAlpha(b, bufW_, bufH_, r, 72, RGB(0, 120, 215));
     }
 
     // 选中高亮（填充 + 1px 边框）
@@ -942,6 +982,7 @@ void DesktopSurface::PaintLayered() {
     // 正在拖的图标交给拖拽浮层画（桌面层在所有盒子下面，不然会被盒子挡住）
 
     if (previewOn_) DrawPreviewLayered();
+    if (seamOn_) DrawSeamLayered();
 
     if (mode_ == Mode::Marquee) {
         RECT m = Normalize(marqueeA_, marqueeB_);
@@ -980,6 +1021,17 @@ void DesktopSurface::DrawPreviewLayered() {
         {r.right - 2, r.top, r.right, r.bottom},
     };
     for (const auto& e : edge) FillRectAlpha(b, bufW_, bufH_, e, 190, RGB(0, 120, 215));
+}
+
+// 拖拽插入缝隙线：3px 竖条，落在两格之间的中线上，上下各留 6px。
+// 和盒子里的缝隙线是同一套视觉（那边走 GDI+，这边是手写 alpha，尺寸/颜色对齐）。
+void DesktopSurface::DrawSeamLayered() {
+    if (!bits_) return;
+    const int x = seamX_ - origin_.x;
+    const int top = seamTop_ - origin_.y;
+    RECT r{x, top + 6, x + 3, top + seamH_ - 6};
+    if (r.right <= 0 || r.left >= bufW_ || r.bottom <= 0 || r.top >= bufH_) return;
+    FillRectAlpha(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, r, 235, RGB(0, 120, 215));
 }
 
 // per-pixel alpha 的分层窗口有个坑：alpha == 0 的像素不接收鼠标消息（点击直接穿透到
@@ -1052,6 +1104,7 @@ void DesktopSurface::PaintOpaque(HDC hdc) {
     }
 
     if (previewOn_) DrawPreviewGdi(hdc);
+    if (seamOn_) DrawSeamGdi(hdc);
 
     if (mode_ == Mode::Marquee) {
         RECT m = Normalize(marqueeA_, marqueeB_);
@@ -1083,15 +1136,30 @@ void DesktopSurface::DrawPreviewGdi(HDC hdc) {
     for (const auto& e : edge) FillRectBlend(hdc, e, 165, RGB(0, 120, 215));
 }
 
+void DesktopSurface::DrawSeamGdi(HDC hdc) {
+    if (!hdc) return;
+    const int x = seamX_ - origin_.x;
+    const int top = seamTop_ - origin_.y;
+    RECT r{x, top + 6, x + 3, top + seamH_ - 6};
+    FillRectBlend(hdc, r, 235, RGB(0, 120, 215));
+}
+
 void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging) {
     int x = (dragging ? e->dragPos.x : e->pos.x) - origin_.x;
     int y = (dragging ? e->dragPos.y : e->pos.y) - origin_.y;
 
-    // 悬停底：这里用方角，和本路径下面那套方角选中高亮保持一致
-    //（分层路径画的是圆角 + 描边，更精致，但那套要走 32bpp DIB）
+    // 悬停底：这里用直角 + 描边，和分层路径保持一致
+    //（两套渲染路径的观感必须一样，否则换 MEOW_SURFACE 就成了两个程序）
     if (e->hover && !e->selected && !dragging) {
         RECT hf{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
         FillRectBlend(hdc, hf, 26, RGB(0, 120, 215));
+        RECT hedge[4] = {
+            {hf.left, hf.top, hf.right, hf.top + 1},
+            {hf.left, hf.bottom - 1, hf.right, hf.bottom},
+            {hf.left, hf.top, hf.left + 1, hf.bottom},
+            {hf.right - 1, hf.top, hf.right, hf.bottom},
+        };
+        for (const auto& r : hedge) FillRectBlend(hdc, r, 72, RGB(0, 120, 215));
     }
 
     if (e->selected) {

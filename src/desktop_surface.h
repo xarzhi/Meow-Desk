@@ -108,8 +108,11 @@ public:
                           const std::vector<DesktopIconView*>& exclude,
                           std::vector<DesktopIconView*>* swapped) const;
 
-    // 落点预览：在「松手会落到的格子」画一个半透明圆角框。on=false 隐藏。
+    // 落点预览：在「松手会落到的格子」画一个半透明直角框。on=false 隐藏。
     void SetDropPreview(bool on, POINT cellTopLeft = POINT{0, 0});
+    // 拖拽插入缝隙线（屏幕坐标）：拖到别的桌面图标左右时，告诉用户「松手会插到这儿」。
+    // 数学和盒子里的缝隙线一致：线落在两格之间的中线上。
+    void SetDropSeam(bool on, int screenX, int top, int h);
 
     // 拖到外部（盒子）时询问是否接收；返回 true 表示这批图标被拿走
     std::function<bool(const std::vector<DesktopIconView*>&, POINT screenPt)> onDrop;
@@ -212,6 +215,17 @@ private:
     bool marqueeAdditive_ = false;
     bool previewOn_ = false;        // 落点预览框是否显示
     POINT previewCell_{0, 0};       // 预览格子左上角（屏幕坐标）
+    // 拖拽插入缝隙线（屏幕坐标；只在「拖到别的图标左右」时出现）
+    bool seamOn_ = false;
+    int seamX_ = 0;
+    int seamTop_ = 0;
+    int seamH_ = 0;
+    // 缝隙线对应的落点格子（屏幕坐标）：松手时优先用它，而不是光标下的格子 ——
+    // 缝隙线画在两格之间的缝里，图标就该落在缝旁边那一格，不然线和结果对不上。
+    bool seamCellValid_ = false;
+    POINT seamCell_{0, 0};
+    void DrawSeamLayered();
+    void DrawSeamGdi(HDC hdc);
     std::vector<DesktopIconView*> dragSet_;
     std::vector<POINT> dragStartPos_;
     POINT pressScreen_{0, 0};

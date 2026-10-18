@@ -23,6 +23,8 @@ struct FenceConfig {
     int alpha = 236;                 // 0-255
     int radius = 12;                 // 圆角半径
     int acrylic = 0;                 // 1 = Win11 亚克力（模糊壁纸）
+    // 1 = 锁定：右上角的锁按钮按下后，盒子既不能拖动也不能改尺寸
+    int locked = 0;
     std::wstring title;
 
     // 「查看」：0=小 1=中 2=大 3=超大 4=列表 5=详情
@@ -34,6 +36,24 @@ struct FenceConfig {
     int sortAsc = 1;                 // 1 = 正序，0 = 倒序
 };
 
+// 整理规则：把匹配的桌面文件归入同名盒子（和 my-desktop 的「整理规则」一致）
+//
+// 匹配顺序 = 列表顺序，第一条命中的生效；matchFolders 的规则吃下所有文件夹，
+// isFallback 的兜底规则吃下谁都没匹配到的项目（永远放在最后，由默认规则保证）。
+struct OrganizeRule {
+    std::wstring name;
+    // 扩展名，分号 / 逗号 / 空格分隔，例如 ".jpg; .png"（不带点也认）
+    std::wstring exts;
+    int matchFolders = 0;
+    int isFallback = 0;
+};
+
+// 默认规则（和 my-desktop 的 OrganizeRule.CreateDefaults 一一对应）
+std::vector<OrganizeRule> OrganizeRulesDefault();
+
+// 这条规则是否吃下 path；ext 由调用方给（已小写、带点），isDir 表示是文件夹
+bool OrganizeRuleMatches(const OrganizeRule& r, const std::wstring& ext, bool isDir);
+
 struct AppConfig {
     int textShadow = 1;         // 桌面图标文字阴影
     int shortcutArrow = 1;      // 快捷方式箭头
@@ -44,8 +64,11 @@ struct AppConfig {
     // 显示盒子标题：关掉后标题文字和右上角箭头都不画，头部只留 2px 透明条
     // （仍然能收到鼠标，悬停自动展开照样有效）
     int showFenceTitle = 1;
+    // 桌面上新出现的文件几秒后自动按整理规则归类（监视桌面文件夹）
+    int autoOrganize = 0;
 
     std::vector<FenceConfig> fences;
+    std::vector<OrganizeRule> rules;
 
     void Load();
     void Save() const;

@@ -99,6 +99,12 @@ public:
     int itemCount() const;
 
     // 几何变化（移动后）→ 外部保存配置
+    // 头部右侧的锁按钮：锁上之后盒子不能拖动、也不能拖边缘改尺寸
+    RECT LockRect() const;
+    bool locked() const { return cfg_ && cfg_->locked; }
+    void SetLocked(bool on);
+    void ToggleLock() { SetLocked(!locked()); }
+
     std::function<void()> onGeometryChanged;
     // 点击盒内图标
     std::function<void(DesktopIconView*)> onOpen;
@@ -261,6 +267,7 @@ private:
     int sel_ = -1;            // 单击选中的图标（双击才打开，所以要有个选中态）
     int pressItem_ = -1;
     bool pressArrow_ = false;
+    bool pressLock_ = false;
     bool pressHeader_ = false;
     bool pressBody_ = false;
     bool dragging_ = false;

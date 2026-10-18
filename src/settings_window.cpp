@@ -1,7 +1,6 @@
 #include "settings_window.h"
 
 #include <windowsx.h>
-#include <commdlg.h>
 #include <dwmapi.h>
 #include <objidl.h>
 #include <propidl.h>
@@ -15,7 +14,6 @@
 #include "config.h"
 #include "icon_render.h"
 
-#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
@@ -36,7 +34,7 @@ const int kRowLeft = kContentX + 20;   // 卡片内文字左边
 
 enum : int {
     ID_NONE = -1,
-    ID_SWATCH0 = 0,   // 0..7
+    ID_SWATCH0 = 0,   // 0..11
     ID_RADIUS = 20,
     ID_ALPHA = 21,
     ID_ACRYLIC = 22,
@@ -46,31 +44,40 @@ enum : int {
     ID_SHOW_LABELS = 26,
     ID_HOVER_EXPAND = 27,
     ID_SORT_ANIM = 28,
-    ID_COLOR_PICK = 29,
     ID_SHOW_FENCE_TITLE = 30,
+    ID_AUTO_ORGANIZE = 31,
+    ID_ADD_RULE = 32,
+    ID_RESET_RULES = 33,
+    ID_ORGANIZE_NOW = 34,
+    ID_RULE_DEL = 100,    // 100..（每行一个：100 + 行号）
     ID_RELOAD = 40,
     ID_SYSICONS = 41,
     ID_OPENFOLDER = 42,
-    ID_NAV0 = 60,     // 60..63 = 导航项
+    ID_NAV0 = 60,     // 60..64 = 导航项
+    // 规则行的 EDIT 子控件：5000 + 行号*2（名字）/ +1（扩展名）
+    ID_RULE_EDIT = 5000,
 };
 
-// Fluent 调色
-const COLORREF kSwatchColors[8] = {
+// Fluent 调色：前 8 个是浅色常用底色，后 4 个是明显更暗的备选
+// （暗色卡片上浅色底会「发白」，需要几个压得住的深色）。
+const COLORREF kSwatchColors[12] = {
     RGB(250, 251, 254), RGB(232, 240, 254), RGB(224, 247, 250), RGB(232, 245, 233),
     RGB(255, 248, 225), RGB(252, 232, 230), RGB(243, 233, 245), RGB(224, 224, 224),
+    RGB(56, 62, 78),    RGB(38, 45, 56),    RGB(44, 56, 48),    RGB(58, 44, 52),
 };
 
-const wchar_t* kNavNames[4] = {
-    L"\u5e38\u89c4",      // 常规
-    L"\u5916\u89c2",      // 外观
-    L"\u4ea4\u4e92",      // 交互
-    L"\u5173\u4e8e",      // 关于
+const wchar_t* kNavNames[5] = {
+    L"\u5e38\u89c4",        // 常规
+    L"\u5916\u89c2",        // 外观
+    L"\u4ea4\u4e92",        // 交互
+    L"\u6574\u7406\u89c4\u5219",  // 整理规则
+    L"\u5173\u4e8e",        // 关于
 };
 
 // 导航项图标（用几何图形自绘，避免依赖图标字体）
-enum class NavGlyph { Sliders, Palette, Cursor, Info };
-const NavGlyph kNavGlyphs[4] = {NavGlyph::Sliders, NavGlyph::Palette, NavGlyph::Cursor,
-                                NavGlyph::Info};
+enum class NavGlyph { Sliders, Palette, Cursor, Rules, Info };
+const NavGlyph kNavGlyphs[5] = {NavGlyph::Sliders, NavGlyph::Palette, NavGlyph::Cursor,
+                                NavGlyph::Rules, NavGlyph::Info};
 
 bool AppsUseLightTheme() {
     HKEY k = nullptr;
@@ -156,7 +163,7 @@ LRESULT CALLBACK SettingsWindow::WndProcStatic(HWND h, UINT m, WPARAM w, LPARAM 
 // ---------------------------------------------------------------------------
 void SettingsWindow::Layout() {
     // 导航
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         rcNav_[i] = RECT{12, 104 + i * 48, kNavW - 12, 104 + i * 48 + 42};
     }
 
@@ -174,12 +181,10 @@ void SettingsWindow::Layout() {
     // ---- 外观页 ----
     {
         const int c1 = 100;
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 12; ++i) {
             swatches_[i] = RECT{kContentX + 112 + i * 38, c1 + 44, kContentX + 112 + i * 38 + 26,
                                 c1 + 70};
         }
-        // 第 9 个是「调色盘」，点开系统取色器选任意颜色
-        rcCustomColor_ = RECT{swatches_[7].right + 12, c1 + 44, swatches_[7].right + 38, c1 + 70};
         const int tl = kContentX + 112;
         const int tr = kContentX + kCardW - 24;
         rcRadius_ = RECT{tl, c1 + 100, tr, c1 + 130};
@@ -205,10 +210,20 @@ void SettingsWindow::Layout() {
         const int c1 = 100;
         rcOpenFolder_ = RECT{kContentX + 20, c1 + 172, kContentX + 180, c1 + 204};
     }
+
+    // ---- 整理规则页 ----
+    {
+        const int tr = kContentX + kCardW - 24;
+        rcAutoOrganize_ = RECT{tr - 36, 146, tr, 168};
+        rcRulesList_ = RECT{kContentX, 214, kContentX + kCardW, 498};
+        rcAddRule_ = RECT{kContentX, 512, kContentX + 104, 542};
+        rcResetRules_ = RECT{kContentX + 112, 512, kContentX + 248, 542};
+        rcOrganizeNow_ = RECT{kContentX + 256, 512, kContentX + 396, 542};
+    }
 }
 
 int SettingsWindow::HitTest(POINT pt) const {
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         const RECT& r = rcNav_[i];
         if (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom)
             return ID_NAV0 + i;
@@ -227,10 +242,9 @@ int SettingsWindow::HitTest(POINT pt) const {
         if (in(rcSysIcons_, 150, 18)) return ID_SYSICONS;
         break;
     case Page::Appearance:
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 12; ++i) {
             if (in(swatches_[i], 4, 4)) return ID_SWATCH0 + i;
         }
-        if (in(rcCustomColor_, 4, 4)) return ID_COLOR_PICK;
         if (in(rcRadius_, 0, 8)) return ID_RADIUS;
         if (in(rcAlpha_, 0, 8)) return ID_ALPHA;
         if (in(rcHeaderH_, 0, 8)) return ID_HEADER_H;
@@ -241,6 +255,15 @@ int SettingsWindow::HitTest(POINT pt) const {
     case Page::Interaction:
         if (in(rcHoverExpand_, 150, 18)) return ID_HOVER_EXPAND;
         if (in(rcSortAnim_, 150, 18)) return ID_SORT_ANIM;
+        break;
+    case Page::Rules:
+        if (in(rcAutoOrganize_, 150, 16)) return ID_AUTO_ORGANIZE;
+        if (in(rcAddRule_, 0, 4)) return ID_ADD_RULE;
+        if (in(rcResetRules_, 0, 4)) return ID_RESET_RULES;
+        if (in(rcOrganizeNow_, 0, 4)) return ID_ORGANIZE_NOW;
+        for (size_t i = 0; i < ruleRows_.size(); ++i) {
+            if (in(ruleRows_[i].del, 4, 4)) return ID_RULE_DEL + (int)i;
+        }
         break;
     case Page::About:
         if (in(rcOpenFolder_, 0, 4)) return ID_OPENFOLDER;
@@ -293,7 +316,7 @@ void SettingsWindow::PaintNav(Graphics& g, const SettingsTheme& t) {
                  &brText);
     g.DrawString(L"meow-desk", -1, &fSub, RectF(26.0f, 60.0f, 160.0f, 18.0f), &sf, &brSub);
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         const RECT& r = rcNav_[i];
         const bool sel = ((int)page_ == i);
         const bool hov = (hot_ == ID_NAV0 + i);
@@ -345,6 +368,15 @@ void SettingsWindow::PaintNav(Graphics& g, const SettingsTheme& t) {
             PointF tri[3] = {PointF(cx - 4.0f, cy - 7.0f), PointF(cx - 4.0f, cy + 6.0f),
                              PointF(cx + 6.0f, cy - 1.0f)};
             g.FillPolygon(&gb, tri, 3);
+            break;
+        }
+        case NavGlyph::Rules: {
+            // 清单：三行，每行前面一个小点，后面一条横线
+            for (int k = 0; k < 3; ++k) {
+                const float y = cy - 5.0f + k * 5.0f;
+                g.FillEllipse(&gb, cx - 6.5f, y - 1.5f, 3.0f, 3.0f);
+                g.DrawLine(&gp, cx - 1.5f, y, cx + 6.0f, y);
+            }
             break;
         }
         case NavGlyph::Info: {
@@ -544,7 +576,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         g.DrawString(L"\u989c\u8272", -1, &fBody,
                      RectF((float)kRowLeft, (float)(c1 + 44), 80.0f, 26.0f), &sf,
                      &brText);
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 12; ++i) {
             const RECT& r = swatches_[i];
             const bool sel = (base == kSwatchColors[i]);
             GraphicsPath p;
@@ -558,29 +590,6 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                 Pen pen(C(t.cardBorder), 1.0f);
                 g.DrawPath(&pen, &p);
             }
-        }
-
-        // ---- 调色盘（第 9 格）：任意颜色 ----
-        {
-            const RECT& r = rcCustomColor_;
-            const RectF rr((float)r.left, (float)r.top, 26.0f, 26.0f);
-            GraphicsPath p;
-            AddRound(p, rr, 7.0f);
-            // 用一条多色渐变的彩虹条表示「自己挑颜色」，比画图标更好认
-            LinearGradientBrush lg(rr, C(RGB(255, 96, 96)), C(RGB(120, 120, 255)),
-                                   LinearGradientModeHorizontal);
-            Color cols[6] = {C(RGB(255, 96, 96)),  C(RGB(255, 190, 90)),
-                             C(RGB(250, 240, 110)), C(RGB(120, 220, 130)),
-                             C(RGB(100, 190, 245)), C(RGB(190, 130, 245))};
-            REAL pos[6] = {0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f};
-            lg.SetInterpolationColors(cols, pos, 6);
-            g.FillPath(&lg, &p);
-            // 当前颜色不是 8 个预设之一 → 调色盘自己加一圈选中环
-            bool preset = false;
-            for (int i = 0; i < 8; ++i)
-                if (base == kSwatchColors[i]) preset = true;
-            Pen pen(preset ? C(t.cardBorder) : C(t.accent), preset ? 1.0f : 2.0f);
-            g.DrawPath(&pen, &p);
         }
 
         g.DrawString(L"\u5706\u89d2", -1, &fBody,
@@ -672,6 +681,10 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         break;
     }
 
+    case Page::Rules:
+        PaintRulesPage(g, t);
+        break;
+
     case Page::About: {
         g.DrawString(L"\u5173\u4e8e", -1, &fPage, RectF((float)kContentX, 26.0f, 300.0f, 30.0f),
                      &sf, &brText);
@@ -728,6 +741,173 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 绘制：整理规则页
+//
+// 布局取自 my-desktop 的「整理规则」：说明 → 自动整理开关 → 规则列表 →
+// 添加 / 恢复默认 / 立即整理。每行左边是规则名（=要归入的盒子名），
+// 右边是扩展名列表；文件夹规则和兜底规则没有扩展名，直接写死说明文字。
+// ---------------------------------------------------------------------------
+void SettingsWindow::PaintRulesPage(Graphics& g, const SettingsTheme& t) {
+    FontFamily family(L"Microsoft YaHei UI");
+    Font fPage(&family, 19.0f, FontStyleBold, UnitPixel);
+    Font fSection(&family, 14.5f, FontStyleBold, UnitPixel);
+    Font fBody(&family, 13.5f, FontStyleRegular, UnitPixel);
+    Font fSub(&family, 12.0f, FontStyleRegular, UnitPixel);
+
+    StringFormat sf;
+    sf.SetLineAlignment(StringAlignmentCenter);
+    sf.SetFormatFlags(StringFormatFlagsNoWrap);
+    StringFormat sfCenter;
+    sfCenter.SetAlignment(StringAlignmentCenter);
+    sfCenter.SetLineAlignment(StringAlignmentCenter);
+
+    SolidBrush brText(C(t.text));
+    SolidBrush brSub(C(t.sub));
+
+    g.DrawString(L"\u6574\u7406\u89c4\u5219", -1, &fPage,
+                 RectF((float)kContentX, 26.0f, 300.0f, 30.0f), &sf, &brText);
+    // 这段说明比较长，交给 GDI+ 自动换行（这里不能带 NoWrap）
+    StringFormat wrap;
+    wrap.SetLineAlignment(StringAlignmentNear);
+    g.DrawString(
+        L"\u4e00\u952e\u6574\u7406\u65f6\uff0c\u684c\u9762\u4e0a\u7684\u56fe\u6807\u6309\u4e0b\u5217"
+        L"\u89c4\u5219\u4ece\u4e0a\u5230\u4e0b\u5339\u914d\uff0c\u5f52\u5165\u540c\u540d\u5206\u533a"
+        L"\uff08\u4e0d\u5b58\u5728\u65f6\u81ea\u52a8\u521b\u5efa\uff09\u3002\u53ea\u662f\u5f52\u7c7b"
+        L"\u663e\u793a\uff0c\u6587\u4ef6\u4ecd\u7559\u5728\u684c\u9762\u6587\u4ef6\u5939\u91cc\u3002"
+        L"\u6269\u5c55\u540d\u4e4b\u95f4\u7528\u5206\u53f7\u5206\u9694\u3002",
+        -1, &fSub,
+        RectF((float)kContentX + 2, 54.0f, (float)kCardW - 20.0f, 40.0f), &wrap, &brSub);
+
+    auto drawCard = [&](int y, int ch) {
+        GraphicsPath p;
+        AddRound(p, RectF((float)kContentX, (float)y, (float)kCardW, (float)ch), 10.0f);
+        SolidBrush fill(C(t.card));
+        g.FillPath(&fill, &p);
+        Pen pen(C(t.cardBorder), 1.0f);
+        g.DrawPath(&pen, &p);
+    };
+
+    auto drawToggle = [&](const RECT& r, bool on) {
+        const float tw = (float)(r.right - r.left);
+        const float th = (float)(r.bottom - r.top);
+        GraphicsPath p;
+        AddRound(p, RectF((float)r.left, (float)r.top, tw, th), th * 0.5f);
+        SolidBrush track(C(on ? t.accent : t.track));
+        g.FillPath(&track, &p);
+        if (!on) {
+            Pen pen(C(dark_ ? RGB(90, 90, 90) : RGB(200, 200, 200)), 1.0f);
+            g.DrawPath(&pen, &p);
+        }
+        const float d = th - 8.0f;
+        const float cx = on ? (float)r.right - 4.0f - d * 0.5f : (float)r.left + 4.0f + d * 0.5f;
+        const float cy = (float)r.top + th * 0.5f;
+        SolidBrush knob(C(on ? RGB(255, 255, 255) : RGB(120, 120, 120)));
+        g.FillEllipse(&knob, cx - d * 0.5f, cy - d * 0.5f, d, d);
+    };
+
+    // ---- 自动整理 ----
+    drawCard(100, 84);
+    g.DrawString(L"\u81ea\u52a8\u6574\u7406\u65b0\u6587\u4ef6", -1, &fBody,   // 自动整理新文件
+                 RectF((float)kRowLeft, (float)(rcAutoOrganize_.top - 12), 320.0f, 26.0f), &sf,
+                 &brText);
+    g.DrawString(L"\u684c\u9762\u4e0a\u65b0\u51fa\u73b0\u7684\u6587\u4ef6\uff08\u5982\u521a"
+                 L"\u4e0b\u8f7d\u3001\u521a\u4fdd\u5b58\u7684\uff09\u51e0\u79d2\u540e\u81ea\u52a8"
+                 L"\u5f52\u5165\u5206\u533a",
+                 -1, &fSub,
+                 RectF((float)kRowLeft, (float)(rcAutoOrganize_.top + 12), 520.0f, 16.0f), &sf,
+                 &brSub);
+    drawToggle(rcAutoOrganize_, g_config.autoOrganize != 0);
+
+    // ---- 规则列表 ----
+    g.DrawString(L"\u89c4\u5219\u5217\u8868", -1, &fSection,
+                 RectF((float)kContentX, 190.0f, 240.0f, 22.0f), &sf, &brText);
+
+    for (size_t i = 0; i < ruleRows_.size(); ++i) {
+        const RuleRow& row = ruleRows_[i];
+        const int idx = row.ruleIndex;
+        if (idx < 0 || idx >= (int)g_config.rules.size()) continue;
+        const OrganizeRule& r = g_config.rules[idx];
+
+        GraphicsPath p;
+        AddRound(p,
+                 RectF((float)(rcRulesList_.left), (float)(row.name.top - 7),
+                       (float)(rcRulesList_.right - rcRulesList_.left), 40.0f),
+                 8.0f);
+        SolidBrush fill(C(t.card));
+        g.FillPath(&fill, &p);
+        Pen pen(C(t.cardBorder), 1.0f);
+        g.DrawPath(&pen, &p);
+
+        // 没有扩展名的两种规则：把说明文字画在扩展名那一栏
+        if (r.matchFolders || r.isFallback) {
+            const wchar_t* hint = r.matchFolders != 0
+                                      ? L"\u684c\u9762\u4e0a\u7684\u6240\u6709\u6587\u4ef6\u5939"
+                                      : // 桌面上的所有文件夹
+                                      L"\u5176\u4ed6\u89c4\u5219\u90fd\u6ca1\u6709\u5339\u914d"
+                                      L"\u5230\u7684\u9879\u76ee";   // 其他规则都没有匹配到的项目
+            g.DrawString(hint, -1, &fSub,
+                         RectF((float)row.exts.left + 4, (float)row.exts.top,
+                               (float)(row.exts.right - row.exts.left - 4),
+                               (float)(row.exts.bottom - row.exts.top)),
+                         &sf, &brSub);
+        }
+
+        // 删除按钮（垃圾桶简笔）
+        {
+            const RECT& d = row.del;
+            const bool hot = (hot_ == ID_RULE_DEL + (int)i);
+            if (hot) {
+                GraphicsPath bp;
+                AddRound(bp,
+                         RectF((float)d.left, (float)d.top, (float)(d.right - d.left),
+                               (float)(d.bottom - d.top)),
+                         6.0f);
+                SolidBrush hb(CA(t.accent, 26));
+                g.FillPath(&hb, &bp);
+            }
+            const float cx = (float)(d.left + d.right) * 0.5f;
+            const float cy = (float)(d.top + d.bottom) * 0.5f;
+            Pen pen(C(t.sub), 1.4f);
+            pen.SetStartCap(LineCapRound);
+            pen.SetEndCap(LineCapRound);
+            g.DrawLine(&pen, cx - 5.0f, cy - 4.0f, cx + 5.0f, cy - 4.0f);
+            g.DrawLine(&pen, cx - 3.0f, cy - 4.0f, cx - 3.0f, cy + 5.0f);
+            g.DrawLine(&pen, cx + 3.0f, cy - 4.0f, cx + 3.0f, cy + 5.0f);
+            g.DrawLine(&pen, cx - 4.0f, cy + 5.0f, cx + 4.0f, cy + 5.0f);
+            g.DrawLine(&pen, cx, cy - 6.0f, cx, cy - 4.0f);
+        }
+    }
+
+    if ((int)g_config.rules.size() > rulesScroll_ + (int)ruleRows_.size()) {
+        // 有被卷上去/滚下去的行，给个提示（没有滚动条，靠滚轮）
+        g.DrawString(L"\u6eda\u8f6e\u7ffb\u9875", -1, &fSub,
+                     RectF((float)rcRulesList_.right - 100.0f, 190.0f, 100.0f, 22.0f),
+                     StringFormat::GenericDefault(), &brSub);
+    }
+
+    // ---- 底部按钮 ----
+    auto drawButton = [&](const RECT& r, const wchar_t* text, bool primary) {
+        GraphicsPath p;
+        AddRound(p,
+                 RectF((float)r.left, (float)r.top, (float)(r.right - r.left),
+                       (float)(r.bottom - r.top)),
+                 6.0f);
+        SolidBrush fill(primary ? C(t.accent) : C(t.cardBorder));
+        g.FillPath(&fill, &p);
+        Pen pen(C(primary ? t.accent : t.cardBorder), 1.0f);
+        g.DrawPath(&pen, &p);
+        SolidBrush white(C(RGB(255, 255, 255)));
+        g.DrawString(text, -1, &fBody,
+                     RectF((float)r.left, (float)r.top, (float)(r.right - r.left),
+                           (float)(r.bottom - r.top)),
+                     &sfCenter, primary ? &white : &brText);
+    };
+    drawButton(rcAddRule_, L"\u6dfb\u52a0\u89c4\u5219", false);          // 添加规则
+    drawButton(rcResetRules_, L"\u6062\u590d\u9ed8\u8ba4\u89c4\u5219", false);  // 恢复默认规则
+    drawButton(rcOrganizeNow_, L"\u7acb\u5373\u6574\u7406\u684c\u9762\u2026", true);  // 立即整理桌面…
+}
+
 void SettingsWindow::Paint() {
     if (!hwnd_) return;
     RECT cr{};
@@ -774,6 +954,9 @@ void SettingsWindow::Toggle(int id) {
     case ID_SHOW_FENCE_TITLE:
         g_config.showFenceTitle = g_config.showFenceTitle ? 0 : 1;
         break;
+    case ID_AUTO_ORGANIZE:
+        g_config.autoOrganize = g_config.autoOrganize ? 0 : 1;
+        break;
     case ID_HOVER_EXPAND:
         g_config.autoExpandOnHover = g_config.autoExpandOnHover ? 0 : 1;
         break;
@@ -794,6 +977,106 @@ void SettingsWindow::Toggle(int id) {
     Paint();
 }
 
+// ---------------------------------------------------------------------------
+// 整理规则：输入行
+// ---------------------------------------------------------------------------
+int SettingsWindow::RulesVisibleRows() const {
+    const int step = 46;   // 行高 40 + 间隙 6
+    const int h = rcRulesList_.bottom - rcRulesList_.top;
+    const int n = h / step;
+    return n > 0 ? n : 1;
+}
+
+void SettingsWindow::DestroyRuleControls() {
+    for (auto& r : ruleRows_) {
+        if (r.nameEdit) { DestroyWindow(r.nameEdit); r.nameEdit = nullptr; }
+        if (r.extEdit) { DestroyWindow(r.extEdit); r.extEdit = nullptr; }
+    }
+    ruleRows_.clear();
+}
+
+// 输入框里的字是「正在编辑」的真相：重建/切页/关窗前必须收回配置，
+// 否则用户刚打的字会随着控件销毁一起消失。
+void SettingsWindow::SyncRulesFromControls() {
+    for (auto& row : ruleRows_) {
+        if (row.ruleIndex < 0 || row.ruleIndex >= (int)g_config.rules.size()) continue;
+        OrganizeRule& r = g_config.rules[row.ruleIndex];
+        if (row.nameEdit) {
+            wchar_t buf[256]{};
+            GetWindowTextW(row.nameEdit, buf, 256);
+            r.name = buf;
+        }
+        if (row.extEdit) {
+            wchar_t buf[2048]{};
+            GetWindowTextW(row.extEdit, buf, 2048);
+            r.exts = buf;
+        }
+    }
+}
+
+void SettingsWindow::BuildRuleControls() {
+    if (!hwnd_) return;
+    SyncRulesFromControls();
+    DestroyRuleControls();
+    if (page_ != Page::Rules) return;
+
+    const int total = (int)g_config.rules.size();
+    if (rulesScroll_ > total - 1) rulesScroll_ = total - 1;
+    if (rulesScroll_ < 0) rulesScroll_ = 0;
+
+    if (!ruleFont_) {
+        // 直接用 LOGFONT 建字体：GDI+ 的 Font 要拿到 Graphics 才能导出 LOGFONT，
+        // 这里只需要「13px 微软雅黑」，手写一份更省事
+        LOGFONTW lf{};
+        lf.lfHeight = -13;
+        lf.lfWeight = FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        lf.lfQuality = CLEARTYPE_QUALITY;
+        wcscpy_s(lf.lfFaceName, L"Microsoft YaHei UI");
+        ruleFont_ = CreateFontIndirectW(&lf);
+    }
+
+    const int vis = RulesVisibleRows();
+    for (int i = 0; i < vis; ++i) {
+        const int idx = rulesScroll_ + i;
+        if (idx >= total) break;
+        const OrganizeRule& r = g_config.rules[idx];
+        RuleRow row;
+        row.ruleIndex = idx;
+        const int y = rcRulesList_.top + i * 46;
+        row.name = RECT{rcRulesList_.left + 10, y + 7, rcRulesList_.left + 152, y + 33};
+        row.exts = RECT{rcRulesList_.left + 162, y + 7, rcRulesList_.right - 44, y + 33};
+        row.del = RECT{rcRulesList_.right - 34, y + 8, rcRulesList_.right - 10, y + 32};
+
+        const DWORD baseStyle = WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL;
+        row.nameEdit = CreateWindowExW(
+            0, L"EDIT", r.name.c_str(), baseStyle, row.name.left, row.name.top,
+            row.name.right - row.name.left, row.name.bottom - row.name.top, hwnd_,
+            (HMENU)(INT_PTR)(ID_RULE_EDIT + i * 2), nullptr, GetModuleHandleW(nullptr));
+        if (row.nameEdit) SendMessageW(row.nameEdit, WM_SETFONT, (WPARAM)ruleFont_, TRUE);
+
+        if (!r.matchFolders && !r.isFallback) {
+            row.extEdit = CreateWindowExW(
+                0, L"EDIT", r.exts.c_str(), baseStyle, row.exts.left, row.exts.top,
+                row.exts.right - row.exts.left, row.exts.bottom - row.exts.top, hwnd_,
+                (HMENU)(INT_PTR)(ID_RULE_EDIT + i * 2 + 1), nullptr, GetModuleHandleW(nullptr));
+            if (row.extEdit) SendMessageW(row.extEdit, WM_SETFONT, (WPARAM)ruleFont_, TRUE);
+        }
+        ruleRows_.push_back(row);
+    }
+}
+
+void SettingsWindow::ScrollRules(int delta) {
+    const int total = (int)g_config.rules.size();
+    const int vis = RulesVisibleRows();
+    const int maxScroll = std::max(0, total - vis);
+    const int next = std::clamp(rulesScroll_ + delta, 0, maxScroll);
+    if (next == rulesScroll_) return;
+    rulesScroll_ = next;
+    BuildRuleControls();   // 重建（内部会先把输入框里的字收回配置）
+    Paint();
+}
+
 LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_ERASEBKGND:
@@ -807,17 +1090,76 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    // 规则行的输入框用系统 EDIT：底色/字色跟卡片走，不然白底会跳出面板
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        const SettingsTheme t = dark_ ? DarkTheme() : LightTheme();
+        SetTextColor(dc, t.text);
+        SetBkColor(dc, t.card);
+        if (!ruleBrush_) ruleBrush_ = CreateSolidBrush(t.card);
+        return reinterpret_cast<LRESULT>(ruleBrush_);
+    }
+
+    case WM_COMMAND: {
+        const int id = LOWORD(wp);
+        if (id >= ID_RULE_EDIT && HIWORD(wp) == EN_CHANGE) {
+            const int row = (id - ID_RULE_EDIT) / 2;
+            const bool isExt = ((id - ID_RULE_EDIT) % 2) != 0;
+            if (row >= 0 && row < (int)ruleRows_.size()) {
+                const int idx = ruleRows_[row].ruleIndex;
+                if (idx >= 0 && idx < (int)g_config.rules.size()) {
+                    wchar_t buf[2048]{};
+                    HWND ed = isExt ? ruleRows_[row].extEdit : ruleRows_[row].nameEdit;
+                    if (ed) GetWindowTextW(ed, buf, 2048);
+                    if (isExt) g_config.rules[idx].exts = buf;
+                    else g_config.rules[idx].name = buf;
+                    // 每敲一个字就写库太重（FULL 同步），攒一下再存
+                    SetTimer(h, 9, 500, nullptr);
+                }
+            }
+            return 0;
+        }
+        break;
+    }
+
+    case WM_TIMER:
+        if (wp == 9) {
+            KillTimer(h, 9);
+            g_config.Save();
+            return 0;
+        }
+        break;
+
+    case WM_MOUSEWHEEL: {
+        if (page_ == Page::Rules) {
+            const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            ScrollRules(delta < 0 ? 1 : -1);
+            return 0;
+        }
+        break;
+    }
+
     case WM_LBUTTONDOWN: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         const int id = HitTest(pt);
 
-        if (id >= ID_NAV0 && id < ID_NAV0 + 4) {
-            page_ = (Page)(id - ID_NAV0);
+        if (id >= ID_NAV0 && id < ID_NAV0 + 5) {
+            const Page np = (Page)(id - ID_NAV0);
+            if (np != page_) {
+                if (page_ == Page::Rules) SyncRulesFromControls();   // 先收字再切页
+                page_ = np;
+                if (page_ == Page::Rules) {
+                    rulesScroll_ = 0;
+                    BuildRuleControls();
+                } else {
+                    DestroyRuleControls();
+                }
+            }
             hot_ = id;
             Paint();
             return 0;
         }
-        if (id >= ID_SWATCH0 && id < ID_SWATCH0 + 8) {
+        if (id >= ID_SWATCH0 && id < ID_SWATCH0 + 12) {
             const COLORREF c = kSwatchColors[id - ID_SWATCH0];
             for (auto& f : g_config.fences) f.color = (int)c;
             NotifyChanged();
@@ -837,25 +1179,53 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (id == ID_ACRYLIC || id == ID_SHADOW || id == ID_ARROW || id == ID_SHOW_LABELS ||
             id == ID_HOVER_EXPAND || id == ID_SORT_ANIM || id == ID_SYSICONS ||
-            id == ID_SHOW_FENCE_TITLE) {
+            id == ID_SHOW_FENCE_TITLE || id == ID_AUTO_ORGANIZE) {
             Toggle(id);
             return 0;
         }
-        if (id == ID_COLOR_PICK) {
-            // 系统调色盘：预设 8 色之外想用任意颜色就走这里
-            SetForegroundWindow(h);   // 本窗口是 topmost，不先抢前台的话对话框会被压住
-            static COLORREF custom[16] = {};
-            CHOOSECOLORW cc{};
-            cc.lStructSize = sizeof(cc);
-            cc.hwndOwner = h;
-            cc.rgbResult = g_config.fences.empty() ? RGB(250, 251, 254)
-                                                   : (COLORREF)g_config.fences[0].color;
-            cc.lpCustColors = custom;
-            cc.Flags = CC_FULLOPEN | CC_RGBINIT | CC_ANYCOLOR;
-            if (ChooseColorW(&cc)) {
-                for (auto& f : g_config.fences) f.color = (int)cc.rgbResult;
+        // ---- 整理规则页的三个按钮 ----
+        if (id == ID_ADD_RULE) {
+            SyncRulesFromControls();
+            OrganizeRule r;
+            r.name = L"\u65b0\u89c4\u5219";   // 新规则
+            r.exts = L".ext";
+            // 兜底规则永远在最后，新规则插在它前面
+            auto it = std::find_if(g_config.rules.begin(), g_config.rules.end(),
+                                   [](const OrganizeRule& x) { return x.isFallback != 0; });
+            const int at = (int)(it - g_config.rules.begin());
+            g_config.rules.insert(g_config.rules.begin() + at, r);
+            // 滚到能看到新规则的那一行
+            const int vis = RulesVisibleRows();
+            if (at >= rulesScroll_ + vis) rulesScroll_ = at - vis + 1;
+            BuildRuleControls();
+            g_config.Save();
+            Paint();
+            return 0;
+        }
+        if (id == ID_RESET_RULES) {
+            DestroyRuleControls();
+            g_config.rules = OrganizeRulesDefault();
+            rulesScroll_ = 0;
+            BuildRuleControls();
+            g_config.Save();
+            Paint();
+            return 0;
+        }
+        if (id == ID_ORGANIZE_NOW) {
+            SyncRulesFromControls();
+            g_config.Save();
+            if (onOrganize) onOrganize();
+            Paint();
+            return 0;
+        }
+        if (id >= ID_RULE_DEL && id < ID_RULE_DEL + (int)ruleRows_.size()) {
+            const int row = id - ID_RULE_DEL;
+            const int idx = ruleRows_[row].ruleIndex;
+            SyncRulesFromControls();
+            if (idx >= 0 && idx < (int)g_config.rules.size()) {
+                g_config.rules.erase(g_config.rules.begin() + idx);
+                BuildRuleControls();
                 g_config.Save();
-                NotifyChanged();
                 Paint();
             }
             return 0;
@@ -956,7 +1326,10 @@ bool SettingsWindow::Create(HWND owner) {
     RegisterClassExW(&wc);
 
     // WS_MINIMIZEBOX：标题栏要有最小化按钮。少了它 Win11 只画「关闭」一个按钮。
-    const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    // WS_CLIPCHILDREN：整理规则页的输入框是真的子窗口，面板是「画满整张位图再 BitBlt」，
+    // 没有这个样式时每次重绘都会把输入框那块一起刷掉（和搜索面板同一个坑）。
+    const DWORD kStyle =
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     RECT wr{0, 0, kClientW, kClientH};
     AdjustWindowRectEx(&wr, kStyle, FALSE, WS_EX_APPWINDOW);
     const int w = wr.right - wr.left;
@@ -985,16 +1358,29 @@ bool SettingsWindow::Create(HWND owner) {
 void SettingsWindow::Show() {
     if (!hwnd_) return;
     dark_ = !AppsUseLightTheme();
+    if (ruleBrush_) { DeleteObject(ruleBrush_); ruleBrush_ = nullptr; }   // 主题可能变了
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd_);
+    // 规则页的输入框是懒创建的：每次显示都重建一遍，顺便把配置里的最新内容带进来
+    if (page_ == Page::Rules) BuildRuleControls();
     Paint();
 }
 
 void SettingsWindow::Hide() {
-    if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
+    if (!hwnd_) return;
+    // 输入框里的字还没提交到配置，隐藏前先收走
+    if (page_ == Page::Rules) {
+        SyncRulesFromControls();
+        g_config.Save();
+        DestroyRuleControls();
+    }
+    ShowWindow(hwnd_, SW_HIDE);
 }
 
 void SettingsWindow::Destroy() {
+    DestroyRuleControls();
+    if (ruleFont_) { DeleteObject(ruleFont_); ruleFont_ = nullptr; }
+    if (ruleBrush_) { DeleteObject(ruleBrush_); ruleBrush_ = nullptr; }
     if (hwnd_) {
         SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
         DestroyWindow(hwnd_);

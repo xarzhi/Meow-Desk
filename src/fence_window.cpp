@@ -324,9 +324,32 @@ int FenceWindow::minH() const {
     return HeadH() + 64;        // 头部 + 一行图标的空间
 }
 
+// 头部右侧的锁按钮矩形（客户区）。箭头占最右边 40px，锁放在它左边一格。
+RECT FenceWindow::LockRect() const {
+    const int cy = HeadH() / 2;
+    const int cx = width_ - 52;
+    return RECT{cx - 9, cy - 9, cx + 9, cy + 9};
+}
+
+void FenceWindow::SetLocked(bool on) {
+    if (!cfg_) return;
+    const bool was = cfg_->locked != 0;
+    cfg_->locked = on ? 1 : 0;
+    if (on && !was) {
+        // 正在拖动 / 改尺寸时被锁上（理论上有），立刻收掉手势，
+        // 否则鼠标还按着，盒子会继续跟着走 —— 看着就像「锁不住」。
+        dragging_ = false;
+        resizing_ = false;
+        resizeEdge_ = Edge::None;
+    }
+    Redraw();
+    if (onStateChanged) onStateChanged();   // 存配置 + 存布局
+}
+
 // 命中四条边/四个角（客户区坐标）。收起状态下不参与，避免和「拖头部移动」打架。
 FenceWindow::Edge FenceWindow::HitEdge(POINT pt) const {
     if (collapsed_) return Edge::None;
+    if (locked()) return Edge::None;   // 锁定的盒子不能改尺寸
     const int m = kEdgeMargin;
     const bool left = pt.x < m;
     const bool right = pt.x >= width_ - m;
@@ -358,8 +381,19 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     resizeEdge_ = Edge::None;
     pressItem_ = -1;
     pressArrow_ = false;
+    pressLock_ = false;
     pressHeader_ = false;
     pressBody_ = false;
+
+    // 锁按钮优先级最高：它压在头部右侧，点在它上面不能算「拖头部」
+    if (showTitle_ && pt.y < HeadH()) {
+        const RECT lr = LockRect();
+        if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom) {
+            pressLock_ = true;
+            SetCapture(h);
+            return;
+        }
+    }
 
     // 先判边缘：边缘优先于头部拖动/图标
     const Edge e = HitEdge(pt);
@@ -376,7 +410,8 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     if (pt.y < HeadH() && showTitle_ && pt.x > width_ - 40) {
         pressArrow_ = true;
     } else if (pt.y < HeadH()) {
-        pressHeader_ = true;
+        // 锁定后头部不再能拖动（不然「锁住位置」就成了空话）
+        pressHeader_ = !locked();
     } else if (!collapsed_) {
         pressBody_ = true;
         pressItem_ = HitItem(pt);
@@ -975,6 +1010,14 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt{};
             GetCursorPos(&pt);
             ScreenToClient(h, &pt);
+            // 锁按钮上给手型（它和头部拖动长得很近，得有个区分）
+            if (showTitle_ && pt.y < HeadH()) {
+                const RECT lr = LockRect();
+                if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom) {
+                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    return TRUE;
+                }
+            }
             LPCWSTR id = nullptr;
             switch (HitEdge(pt)) {
             case Edge::L: case Edge::R: id = IDC_SIZEWE; break;
@@ -1097,6 +1140,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
         const int item = pressItem_;
         const bool arrow = pressArrow_;
+        const bool lockPress = pressLock_;
         const bool wasDragging = dragging_;
         const bool wasItemDrag = itemDragging_;
         const bool wasResizing = resizing_;
@@ -1107,8 +1151,14 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         resizeEdge_ = Edge::None;
         pressItem_ = -1;
         pressArrow_ = false;
+        pressLock_ = false;
         pressHeader_ = false;
         pressBody_ = false;
+
+        if (lockPress) {
+            ToggleLock();   // 锁 / 解锁（SetLocked 里会存盘并重画）
+            return 0;
+        }
 
         if (wasResizing) {
             if (onGeometryChanged) onGeometryChanged();
@@ -1340,6 +1390,36 @@ void FenceWindow::Paint() {
                            &fmt, &brush);
         }
 
+        // ---- 锁按钮（自绘挂锁）----
+        // 锁上：实心锁体 + 蓝色；未锁：只有描边、颜色淡一些，不抢标题的视觉重量。
+        if (showTitle_) {
+            const RECT lr = LockRect();
+            const float cx = (float)(lr.left + lr.right) * 0.5f;
+            const float cy = (float)(lr.top + lr.bottom) * 0.5f;
+            const bool on = locked();
+            const Color lc = on ? Color(255, 0, 120, 215)
+                                : (light ? Color(130, 96, 96, 102) : Color(140, 210, 210, 216));
+            // 锁体：宽 11、高 9，底边贴着 cy+5
+            const RectF body(cx - 5.5f, cy - 1.0f, 11.0f, 9.0f);
+            GraphicsPath bp;
+            AddRoundRect(bp, body, 2.0f);
+            // 锁梁：半圆，锁上时扣在锁体上（低一点、闭合），未锁时抬高一点
+            GraphicsPath sp;
+            const float lift = on ? 0.0f : -1.5f;
+            sp.AddArc(cx - 4.0f, cy - 7.5f + lift, 8.0f, 8.0f, 180.0f, 180.0f);
+            Pen shackle(lc, 1.5f);
+            shackle.SetStartCap(LineCapRound);
+            shackle.SetEndCap(LineCapRound);
+            gfx.DrawPath(&shackle, &sp);
+            if (on) {
+                SolidBrush fill(lc);
+                gfx.FillPath(&fill, &bp);
+            } else {
+                Pen pen(lc, 1.3f);
+                gfx.DrawPath(&pen, &bp);
+            }
+        }
+
         // ---- 收起 / 展开箭头 ----
         // 收起/展开是有高度补间的，箭头按「展开程度」绕 90° 转过去，跟高度一起动。
         // 展开程度直接由当前高度推出来，不用再单独维护一套动画状态。
@@ -1368,16 +1448,14 @@ void FenceWindow::Paint() {
         }
 
         // ---- 悬停高亮（拖动中不画：被拖的那个已变成"空位"，再套一层高亮很乱）----
+        // 直角填充：盒内图标的底色和桌面图标保持一致，不做圆角
+        // （逐像素 alpha 的圆角在这个尺寸下没有抗锯齿，边缘会明显发毛）。
         if (!collapsed_ && hot_ >= 0 && !itemDragging_) {
             RECT ir = ItemHighlightRect(hot_);
             if (ir.right > ir.left) {
-                GraphicsPath cell;
-                AddRoundRect(cell, RectF((float)ir.left + 2, (float)ir.top + 2,
-                                         (float)(ir.right - ir.left) - 4,
-                                         (float)cellH() - 4),
-                             8.0f);
                 SolidBrush hl{light ? Color(26, 0, 0, 0) : Color(52, 255, 255, 255)};
-                gfx.FillPath(&hl, &cell);
+                gfx.FillRectangle(&hl, Rect(ir.left + 2, ir.top + 2, ir.right - ir.left - 4,
+                                            cellH() - 4));
             }
         }
 
@@ -1385,17 +1463,12 @@ void FenceWindow::Paint() {
         if (!collapsed_ && sel_ >= 0 && !itemDragging_) {
             RECT sr = ItemHighlightRect(sel_);
             if (sr.right > sr.left) {
-                GraphicsPath cell;
-                AddRoundRect(cell,
-                             RectF((float)sr.left + 3.0f, (float)sr.top + 3.0f,
-                                   (float)(sr.right - sr.left) - 6.0f,
-                                   (float)cellH() - 6.0f),
-                             8.0f);
+                const Rect rc(sr.left + 3, sr.top + 3, sr.right - sr.left - 6, cellH() - 6);
                 // 浅色卡片上用暗一点的高亮，深色卡片上用亮一点的
                 SolidBrush fill{light ? Color(34, 0, 0, 0) : Color(44, 255, 255, 255)};
-                gfx.FillPath(&fill, &cell);
+                gfx.FillRectangle(&fill, rc);
                 Pen pen{light ? Color(70, 0, 0, 0) : Color(80, 255, 255, 255), 1.0f};
-                gfx.DrawPath(&pen, &cell);
+                gfx.DrawRectangle(&pen, rc);
             }
         }
 
@@ -1403,16 +1476,11 @@ void FenceWindow::Paint() {
         if (!collapsed_ && drop_.item >= 0 && drop_.zone == 0) {
             RECT ir = ItemHighlightRect(drop_.item);
             if (ir.right > ir.left) {
-                GraphicsPath cell;
-                AddRoundRect(cell,
-                             RectF((float)ir.left + 3.0f, (float)ir.top + 3.0f,
-                                   (float)(ir.right - ir.left) - 6.0f,
-                                   (float)cellH() - 6.0f),
-                             8.0f);
+                const Rect rc(ir.left + 3, ir.top + 3, ir.right - ir.left - 6, cellH() - 6);
                 SolidBrush fill{Color(58, 0, 120, 215)};
-                gfx.FillPath(&fill, &cell);
+                gfx.FillRectangle(&fill, rc);
                 Pen pen{Color(255, 0, 120, 215), 1.6f};
-                gfx.DrawPath(&pen, &cell);
+                gfx.DrawRectangle(&pen, rc);
             }
         }
 

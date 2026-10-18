@@ -21,7 +21,8 @@ std::wstring g_file;
 // schema 版本：以后加字段就 +1，并在 Upgrade() 里补一段迁移
 //   v1 — 初版：app / fence / icon_layout
 //   v2 — fence 表加 viewMode / sortKey / sortAsc（每个盒子各自的「查看」「排序」）
-const int kSchemaVersion = 2;
+//   v3 — fence 表加 locked（盒子锁定）；新增 rule 表（整理规则）
+const int kSchemaVersion = 3;
 
 void SetError(const char* what) {
     g_lastError = what ? what : "";
@@ -55,7 +56,15 @@ bool Upgrade(int from) {
         "  title TEXT NOT NULL,"
         "  viewMode INTEGER NOT NULL DEFAULT 1,"
         "  sortKey  INTEGER NOT NULL DEFAULT 4,"
-        "  sortAsc  INTEGER NOT NULL DEFAULT 1"
+        "  sortAsc  INTEGER NOT NULL DEFAULT 1,"
+        "  locked   INTEGER NOT NULL DEFAULT 0"
+        ");"
+        "CREATE TABLE IF NOT EXISTS rule ("
+        "  id INTEGER PRIMARY KEY,"     // 0,1,2… 对应 rules 下标（顺序就是匹配优先级）
+        "  name TEXT NOT NULL DEFAULT '',"
+        "  exts TEXT NOT NULL DEFAULT '',"
+        "  matchFolders INTEGER NOT NULL DEFAULT 0,"
+        "  isFallback   INTEGER NOT NULL DEFAULT 0"
         ");"
         "CREATE TABLE IF NOT EXISTS icon_layout ("
         "  path  TEXT PRIMARY KEY,"     // 解析名，唯一且稳定
@@ -72,6 +81,11 @@ bool Upgrade(int from) {
         AddColumn("fence", "viewMode", "INTEGER NOT NULL DEFAULT 1");
         AddColumn("fence", "sortKey", "INTEGER NOT NULL DEFAULT 4");
         AddColumn("fence", "sortAsc", "INTEGER NOT NULL DEFAULT 1");
+    }
+    if (from < 3) {
+        AddColumn("fence", "locked", "INTEGER NOT NULL DEFAULT 0");
+        // rule 表在上面那段 kSchema 里已经 CREATE IF NOT EXISTS 过了，
+        // 老库走这里也一样会建出来（kSchema 每次都执行），不会丢数据。
     }
 
     const std::string ver = "PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";";

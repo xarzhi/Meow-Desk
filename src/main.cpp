@@ -35,6 +35,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #pragma comment(lib, "shell32.lib")
@@ -67,6 +68,9 @@ static int g_lastArrow = 1;
 static int g_lastAcrylic = 0;
 static int g_cellW = 75;
 static int g_cellH = 98;
+// 资源管理器真实的桌面行距。g_cellH 是「实际用」的行距：关掉图标标题后
+// 会把标签那一块的高度减掉，行与行之间立刻变紧。
+static int g_cellHFull = 98;
 static DesktopIconView* g_draggingIcon = nullptr;
 
 // ---------------------------------------------------------------------------
@@ -450,6 +454,27 @@ static void ReloadDesktopIcons() {
 }
 
 // ---------------------------------------------------------------------------
+// 桌面格子尺寸
+//
+// 行距来自资源管理器的 GetSpacing（g_cellHFull）。「显示图标标题」关掉之后，
+// 标签那一块就不占了，格子高度要把它的高度整块减掉（图标本身不变小）；
+// 重新打开就加回来。拖动浮层的标签排版也走同一份尺寸。
+// ---------------------------------------------------------------------------
+static void ApplyCellSize() {
+    const int iconBlock = DesktopSurface::kIconTopPad + kIconPx + DesktopSurface::kTextGap;
+    const int labelH = std::max(14, g_cellHFull - iconBlock);
+    g_cellH = (g_config.showLabels != 0) ? g_cellHFull : (g_cellHFull - labelH);
+    if (g_cellH < iconBlock) g_cellH = iconBlock;
+
+    g_surface.SetCellSize(g_cellW, g_cellH);
+    const int textH = std::max(14, g_cellH - iconBlock);
+    g_drag.SetLabelLayout(std::max(40, g_cellW - 10), textH, g_config.textShadow != 0,
+                          g_config.showLabels != 0);
+    // SetCellSize 只是改数字，得自己触发一次重画（悬停/选中框都按格子尺寸算）
+    g_surface.Redraw();
+}
+
+// ---------------------------------------------------------------------------
 // 设置变化
 // ---------------------------------------------------------------------------
 static void ApplySettings() {
@@ -463,12 +488,7 @@ static void ApplySettings() {
 
     g_surface.SetTextShadow(g_config.textShadow != 0);
     g_surface.SetShowLabels(g_config.showLabels != 0);
-    {
-        const int textH = std::max(14, g_cellH - (DesktopSurface::kIconTopPad + kIconPx +
-                                                  DesktopSurface::kTextGap));
-        g_drag.SetLabelLayout(std::max(40, g_cellW - 10), textH, g_config.textShadow != 0,
-                              g_config.showLabels != 0);
-    }
+    ApplyCellSize();   // 标题开关会改桌面格子高度
     for (auto& f : g_fences) if (f) f->ApplyConfig(recapture);
 }
 
@@ -503,6 +523,7 @@ enum {
     kCmdViewSmall = 4030,   // 4030..4035：小 / 中 / 大 / 超大 / 列表 / 详情
     kCmdSettings = 4040,
     kCmdRename = 4041,
+    kCmdLock = 4042,
 };
 
 static void AddFenceWindow(int i);
@@ -542,6 +563,145 @@ static void NewFenceNear(int fi) {
     g_config.Save();
     LogStep("new fence #" + std::to_string((int)g_config.fences.size() - 1) + " at " +
             std::to_string(x) + "," + std::to_string(y));
+}
+
+// ---------------------------------------------------------------------------
+// 整理规则：一键整理 / 自动整理
+//
+// 参考 my-desktop 的行为：只改「归属」（图标进哪个盒子），文件始终留在桌面上，
+// 所以整理是瞬间完成的，也不受跨盘、大文件影响。规则顺序就是优先级，
+// 第一条命中的生效；isFallback 的兜底规则吃下谁都没匹配到的项目。
+// ---------------------------------------------------------------------------
+static std::wstring ExtLowerOf(const std::wstring& path) {
+    const size_t dot = path.find_last_of(L'.');
+    const size_t sep = path.find_last_of(L"\\/");
+    if (dot == std::wstring::npos) return std::wstring();
+    if (sep != std::wstring::npos && dot < sep) return std::wstring();
+    std::wstring ext = path.substr(dot);
+    for (auto& ch : ext)
+        if (ch >= L'A' && ch <= L'Z') ch = (wchar_t)(ch - L'A' + L'a');
+    return ext;
+}
+
+static bool IsDirectoryPath(const std::wstring& path) {
+    const DWORD a = GetFileAttributesW(path.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// 按规则顺序取第一条命中的；都不命中返回兜底规则下标（没有兜底则 -1）
+static int MatchRuleIndex(const std::wstring& path, bool isDir, bool& matched) {
+    const std::wstring ext = ExtLowerOf(path);
+    int fallback = -1;
+    matched = false;
+    for (size_t i = 0; i < g_config.rules.size(); ++i) {
+        const OrganizeRule& r = g_config.rules[i];
+        if (r.isFallback) {
+            if (fallback < 0) fallback = (int)i;
+            continue;
+        }
+        if (OrganizeRuleMatches(r, ext, isDir)) {
+            matched = true;
+            return (int)i;
+        }
+    }
+    return fallback;
+}
+
+static int FindFenceByTitle(const std::wstring& t) {
+    for (size_t i = 0; i < g_fences.size() && i < g_config.fences.size(); ++i) {
+        if (g_fences[i] && g_config.fences[i].title == t) return (int)i;
+    }
+    return -1;
+}
+
+// 给某条规则新建盒子：从现有盒子往右摆，超出工作区换到下一行（和「新建盒子」一致）
+static int CreateRuleFence(const std::wstring& title) {
+    const int w = 340, h = 380;
+    RECT base{200, 200, 200 + w, 200 + h};
+    for (int i = (int)g_fences.size() - 1; i >= 0; --i) {
+        if (g_fences[i] && g_fences[i]->hwnd()) {
+            base = g_fences[i]->rect();
+            break;
+        }
+    }
+    RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromPoint(POINT{base.left, base.top}, MONITOR_DEFAULTTONEAREST);
+    if (mon && GetMonitorInfoW(mon, &mi)) lim = mi.rcWork;
+
+    int x = base.right + 20;
+    int y = base.top;
+    if (x + w > lim.right) {
+        x = lim.left + 40;
+        y = base.bottom + 20;
+    }
+    if (y + h > lim.bottom) y = lim.bottom - h;
+    if (x < lim.left) x = lim.left;
+    if (y < lim.top) y = lim.top;
+
+    FenceConfig c;
+    c.x = x;
+    c.y = y;
+    c.w = w;
+    c.h = h;
+    c.title = title;
+    g_config.fences.push_back(c);
+    const int idx = (int)g_config.fences.size() - 1;
+    AddFenceWindow(idx);
+    LogStep("rule fence \"" + Narrow(title) + "\" #" + std::to_string(idx));
+    return idx;
+}
+
+// 把一批图标按规则归入盒子；quiet = 自动整理（不弹提示、不报错到界面）
+static void OrganizeIcons(const std::vector<DesktopIconView*>& cand, bool quiet) {
+    (void)quiet;
+    if (cand.empty() || g_config.rules.empty()) return;
+
+    std::vector<std::vector<DesktopIconView*>> groups(g_config.rules.size());
+    size_t total = 0;
+    for (auto* e : cand) {
+        if (!e) continue;
+        bool matched = false;
+        const int ri = MatchRuleIndex(e->path, IsDirectoryPath(e->path), matched);
+        if (ri < 0 || ri >= (int)groups.size()) continue;
+        groups[ri].push_back(e);
+        ++total;
+    }
+    if (!total) {
+        LogStep("organize: nothing matched");
+        return;
+    }
+
+    bool changed = false;
+    for (size_t i = 0; i < groups.size(); ++i) {
+        if (groups[i].empty()) continue;
+        std::wstring name = g_config.rules[i].name;
+        if (name.empty()) name = L"\u672a\u547d\u540d";   // 未命名
+        int fi = FindFenceByTitle(name);
+        if (fi < 0) fi = CreateRuleFence(name);
+        if (fi < 0) continue;
+        for (auto* e : groups[i]) InsertIntoFence(e, fi, -1);
+        changed = true;
+        LogStep("organize: " + Narrow(name) + " <- " + std::to_string(groups[i].size()));
+    }
+    if (changed) {
+        SaveIconLayout();
+        g_config.Save();
+        RedrawAll();
+    }
+}
+
+// 立即整理：桌面上还没进盒子的图标全部按规则归类
+static void OrganizeDesktopNow() {
+    std::vector<DesktopIconView*> cand;
+    for (auto* e : g_icons)
+        if (e && e->OnDesktop()) cand.push_back(e);
+    if (cand.empty()) {
+        LogStep("organize: no desktop icons");
+        return;
+    }
+    OrganizeIcons(cand, false);
 }
 
 // 在真实桌面上新建文件夹（和资源管理器一样挑一个不重名的名字）
@@ -740,6 +900,11 @@ static void ShowFenceMenu(int fi, POINT sp) {
     items.push_back(
         PopupMenuItem(L"\u6253\u5f00\u8bbe\u7f6e\u9762\u677f", kCmdSettings));  // 打开设置面板
     items.push_back(PopupMenuItem(L"\u91cd\u547d\u540d\u5206\u533a", kCmdRename));  // 重命名分区
+    // 头部右侧的锁按钮在「显示盒子标题」关掉时是看不见的，这里留一个出口，
+    // 免得锁上之后没法再解开。
+    items.push_back(PopupMenuItem(f->locked() ? L"\u89e3\u9501\u4f4d\u7f6e"    // 解锁位置
+                                              : L"\u9501\u5b9a\u4f4d\u7f6e",   // 锁定位置
+                                  kCmdLock));
 
     if (!g_fenceMenu.Create()) return;
     g_fenceMenu.SetOwner(f->hwnd());
@@ -750,6 +915,7 @@ static void ShowFenceMenu(int fi, POINT sp) {
         if (id == kCmdNewFolder) { NewDesktopFolder(); return; }
         if (id == kCmdSettings) { g_settings.Show(); return; }
         if (id == kCmdRename) { BeginRenameFence(fi); return; }
+        if (id == kCmdLock) { w->ToggleLock(); return; }
         if (id >= kCmdSortName && id < kCmdSortName + 5) {
             // 换排序字段时保留当前的正序/倒序
             w->SetSort(id - kCmdSortName, w->sortAsc());
@@ -908,11 +1074,86 @@ static void Cleanup() {
 }
 
 // ---------------------------------------------------------------------------
+// 自动整理：桌面上新出现的文件几秒后自动按规则归类
+//
+// 没有用 ReadDirectoryChangesW / FileSystemWatcher：只要 4 秒扫一次桌面文件夹
+// （几十个条目，开销可以忽略）就够了，还不会被 Explorer 重启、OneDrive 迁移目录
+// 之类的事情搞坏。判「新」用创建时间 —— 同盘移动会保留创建时间，所以从别处
+// 移过来的旧文件不会被误收。
+// ---------------------------------------------------------------------------
+static std::unordered_set<std::wstring> g_knownDesk;
+static ULONGLONG g_procStartFt = 0;
+static DWORD g_lastAutoCheck = 0;
+
+static ULONGLONG FileTimeToU64(const FILETIME& ft) {
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart;
+}
+
+// 把当前认识的桌面项目全部记下来（启动时、手动整理后各调一次）
+static void NoteKnownDesktopPaths() {
+    g_knownDesk.clear();
+    for (auto* e : g_icons)
+        if (e && !e->path.empty()) g_knownDesk.insert(e->path);
+}
+
+static void CheckAutoOrganize() {
+    if (!g_config.autoOrganize) return;
+    const DWORD now = GetTickCount();
+    if (g_lastAutoCheck && now - g_lastAutoCheck < 4000) return;
+    g_lastAutoCheck = now;
+
+    PWSTR p = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &p)) || !p) return;
+    std::wstring dir = p;
+    CoTaskMemFree(p);
+
+    bool fresh = false;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == L'.' &&
+            (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0)))
+            continue;
+        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+        const std::wstring full = dir + L"\\" + fd.cFileName;
+        if (g_knownDesk.count(full)) continue;
+        if (FileTimeToU64(fd.ftCreationTime) < g_procStartFt) {
+            g_knownDesk.insert(full);   // 老文件，只是我们不认识：记下来，别再扫它
+            continue;
+        }
+        fresh = true;
+        break;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (!fresh) return;
+
+    // 有新项目 → 重新枚举一次图标（得先有图标对象才能归类），再把「不认识的那些」收进去
+    ReloadDesktopIcons();
+    std::vector<DesktopIconView*> added;
+    for (auto* e : g_icons) {
+        if (!e || !e->OnDesktop() || e->path.empty()) continue;
+        if (g_knownDesk.count(e->path)) continue;
+        g_knownDesk.insert(e->path);
+        added.push_back(e);
+    }
+    if (!added.empty()) OrganizeIcons(added, true);
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 物理像素坐标系：不清这个，DWM 会把分层窗口整体拉伸，图标必然发虚
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    {
+        FILETIME ft{};
+        GetSystemTimeAsFileTime(&ft);
+        g_procStartFt = FileTimeToU64(ft);
+    }
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     LogStep("--- start ---");
@@ -964,7 +1205,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     POINT sp = LastEnumSpacing();
     g_cellW = sp.x > 0 ? sp.x : 75;
-    g_cellH = sp.y > 0 ? sp.y : 98;
+    g_cellHFull = sp.y > 0 ? sp.y : 98;
+    g_cellH = g_cellHFull;
 
     // 3. 隐藏系统桌面图标，交给我们的桌面层
     g_systemIconsHidden = SetSystemDesktopIconsVisible(false);
@@ -972,18 +1214,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     // 4. 拖拽浮层（最先创建，层级最后摆）
     g_drag.Create();
-    {
-        // 浮层里图标下方也要显示名称：排版盒子和桌面标签保持一致
-        const int iconSide = kIconPx;
-        const int textH = std::max(14, g_cellH - (DesktopSurface::kIconTopPad + iconSide +
-                                                  DesktopSurface::kTextGap));
-        g_drag.SetLabelLayout(std::max(40, g_cellW - 10), textH, g_config.textShadow != 0,
-                              g_config.showLabels != 0);
-    }
 
     // 5. 桌面层
     g_surface.SetIcons(&g_icons);
-    g_surface.SetCellSize(g_cellW, g_cellH);
+    ApplyCellSize();   // 格子尺寸（含「显示标题」开关的影响）+ 拖拽浮层标签排版
     g_surface.SetIconPx(kIconPx);
     g_surface.SetTextShadow(g_config.textShadow != 0);
     g_surface.SetShowLabels(g_config.showLabels != 0);
@@ -1049,6 +1283,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     ApplyIconLayout();
     // 还原完归属才知道哪些图标在盒子里，这时再把它们换成「查看」档位对应的尺寸
     for (int i = 0; i < (int)g_fences.size(); ++i) EnsureFenceIconSize(i);
+    // 自动整理只认「启动之后新出现的」项目，先把现有的都记下来
+    NoteKnownDesktopPaths();
     RedrawAll();   // 盒子创建时就已经画过一次（那时还是空的），还原后必须重画
 
     // 7. 设置窗口 + 托盘 + 搜索面板
@@ -1057,6 +1293,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_settings.onReloadIcons = [] { ReloadDesktopIcons(); };
     g_settings.getSystemIconsShown = [] { return !g_systemIconsHidden; };
     g_settings.setSystemIconsShown = [](bool shown) { SetDesktopIconsShown(shown); };
+    g_settings.onOrganize = [] { OrganizeDesktopNow(); };
 
     g_search.SetIcons(&g_icons);
     g_search.onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
@@ -1085,8 +1322,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!g_tray.Create(nullptr)) LogStep("tray create FAILED");
     g_tray.SetDesktopIconsVisible(false);
 
-    // 8. 心跳：把层级摆回来（Win+D、Explorer 重启等）
-    g_surface.onTick = [] { RestoreZOrder(); };
+    // 8. 心跳：把层级摆回来（Win+D、Explorer 重启等）+ 自动整理巡检
+    g_surface.onTick = [] {
+        RestoreZOrder();
+        CheckAutoOrganize();
+    };
 
     RestoreZOrder();
     // 便于自动化测试：MEOW_SHOW_SETTINGS=1 时启动即打开设置面板

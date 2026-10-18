@@ -103,6 +103,7 @@ void LoadLegacyIni(AppConfig& c) {
         else if (k == L"alpha") cur.alpha = ToInt(v, 236);
         else if (k == L"radius") cur.radius = ToInt(v, 12);
         else if (k == L"acrylic") cur.acrylic = ToInt(v, 0);
+        else if (k == L"locked") cur.locked = ToInt(v, 0);
         else if (k == L"title") cur.title = v;
         else if (k == L"viewMode") cur.viewMode = ToInt(v, 1);
         else if (k == L"sortKey") cur.sortKey = ToInt(v, 4);
@@ -128,11 +129,12 @@ bool ConfigFromDb(AppConfig& c) {
             else if (k == L"autoExpandOnHover") c.autoExpandOnHover = n;
             else if (k == L"sortAnim") c.sortAnim = n;
             else if (k == L"showFenceTitle") c.showFenceTitle = n;
+            else if (k == L"autoOrganize") c.autoOrganize = n;
         }
     }
     {
         storage::Stmt st(
-            "SELECT x,y,w,h,color,alpha,radius,acrylic,title,viewMode,sortKey,sortAsc"
+            "SELECT x,y,w,h,color,alpha,radius,acrylic,title,viewMode,sortKey,sortAsc,locked"
             " FROM fence ORDER BY id");
         if (!st.ok()) return false;
         while (st.step()) {
@@ -149,7 +151,21 @@ bool ConfigFromDb(AppConfig& c) {
             f.viewMode = st.colInt(9);
             f.sortKey = st.colInt(10);
             f.sortAsc = st.colInt(11);
+            f.locked = st.colInt(12);
             c.fences.push_back(std::move(f));
+        }
+    }
+    {
+        storage::Stmt st("SELECT name,exts,matchFolders,isFallback FROM rule ORDER BY id");
+        if (st.ok()) {
+            while (st.step()) {
+                OrganizeRule r;
+                r.name = st.colText(0);
+                r.exts = st.colText(1);
+                r.matchFolders = st.colInt(2);
+                r.isFallback = st.colInt(3);
+                c.rules.push_back(std::move(r));
+            }
         }
     }
     // 没有任何盒子 = 还没初始化过（ConfigEnsureDefaults 保证至少 2 个）
@@ -162,23 +178,89 @@ std::wstring AppConfig::Dir() { return storage::Dir(); }
 std::wstring AppConfig::File() { return storage::File(); }
 
 void ConfigEnsureDefaults() {
-    if (!g_config.fences.empty()) return;
-    FenceConfig a;
-    a.x = 1100; a.y = 400;
-    a.title = L"\u6211\u7684\u76d2\u5b50";
-    g_config.fences.push_back(a);
+    bool dirty = false;
+    if (g_config.rules.empty()) {
+        g_config.rules = OrganizeRulesDefault();
+        dirty = true;
+    }
+    if (g_config.fences.empty()) {
+        FenceConfig a;
+        a.x = 1100; a.y = 400;
+        a.title = L"\u6211\u7684\u76d2\u5b50";
+        g_config.fences.push_back(a);
 
-    FenceConfig b;
-    b.x = 1100; b.y = 100;
-    b.h = 260;
-    b.color = RGB(246, 248, 255);
-    b.title = L"\u5de5\u4f5c";
-    g_config.fences.push_back(b);
-    g_config.Save();
+        FenceConfig b;
+        b.x = 1100; b.y = 100;
+        b.h = 260;
+        b.color = RGB(246, 248, 255);
+        b.title = L"\u5de5\u4f5c";
+        g_config.fences.push_back(b);
+        dirty = true;
+    }
+    if (dirty) g_config.Save();
+}
+
+// ---------------------------------------------------------------------------
+// 整理规则
+// ---------------------------------------------------------------------------
+std::vector<OrganizeRule> OrganizeRulesDefault() {
+    // 顺序就是优先级，兜底规则永远在最后（Match 里也是这么处理的）
+    return {
+        {L"\u5feb\u6377\u65b9\u5f0f",                      // 快捷方式
+         L".lnk; .url; .appref-ms; .website", 0, 0},
+        {L"\u6587\u4ef6\u5939", L"", 1, 0},                // 文件夹
+        {L"\u6587\u6863",                                   // 文档
+         L".doc; .docx; .xls; .xlsx; .xlsm; .ppt; .pptx; .pdf; .txt; .md; .rtf; .wps; "
+         L".et; .dps; .csv; .odt; .ods; .odp; .ofd; .xmind; .vsdx; .epub",
+         0, 0},
+        {L"\u56fe\u7247",                                   // 图片
+         L".jpg; .jpeg; .png; .gif; .bmp; .webp; .svg; .ico; .tif; .tiff; .heic; "
+         L".heif; .psd; .ai; .raw",
+         0, 0},
+        {L"\u5f71\u97f3",                                   // 影音
+         L".mp4; .mkv; .avi; .mov; .wmv; .flv; .webm; .m4v; .rmvb; .mp3; .wav; .flac; "
+         L".aac; .m4a; .ogg; .wma; .ape",
+         0, 0},
+        {L"\u538b\u7f29\u5305",                             // 压缩包
+         L".zip; .rar; .7z; .tar; .gz; .tgz; .bz2; .xz; .iso; .cab", 0, 0},
+        {L"\u7a0b\u5e8f",                                   // 程序
+         L".exe; .msi; .bat; .cmd; .ps1; .vbs; .jar; .appx; .msix", 0, 0},
+        {L"\u5176\u4ed6", L"", 0, 1},                       // 其他（兜底）
+    };
+}
+
+namespace {
+bool IsSep(wchar_t ch) {
+    return ch == L';' || ch == L',' || ch == L' ' || ch == L'\t' || ch == L'\uFF1B' ||
+           ch == L'\uFF0C';
+}
+}  // namespace
+
+bool OrganizeRuleMatches(const OrganizeRule& r, const std::wstring& extLower, bool isDir) {
+    if (r.isFallback) return false;   // 兜底规则由调用方在最后处理
+    if (isDir) return r.matchFolders != 0;
+    if (extLower.empty()) return false;
+    const std::wstring& s = r.exts;
+    size_t i = 0;
+    while (i < s.size()) {
+        while (i < s.size() && IsSep(s[i])) ++i;
+        size_t j = i;
+        while (j < s.size() && !IsSep(s[j])) ++j;
+        if (j > i) {
+            std::wstring tok = s.substr(i, j - i);
+            if (tok[0] != L'.') tok.insert(tok.begin(), L'.');
+            for (auto& ch : tok)
+                if (ch >= L'A' && ch <= L'Z') ch = (wchar_t)(ch - L'A' + L'a');
+            if (tok == extLower) return true;
+        }
+        i = j;
+    }
+    return false;
 }
 
 void AppConfig::Load() {
     fences.clear();
+    rules.clear();
     if (storage::Open()) {
         if (ConfigFromDb(*this)) return;
         // 空库：如果有老的 config.ini，导进来再备份掉
@@ -202,7 +284,8 @@ void AppConfig::Save() const {
     if (!storage::Open()) return;
     if (!storage::Begin()) return;
 
-    bool ok = storage::Exec("DELETE FROM app;") && storage::Exec("DELETE FROM fence;");
+    bool ok = storage::Exec("DELETE FROM app;") && storage::Exec("DELETE FROM fence;") &&
+              storage::Exec("DELETE FROM rule;");
     if (ok) {
         storage::Stmt st("INSERT OR REPLACE INTO app(k,v) VALUES(?1,?2)");
         auto put = [&st](const wchar_t* k, int v) {
@@ -219,11 +302,12 @@ void AppConfig::Save() const {
         put(L"autoExpandOnHover", autoExpandOnHover);
         put(L"sortAnim", sortAnim);
         put(L"showFenceTitle", showFenceTitle);
+        put(L"autoOrganize", autoOrganize);
 
         storage::Stmt fs(
             "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title,"
-            "viewMode,sortKey,sortAsc)"
-            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)");
+            "viewMode,sortKey,sortAsc,locked)"
+            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)");
         for (size_t i = 0; i < fences.size() && fs.ok(); ++i) {
             const FenceConfig& c = fences[i];
             fs.bindInt(1, (int)i);
@@ -239,8 +323,25 @@ void AppConfig::Save() const {
             fs.bindInt(11, c.viewMode);
             fs.bindInt(12, c.sortKey);
             fs.bindInt(13, c.sortAsc);
+            fs.bindInt(14, c.locked);
             ok = fs.done() && ok;
             fs.reset();
+        }
+
+        if (ok) {
+            storage::Stmt rs(
+                "INSERT INTO rule(id,name,exts,matchFolders,isFallback)"
+                " VALUES(?1,?2,?3,?4,?5)");
+            for (size_t i = 0; i < rules.size() && rs.ok(); ++i) {
+                const OrganizeRule& r = rules[i];
+                rs.bindInt(1, (int)i);
+                rs.bindText(2, r.name);
+                rs.bindText(3, r.exts);
+                rs.bindInt(4, r.matchFolders);
+                rs.bindInt(5, r.isFallback);
+                ok = rs.done() && ok;
+                rs.reset();
+            }
         }
     }
 
