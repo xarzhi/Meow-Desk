@@ -173,12 +173,17 @@ void Layout(const RECT& target, const std::wstring& name) {
     const int targetH = (int)(target.bottom - target.top);
     const int targetW = (int)(target.right - target.left);
 
-    // 只区分「一行」和「两行」：标签框够两行时输入框也占两行，
-    // 否则选中态下展开的第二行会从输入框底下露出来。
-    g_textH = (targetH >= g_lineH * 2 - 2) ? g_lineH * 2 : g_lineH;
+    // 高度只取「这个名字真的要占几行」：
+    //   · 名字量出来比标签盒还宽 → 标签会折成两行，输入框也得占两行，
+    //     否则选中态展开的第二行会从输入框底下露出来；
+    //   · 名字短、一行放得下 → 就算标签盒预留了两行，也只给一行高的输入框
+    //     （否则一个三个字的名字顶着一个两行高的大框，很怪）。
+    const int textW = MeasureTextW(name);
+    const bool wraps = textW > targetW - 2;
+    g_textH = (wraps && targetH >= g_lineH * 2 - 2) ? g_lineH * 2 : g_lineH;
 
     // 宽度：至少盖住原来的名字，长名字可以再宽一点（最多 kMaxW）
-    int want = std::max(targetW, MeasureTextW(name) + kPadX * 2 + 8);
+    int want = std::max(targetW, textW + kPadX * 2 + 8);
     g_fieldW = std::max(kMinW, std::min(want, kMaxW));
     g_fieldH = g_textH + kPadY * 2;
 
