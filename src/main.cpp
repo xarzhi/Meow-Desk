@@ -23,6 +23,7 @@
 #include "rename_box.h"
 #include "search_window.h"
 #include "settings_window.h"
+#include "shell_drag.h"
 #include "shell_icons.h"
 #include "storage.h"
 #include "tray.h"
@@ -81,6 +82,9 @@ static int g_cellHFull = 98;
 // 当前正在拖的一批图标（第 0 个 = 光标下面那个）。单选拖动时长度为 1。
 // 用整批而不是单个：盒子里多选之后要能一次拖走好几张。
 static std::vector<DesktopIconView*> g_dragIcons;
+// 正在跑系统级拖放（DoDragDrop 的模态循环里）。用来挡住重入：
+// 那个循环期间我们自己的窗口照样收消息。
+static bool g_shellDragRunning = false;
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -1675,6 +1679,105 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
 }
 
 // ---------------------------------------------------------------------------
+// 拖到「别人的程序窗口」上：把内部拖拽交棒给系统级 OLE 拖放
+//
+// 我们自己的拖拽是自绘的（浮层 + 落点提示 + 盒子吸附），全程只有 SetCapture，
+// 从不向系统提供任何数据 —— 于是拖到浏览器上传区、别的程序窗口上时，对方根本
+// 不知道有东西在拖，松手自然毫无反应。这里判断「光标是不是压在别人的窗口上」，
+// 是就把被拖的文件拼成 CF_HDROP 交给 DoDragDrop，剩下的（光标、目标高亮、
+// 真正的复制/移动）全部由 shell 和对方程序处理。
+// ---------------------------------------------------------------------------
+
+// 这个窗口是不是「桌面背景」这一族（Progman / WorkerW / 桌面图标列表 / 任务栏）。
+// 动态壁纸通常是 WorkerW 的子窗口，所以得顺着父链往上认，不能只看光标下那一个
+// —— 不然装了动态壁纸的机器上，拖图标划过一片空桌面就会被误判成「压在别的程序上」。
+static bool IsShellBackdropWindow(HWND w) {
+    static const wchar_t* kCls[] = {L"Progman", L"WorkerW", L"SysListView32",
+                                    L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd"};
+    HWND p = w;
+    for (int depth = 0; p && depth < 6; ++depth) {
+        wchar_t cls[64]{};
+        if (!GetClassNameW(p, cls, 64)) break;
+        for (const wchar_t* k : kCls)
+            if (_wcsicmp(cls, k) == 0) return true;
+        HWND up = GetAncestor(p, GA_PARENT);
+        if (!up || up == GetDesktopWindow()) break;
+        p = up;
+    }
+    return false;
+}
+
+// 光标下面压着的是不是「别人的窗口」。
+//
+// 不能反过来用「点不在我们窗口里」判：桌面层是全屏分层窗口，alpha=0 的地方
+// 鼠标直接穿透，WindowFromPoint 会返回 Progman / WorkerW（explorer 的桌面背景）。
+// 所以判据是：窗口属于别的进程、可见，而且不是 shell 的桌面背景 / 任务栏。
+static bool CursorOverForeignWindow(POINT pt) {
+    HWND w = WindowFromPoint(pt);
+    if (!w || !IsWindowVisible(w)) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid == GetCurrentProcessId()) return false;   // 我们自己的窗口（含拖拽浮层）
+    return !IsShellBackdropWindow(w);
+}
+
+// 当前这批被拖的东西里，能拿去拖放的磁盘路径。
+// 回收站 / 此电脑是虚拟项（路径形如 ::{GUID}），CF_HDROP 表达不了，直接过滤掉。
+static std::vector<std::wstring> CurrentDragPaths() {
+    const std::vector<DesktopIconView*>* list = nullptr;
+    if (!g_dragIcons.empty()) list = &g_dragIcons;
+    else list = &g_surface.draggingItems();
+
+    std::vector<std::wstring> out;
+    for (auto* e : *list) {
+        if (!e || e->path.empty()) continue;
+        if (GetFileAttributesW(e->path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        out.push_back(e->path);
+    }
+    return out;
+}
+
+// 把内部这次拖拽彻底收掉：图标回原位、浮层和落点提示全撤
+static void EndInternalDragForShell() {
+    g_drag.Hide();
+    ClearAllDropHints();
+    g_surface.SetDropPreview(false);
+    g_surface.SetDropSeam(false, 0, 0, 0);
+    g_surface.AbortDrag();           // 桌面来源
+    for (auto& f : g_fences)
+        if (f) f->AbortItemsDrag();   // 盒子来源（只有正在拖的那个有状态）
+    g_dragIcons.clear();
+}
+
+// 拖动中每次鼠标移动都过一遍：一旦压到别的程序窗口上就交棒。
+//
+// 调用点必须都在「这一帧处理的最后」—— DoDragDrop 会跑一个模态消息循环，
+// 期间我们自己的窗口照样收消息，所以进去之前内部状态必须已经清干净。
+static void MaybeHandOffToShell(POINT pt) {
+    if (g_shellDragRunning) return;
+    if (g_dragIcons.empty() && !g_surface.dragActive()) return;
+    if (!CursorOverForeignWindow(pt)) return;
+    const std::vector<std::wstring> paths = CurrentDragPaths();
+    if (paths.empty()) return;   // 全是虚拟项：外面也用不上，保持原来的内部拖拽
+
+    EndInternalDragForShell();
+
+    g_shellDragRunning = true;
+    const DWORD eff = ShellDrag::DragFiles(paths);
+    g_shellDragRunning = false;
+
+    LogStep("shell drag -> " + std::to_string(paths.size()) + " file(s), effect=" +
+            std::to_string((int)eff));
+    if (eff != DROPEFFECT_NONE) {
+        // 目标可能是「移动」（拖进别的资源管理器窗口）：文件真的被搬走了，
+        // 重枚举一次让图标跟着消失。我们**绝不**自己删源文件 —— MOVE 由目标完成。
+        ReloadDesktopIcons(true);
+        SaveIconLayout();
+        RedrawAll();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 盒子（动态增删：菜单里的「新建盒子」要能加）
 // ---------------------------------------------------------------------------
 static void AddFenceWindow(int i) {
@@ -1773,6 +1876,8 @@ static void AddFenceWindow(int i) {
             else
                 g_surface.SetDropPreview(false);
         }
+        // 压到别的程序窗口上 → 交棒给系统级拖放（必须放在这一帧的最后）
+        MaybeHandOffToShell(pt);
     };
     f->onItemsDrop = [](const std::vector<DesktopIconView*>& list, POINT pt) {
         g_drag.Hide();
@@ -2121,7 +2226,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_surface.onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
     g_surface.onContextInvoked = [] { ReloadDesktopIcons(); };
     g_surface.overTarget = [](POINT pt) { return FenceIndexAt(pt) >= 0; };
-    g_surface.onDragHover = [](POINT pt) { UpdateAllDropHints(pt); };
+    g_surface.onDragHover = [](POINT pt) {
+        UpdateAllDropHints(pt);
+        // 压到别的程序窗口上 → 交棒给系统级拖放（必须放在这一帧的最后）
+        MaybeHandOffToShell(pt);
+    };
     g_surface.onDrop = [](const std::vector<DesktopIconView*>& list, POINT pt) -> bool {
         const int fi = FenceIndexAt(pt);
 

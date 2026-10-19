@@ -635,6 +635,29 @@ RECT DesktopSurface::CellRect(const DesktopIconView* e) const {
     return r;
 }
 
+// 放弃这次拖动、图标回原位（交棒给系统级拖放之前调）。
+// 和鼠标松开时「没落在盒子上、也没真的移动」那条分支同一套收尾，只是位置直接从
+// dragStartPos_ 还原，不再吸附格子。
+void DesktopSurface::AbortDrag() {
+    if (mode_ != Mode::Move) return;
+    if (hwnd_ && GetCapture() == hwnd_) ReleaseCapture();
+    for (size_t i = 0; i < dragSet_.size() && i < dragStartPos_.size(); ++i) {
+        if (!dragSet_[i]) continue;
+        dragSet_[i]->pos = dragStartPos_[i];
+        dragSet_[i]->dragPos = dragStartPos_[i];
+    }
+    dragSet_.clear();
+    dragStartPos_.clear();
+    moved_ = false;
+    dragLayerShown_ = false;
+    previewOn_ = false;
+    seamOn_ = false;
+    seamCellValid_ = false;
+    mode_ = Mode::None;
+    if (onDragEnd) onDragEnd();
+    Redraw();
+}
+
 DesktopIconView* DesktopSurface::HitTest(POINT pt) const {
     if (!icons_) return nullptr;
     for (auto* e : *icons_) {

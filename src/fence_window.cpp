@@ -1378,6 +1378,23 @@ void FenceWindow::ClearDropHint() {
     Redraw();
 }
 
+// 放弃盒内这次拖动，图标回到原来的位置（交棒给系统级拖放之前调）。
+// 按下时留下的 press* 状态也要清：交棒之后 OLE 的循环还会把鼠标移动派发进来，
+// pressBody_/pressItem_ 还留着的话会被当成「又开始拖了」。
+void FenceWindow::AbortItemsDrag() {
+    if (!itemDragging_) return;
+    if (hwnd_ && GetCapture() == hwnd_) ReleaseCapture();
+    itemDragging_ = false;
+    dragged_ = nullptr;
+    dragItems_.clear();
+    pressBody_ = false;
+    pressItem_ = -1;
+    pressHeader_ = false;
+    pressTab_ = -1;
+    drop_ = DropHint{};
+    Redraw();
+}
+
 void FenceWindow::UpdateDropHint(POINT screenPt) {
     if (!hwnd_) return;
     RECT wr = rect();

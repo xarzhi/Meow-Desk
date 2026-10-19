@@ -105,6 +105,9 @@ public:
     // 由外部（main）在拖拽过程中每帧调用：pt 为屏幕坐标
     void UpdateDropHint(POINT screenPt);
     void ClearDropHint();
+    // 放弃盒内这次拖动（图标回原位置）。拖到别的程序窗口上、要交棒给系统级拖放
+    // 之前必须调：交棒之后鼠标松开那一下被 OLE 吃掉，我们收不到 WM_LBUTTONUP。
+    void AbortItemsDrag();
     DropHint dropHint() const { return drop_; }
     // 提示区域对应的屏幕矩形（用于算"插到第几个"）
     int itemCount() const;

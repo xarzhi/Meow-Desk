@@ -125,6 +125,16 @@ public:
     // 数学和盒子里的缝隙线一致：线落在两格之间的中线上。
     void SetDropSeam(bool on, int screenX, int top, int h);
 
+    // ---- 交棒给系统级拖放（拖到别的程序窗口上时）----
+    // 当前正在拖的那一批（外部要拿它们拼 CF_HDROP）
+    const std::vector<DesktopIconView*>& draggingItems() const { return dragSet_; }
+    // 是否已经真的进入拖动（超过 3px 阈值）
+    bool dragActive() const { return mode_ == Mode::Move && moved_; }
+    // 放弃这次拖动、图标回原位。
+    // 必须在 DoDragDrop **之前**调：交棒之后鼠标松开那一下会被 OLE 的拖放循环
+    // 吃掉，我们收不到 WM_LBUTTONUP，状态只能自己清。
+    void AbortDrag();
+
     // 拖到外部（盒子）时询问是否接收；返回 true 表示这批图标被拿走
     std::function<bool(const std::vector<DesktopIconView*>&, POINT screenPt)> onDrop;
     // 拖动中判断光标是否落在外部目标（盒子）上：是则图标跟手走，不再吸附格子
