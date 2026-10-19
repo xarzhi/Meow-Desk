@@ -1409,10 +1409,11 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                           SW_SHOWNORMAL);
             return 0;
         }
-        if (id == ID_ACRYLIC || id == ID_SHADOW || id == ID_ARROW || id == ID_SHOW_LABELS ||
+        if (id == ID_BG_SOLID || id == ID_BG_TRANS || id == ID_BG_ACRYLIC ||
+            id == ID_ACRYLIC || id == ID_SHADOW || id == ID_ARROW || id == ID_SHOW_LABELS ||
             id == ID_HOVER_EXPAND || id == ID_SORT_ANIM || id == ID_SYSICONS ||
             id == ID_TAB_HOVER || id == ID_SHOW_FENCE_TITLE || id == ID_AUTO_ORGANIZE ||
-            id == ID_AUTOSTART || id == ID_HIGHPRIORITY) {
+            id == ID_SNAP || id == ID_AUTOSTART || id == ID_HIGHPRIORITY) {
             Toggle(id);
             return 0;
         }
