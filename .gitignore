@@ -1,6 +1,7 @@
 # ---- 构建产物 ----
 build/
 out/
+dist/
 *.obj
 *.pdb
 *.ilk
@@ -11,6 +12,7 @@ out/
 
 # ---- 临时目录：测试脚本、截图、日志全部集中在这里 ----
 _tmp/
+_tmp_ico/
 tmp/
 *.log
 icons.txt
