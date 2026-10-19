@@ -444,15 +444,20 @@ static void ApplyIconLayout() {
     DumpIconPositions();   // 还原后要刷新调试快照，否则外部看到的是还原前的坐标
 }
 
-// 盒子里第 idx 个可见图标（skip 用来跳过正在被拖的那个）
+// 盒子里第 idx 个图标（当前分组）。
 // 「可见」= 属于盒子当前分组，和 FenceWindow::CollectVisible 的口径保持一致，
 // 否则 DropHint 里的下标会指到别的分组去。
-static DesktopIconView* FenceItemAt(int fi, int idx, DesktopIconView* skip) {
+//
+// **这里故意没有 skip 参数。** DropHint 的下标是在「含正在被拖的那个图标」的
+// 完整列表里数出来的（InsertIntoFenceMulti 里那套 shift 修正就是按这个约定写的），
+// 所以任何「跳过被拖图标」的额外过滤都会整体错位一格 —— 曾经因此出现过
+// 「拖到回收站松手，打开的却是回收站后面那个图标」。
+static DesktopIconView* FenceItemAt(int fi, int idx) {
     if (fi < 0 || idx < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return nullptr;
     const int grp = g_fences[fi]->activeGroup();
     int k = 0;
     for (auto* o : g_icons) {
-        if (!o || o->owner != fi || o->group != grp || o == skip) continue;
+        if (!o || o->owner != fi || o->group != grp) continue;
         if (k == idx) return o;
         ++k;
     }
@@ -1574,7 +1579,7 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
         if (!w) return;
         if (id >= kCmdMoveToGroup && id < kCmdMoveToGroup + 28) {
             const int g = id - kCmdMoveToGroup;
-            DesktopIconView* e = FenceItemAt(fi, item, nullptr);
+            DesktopIconView* e = FenceItemAt(fi, item);
             if (e && g >= 0 && g < w->groupCount() && g != e->group) {
                 // 从当前位置摘出来再追加到目标分组末尾：分组内的顺序就是
                 // g_icons 里的相对顺序，所以「追加」= 排到那一组的最后。
@@ -1679,7 +1684,7 @@ static void AddFenceWindow(int i) {
         // 我们自己的盒子菜单只在空白处 / 头部弹出：它管的是盒子本身
         // （新建盒子、排序、查看、分组、锁定、删除…），和文件的菜单是两件事。
         if (item >= 0) {
-            DesktopIconView* e = FenceItemAt(i, item, nullptr);
+            DesktopIconView* e = FenceItemAt(i, item);
             if (e && !e->path.empty()) {
                 HWND owner = (i < (int)g_fences.size() && g_fences[i]) ? g_fences[i]->hwnd() : nullptr;
                 ShowShellItemMenu(owner, e->path, sp);
@@ -1761,8 +1766,18 @@ static void AddFenceWindow(int i) {
         if (fi >= 0) {
             // 「拖到某个图标的正中间」只对单张有意义：目标是文件夹/回收站就
             // 移进去/删掉，是程序就用它打开；目标不认才当插入位置处理。
-            DesktopIconView* tgt =
-                (h.openWith() && !batch.empty()) ? FenceItemAt(fi, h.item, batch[0]) : nullptr;
+            //
+            // 目标必须按「光标正下方是哪个图标」直接取，**不能**拿 dropHint 的
+            // 下标去 FenceItemAt 反查：h.item 是 HitItem 在「含被拖图标」的完整
+            // 列表里的下标（InsertIntoFenceMulti 里那套 shift 修正就是按这个约定
+            // 算的），而 FenceItemAt 还带一个 skip 参数 —— 再跳一次就整体错位一格。
+            // 表现就是「拖到回收站松手，打开的却是回收站后面那个图标（微信）」。
+            DesktopIconView* tgt = nullptr;
+            if (h.openWith()) {
+                if (fi < (int)g_fences.size() && g_fences[fi])
+                    tgt = g_fences[fi]->ItemAtScreen(pt);
+                if (!tgt) tgt = FenceItemAt(fi, h.item);   // 兜底：光标压在两格之间
+            }
             DWORD eff = DROPEFFECT_NONE;
             if (batch.size() == 1) eff = DropIconOntoIcon(batch[0], tgt);
             if (eff != DROPEFFECT_NONE) {
@@ -2104,7 +2119,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         // 中间区域 + 单个文件 → 交给目标图标（文件夹移进去 / 回收站删 / 程序打开）
         if (h.openWith() && list.size() == 1) {
-            const DWORD eff = DropIconOntoIcon(list[0], FenceItemAt(fi, h.item, nullptr));
+            const DWORD eff = DropIconOntoIcon(list[0], FenceItemAt(fi, h.item));
             if (eff != DROPEFFECT_NONE) {
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
                 SaveIconLayout();
