@@ -289,28 +289,27 @@ static void PlaceOnDesktop(DesktopIconView* e, POINT dropPt,
 }
 
 // 把一批图标从盒子里倒回桌面（删除盒子 / 删除分组时用）。
-// 落点从盒子原来所在的位置开始铺开，撞上已有图标会自动挪到最近的空格子；
-// 整批只提交一次给资源管理器，比一个个走 PlaceOnDesktop 快得多。
+// 落点规则：**从桌面左上角的第一格开始，按行找第一个空位**（一行填满就往下换一行），
+// 图标按原来的顺序一个挨一个排好；整批只向资源管理器提交一次位置。
 static void SendIconsToDesktop(int fi, const std::vector<DesktopIconView*>& list) {
     if (list.empty()) return;
-    RECT r{120, 120, 460, 600};
-    if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) r = g_fences[fi]->rect();
+    (void)fi;   // 落点不再参考盒子位置，统一从桌面左上角开始
 
-    int i = 0;
     for (auto* e : list) {
         if (!e) continue;
-        const POINT pt{r.left + g_cellW / 2 + (i % 5) * g_cellW,
-                       r.top + 40 + (i / 5) * g_cellH};
-        e->pos = g_surface.CellForCursor(pt, e->bmp.valid() ? &e->bmp : nullptr);
-        e->dragPos = e->pos;
+        // 每张都重新扫一遍：上一张已经把 owner 改成 -1、pos 落到格子上，
+        // 所以下一张自然会拿到它后面的第一个空位。
+        const POINT cell = g_surface.FirstFreeCell({});
+        e->pos = cell;
+        e->dragPos = cell;
         e->owner = -1;
         e->group = 0;
         e->selected = false;
         FitIconToOwner(e);   // 回桌面 → 位图换回 48px
-        ++i;
     }
     CommitPositions(list);
     SaveIconLayout();
+    g_surface.Redraw();
 }
 
 // 把当前「归属 + 盒内顺序 + 桌面坐标」整份写盘
@@ -551,6 +550,53 @@ static void SetDesktopIconsShown(bool shown) {
         RestoreZOrder();
     }
     g_tray.SetDesktopIconsVisible(shown);
+}
+
+// ---------------------------------------------------------------------------
+// 开机自启 / 进程优先级
+//
+// 开机自启写 HKCU 的 Run 项：不需要管理员权限，也不用往「启动」文件夹塞 .lnk。
+// 状态一律以注册表为准 —— 用户可能在任务管理器 →「启动」里把它关掉，
+// 界面要显示真实状态，而不是我们自以为的那个开关值。
+// ---------------------------------------------------------------------------
+static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* kRunValue = L"meow-desk";
+
+static bool AutoStartEnabled() {
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
+    wchar_t buf[MAX_PATH * 4]{};
+    DWORD sz = sizeof(buf), type = 0;
+    const LONG r =
+        RegQueryValueExW(k, kRunValue, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz);
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS && type == REG_SZ && sz > 2;
+}
+
+static void SetAutoStart(bool on) {
+    HKEY k = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k,
+                        nullptr) != ERROR_SUCCESS)
+        return;
+    if (on) {
+        wchar_t exe[MAX_PATH * 4]{};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH * 4);
+        // 路径带引号：Program Files 里的空格不括起来会被当成参数
+        const std::wstring v = L"\"" + std::wstring(exe) + L"\"";
+        RegSetValueExW(k, kRunValue, 0, REG_SZ, reinterpret_cast<const BYTE*>(v.c_str()),
+                       (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(k, kRunValue);
+    }
+    RegCloseKey(k);
+    LogStep(std::string("autostart ") + (on ? "on" : "off"));
+}
+
+// 高优先级：桌面层重绘要跟手，NORMAL 下偶尔会被别的程序抢 CPU。
+// 不用 REALTIME / TIME_CRITICAL —— 那会把输入线程也压住，得不偿失。
+static void ApplyHighPriority(bool on) {
+    SetPriorityClass(GetCurrentProcess(), on ? HIGH_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
+    LogStep(std::string("priority ") + (on ? "high" : "normal"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,6 +1488,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 1. 配置
     g_config.Load();
     ConfigEnsureDefaults();
+    // 上次开了「高优先级运行」就照办 —— 进程优先级不落盘在系统里，
+    // 每次启动都得自己按配置重新设一遍。
+    ApplyHighPriority(g_config.highPriority != 0);
     g_lastArrow = g_config.shortcutArrow;
     g_lastAcrylic = g_config.fences.empty() ? 0 : g_config.fences[0].acrylic;
 
@@ -1568,6 +1617,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_settings.onReloadIcons = [] { ReloadDesktopIcons(); };
     g_settings.getSystemIconsShown = [] { return !g_systemIconsHidden; };
     g_settings.setSystemIconsShown = [](bool shown) { SetDesktopIconsShown(shown); };
+    g_settings.getAutoStart = [] { return AutoStartEnabled(); };
+    g_settings.setAutoStart = [](bool on) { SetAutoStart(on); };
+    g_settings.getHighPriority = [] { return g_config.highPriority != 0; };
+    g_settings.setHighPriority = [](bool on) {
+        g_config.highPriority = on ? 1 : 0;
+        ApplyHighPriority(on);
+    };
     g_settings.onOrganize = [] { OrganizeDesktopNow(); };
 
     g_search.SetIcons(&g_icons);

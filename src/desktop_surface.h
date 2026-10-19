@@ -102,6 +102,11 @@ public:
     // 光标在 (x,y) 松手时图标会落到哪个格子（用于落点预览和盒子 → 桌面的落位）
     POINT CellForCursor(POINT cursor, const IconBitmap* icon) const;
 
+    // 桌面左上角起、按行（先从左到右扫完一行，再往下）的第一个空闲格子。
+    // 删除盒子 / 删除分组把图标倒回桌面时用：图标会从左上角开始一个挨一个填满，
+    // 而不是各自「就近抢一个」格子撒得满屏都是。
+    POINT FirstFreeCell(const std::vector<DesktopIconView*>& exclude) const;
+
     // 桌面内拖放的落位：目标格空就直接用；被别的图标占了就和它交换
     // （资源管理器也是这个行为）。否则桌面排满时环形搜索会把图标甩到很远，
     // 观感就是「松手后图标跑掉了」。被挪走的图标通过 swapped 返回，调用方要写回位置。
@@ -134,6 +139,10 @@ public:
     std::function<void()> onTick;
 
 private:
+    // 这个格子（左上角 x,y）上有没有桌面图标挡着。exclude 里的不算。
+    // SnapToFreeCellAt 和 FirstFreeCell 共用同一套判定，免得两处口径走偏。
+    bool CellIsFree(int x, int y, int cw, int ch,
+                    const std::vector<DesktopIconView*>& exclude) const;
     enum class Mode { None, Move, Marquee };
 
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);

@@ -40,6 +40,13 @@ public:
     std::function<void()> onReloadIcons;
     std::function<bool()> getSystemIconsShown;
     std::function<void(bool)> setSystemIconsShown;
+    // 开机自启（写 HKCU 的 Run 项）/ 以高优先级运行（进程优先级类）。
+    // 状态一律问外部要：用户可能在任务管理器「启动」里关掉自启，
+    // 界面得显示真实值，不能拿我们自己以为的开关值糊弄。
+    std::function<bool()> getAutoStart;
+    std::function<void(bool)> setAutoStart;
+    std::function<bool()> getHighPriority;
+    std::function<void(bool)> setHighPriority;
     // 整理规则页：「立即整理桌面…」
     std::function<void()> onOrganize;
 
@@ -92,6 +99,9 @@ private:
     RECT rcArrow_{};
     RECT rcReload_{};
     RECT rcSysIcons_{};
+    RECT rcAutoStart_{};
+    RECT rcHighPriority_{};
+    RECT rcStartDivider_{};   // 「桌面」和「启动」两块之间的分隔线
 
     // ---- 外观 ----
     RECT swatches_[12]{};

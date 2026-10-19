@@ -131,6 +131,7 @@ bool ConfigFromDb(AppConfig& c) {
             else if (k == L"showFenceTitle") c.showFenceTitle = n;
             else if (k == L"autoOrganize") c.autoOrganize = n;
             else if (k == L"switchTabOnHover") c.switchTabOnHover = n;
+            else if (k == L"highPriority") c.highPriority = n;
         }
     }
     {
@@ -317,6 +318,7 @@ void AppConfig::Save() const {
         put(L"showFenceTitle", showFenceTitle);
         put(L"autoOrganize", autoOrganize);
         put(L"switchTabOnHover", switchTabOnHover);
+        put(L"highPriority", highPriority);
 
         storage::Stmt fs(
             "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title,"

@@ -73,6 +73,8 @@ struct AppConfig {
     int autoOrganize = 0;
     // 分组标签的切换方式：1 = 鼠标移入标签就切，0 = 点击才切
     int switchTabOnHover = 1;
+    // 以高优先级运行：桌面层要跟手，NORMAL 优先级下偶尔会被别的程序抢 CPU 拖慢重绘
+    int highPriority = 0;
 
     std::vector<FenceConfig> fences;
     std::vector<OrganizeRule> rules;

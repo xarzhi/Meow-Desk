@@ -54,6 +54,8 @@ enum : int {
     ID_RELOAD = 40,
     ID_SYSICONS = 41,
     ID_OPENFOLDER = 42,
+    ID_AUTOSTART = 43,
+    ID_HIGHPRIORITY = 44,
     ID_NAV0 = 60,     // 60..64 = 导航项
     // 规则行的 EDIT 子控件：5000 + 行号*2（名字）/ +1（扩展名）
     ID_RULE_EDIT = 5000,
@@ -177,6 +179,14 @@ void SettingsWindow::Layout() {
         const int c2 = 300;
         rcReload_ = RECT{kContentX + kCardW - 148, c2 + 42, kContentX + kCardW - 24, c2 + 74};
         rcSysIcons_ = RECT{kContentX + kCardW - 60, c2 + 104, kContentX + kCardW - 24, c2 + 126};
+
+        // 第二张卡片下半截是「启动」那两块：分隔线之后两行。
+        // 两行行距沿用上面的 62，视觉上和一整张卡片里的其它行对齐。
+        rcStartDivider_ = RECT{kRowLeft, c2 + 150, kContentX + kCardW - 24, c2 + 151};
+        rcAutoStart_ =
+            RECT{kContentX + kCardW - 60, c2 + 166, kContentX + kCardW - 24, c2 + 188};
+        rcHighPriority_ =
+            RECT{kContentX + kCardW - 60, c2 + 228, kContentX + kCardW - 24, c2 + 250};
     }
 
     // ---- 外观页 ----
@@ -242,6 +252,8 @@ int SettingsWindow::HitTest(POINT pt) const {
         if (in(rcArrow_, 150, 18)) return ID_ARROW;
         if (in(rcReload_, 0, 4)) return ID_RELOAD;
         if (in(rcSysIcons_, 150, 18)) return ID_SYSICONS;
+        if (in(rcAutoStart_, 150, 18)) return ID_AUTOSTART;
+        if (in(rcHighPriority_, 150, 18)) return ID_HIGHPRIORITY;
         break;
     case Page::Appearance:
         for (int i = 0; i < 12; ++i) {
@@ -521,7 +533,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         drawToggle(rcArrow_, g_config.shortcutArrow != 0);
 
         const int c2 = 300;
-        drawCard(c2, 166);
+        drawCard(c2, 272);
         g.DrawString(L"\u684c\u9762", -1, &fSection,
                      RectF((float)kContentX + 20, (float)c2 + 16.0f, 240.0f, 22.0f), &sf,
                      &brText);
@@ -559,6 +571,36 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         {
             const bool shown = getSystemIconsShown ? getSystemIconsShown() : false;
             drawToggle(rcSysIcons_, shown);
+        }
+
+        // ---- 分隔线：上面是「桌面」，下面是「启动」 ----
+        {
+            Pen line(C(t.cardBorder), 1.0f);
+            g.DrawLine(&line, (float)rcStartDivider_.left, (float)rcStartDivider_.top,
+                       (float)rcStartDivider_.right, (float)rcStartDivider_.top);
+        }
+
+        g.DrawString(L"\u5f00\u673a\u81ea\u542f", -1, &fBody,
+                     RectF((float)kRowLeft, (float)(rcAutoStart_.top - 10), 320.0f, 26.0f),
+                     &sf, &brText);
+        g.DrawString(L"\u767b\u5f55 Windows \u540e\u81ea\u52a8\u542f\u52a8", -1, &fSub,
+                     RectF((float)kRowLeft, (float)(rcAutoStart_.top + 12), 340.0f, 16.0f),
+                     &sf, &brSub);
+        {
+            const bool on = getAutoStart ? getAutoStart() : false;
+            drawToggle(rcAutoStart_, on);
+        }
+
+        g.DrawString(L"\u9ad8\u4f18\u5148\u7ea7\u8fd0\u884c", -1, &fBody,
+                     RectF((float)kRowLeft, (float)(rcHighPriority_.top - 10), 320.0f, 26.0f),
+                     &sf, &brText);
+        g.DrawString(L"\u684c\u9762\u91cd\u7ed8\u66f4\u8ddf\u624b\uff0c\u6ee1\u8f7d\u65f6\u4e0d\u6613\u6389\u5e27",
+                     -1, &fSub,
+                     RectF((float)kRowLeft, (float)(rcHighPriority_.top + 12), 340.0f, 16.0f),
+                     &sf, &brSub);
+        {
+            const bool on = getHighPriority ? getHighPriority() : false;
+            drawToggle(rcHighPriority_, on);
         }
         break;
     }
@@ -985,6 +1027,18 @@ void SettingsWindow::Toggle(int id) {
             setSystemIconsShown(!shown);
         }
         break;
+    case ID_AUTOSTART:
+        if (setAutoStart) {
+            const bool on = getAutoStart ? getAutoStart() : false;
+            setAutoStart(!on);
+        }
+        break;
+    case ID_HIGHPRIORITY:
+        if (setHighPriority) {
+            const bool on = getHighPriority ? getHighPriority() : false;
+            setHighPriority(!on);
+        }
+        break;
     default:
         return;
     }
@@ -1195,7 +1249,8 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (id == ID_ACRYLIC || id == ID_SHADOW || id == ID_ARROW || id == ID_SHOW_LABELS ||
             id == ID_HOVER_EXPAND || id == ID_SORT_ANIM || id == ID_SYSICONS ||
-            id == ID_TAB_HOVER || id == ID_SHOW_FENCE_TITLE || id == ID_AUTO_ORGANIZE) {
+            id == ID_TAB_HOVER || id == ID_SHOW_FENCE_TITLE || id == ID_AUTO_ORGANIZE ||
+            id == ID_AUTOSTART || id == ID_HIGHPRIORITY) {
             Toggle(id);
             return 0;
         }

@@ -380,6 +380,36 @@ POINT DesktopSurface::AutoGridAnchor(POINT nearPt) const {
     return best;
 }
 
+bool DesktopSurface::CellIsFree(int x, int y, int cw, int ch,
+                                const std::vector<DesktopIconView*>& exclude) const {
+    RECT a{x, y, x + cw, y + ch};
+    if (!icons_) return true;
+    for (auto* o : *icons_) {
+        if (!o || !o->OnDesktop()) continue;
+        if (std::find(exclude.begin(), exclude.end(), o) != exclude.end()) continue;
+        RECT b{o->pos.x, o->pos.y, o->pos.x + cw, o->pos.y + ch};
+        if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom)
+            return false;
+    }
+    return true;
+}
+
+// 从桌面左上角开始按行扫（先从左到右扫完一行，再下移一行），
+// 找出第一个空闲格子。删除盒子 / 删除分组时图标从这里开始一个挨一个排。
+POINT DesktopSurface::FirstFreeCell(const std::vector<DesktopIconView*>& exclude) const {
+    const int cw = cellW_ > 0 ? cellW_ : 75;
+    const int ch = cellH_ > 0 ? cellH_ : 98;
+    const int maxX = origin_.x + width_ - cw;
+    const int maxY = origin_.y + height_ - ch;
+    for (int y = origin_.y; y <= maxY; y += ch) {
+        for (int x = origin_.x; x <= maxX; x += cw) {
+            if (CellIsFree(x, y, cw, ch, exclude)) return POINT{x, y};
+        }
+    }
+    // 整屏都排满了：退回左上角（宁可叠一点，也别把图标藏到屏幕外面去）
+    return POINT{origin_.x, origin_.y};
+}
+
 POINT DesktopSurface::SnapToFreeCell(POINT want, const std::vector<DesktopIconView*>& exclude) const {
     return SnapToFreeCellAt(want, AutoGridAnchor(want), exclude);
 }
@@ -406,18 +436,7 @@ POINT DesktopSurface::SnapToFreeCellAt(POINT want, POINT anchor,
     const int baseX = clampX(anchor.x + (int)std::lround((double)(want.x - anchor.x) / cw) * cw);
     const int baseY = clampY(anchor.y + (int)std::lround((double)(want.y - anchor.y) / ch) * ch);
 
-    auto freeAt = [&](int x, int y) {
-        RECT a{x, y, x + cw, y + ch};
-        if (!icons_) return true;
-        for (auto* o : *icons_) {
-            if (!o || !o->OnDesktop()) continue;
-            if (std::find(exclude.begin(), exclude.end(), o) != exclude.end()) continue;
-            RECT b{o->pos.x, o->pos.y, o->pos.x + cw, o->pos.y + ch};
-            if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom)
-                return false;
-        }
-        return true;
-    };
+    auto freeAt = [&](int x, int y) { return CellIsFree(x, y, cw, ch, exclude); };
 
     if (freeAt(baseX, baseY)) return POINT{baseX, baseY};
 
