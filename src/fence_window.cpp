@@ -116,6 +116,10 @@ void CollectSnapLines(const std::vector<RECT>& others, const RECT& wa, const REC
 }
 
 const UINT_PTR kAnimTimer = 2;
+// 搜索「定位」的闪烁节奏：170ms 翻一次，4 相 = 亮→灭→亮→灭 = 正好两下
+const UINT_PTR kFlashTimer = 3;
+const int kFlashInterval = 170;
+const int kFlashPhases = 4;
 // 「鼠标移入切分组」现在是一移上去就切（用户嫌 200ms 延迟明显），
 // 所以原来那个延迟定时器整个删掉了 —— 别再加回来。
 
@@ -1322,6 +1326,81 @@ void FenceWindow::ScrollBy(int deltaPx) {
     if (scrollY_ != old) Redraw();
 }
 
+// 把第 index 个图标滚进可见范围。
+// 视口高度按「展开高度」算而不是 curH_：定位往往紧跟在一次展开动画之后，
+// 那时的 curH_ 可能还是 4px，用它算出来永远是「一行都放不下」。
+void FenceWindow::ScrollItemIntoView(int index) {
+    if (index < 0) return;
+    const int ch = cellH();
+    if (ch <= 0) return;
+    const int cols = std::max(1, CellCols());
+    const int top = HeadH() + kPad;
+    int viewRows = (height_ - kPad - top) / ch;
+    if (viewRows < 1) viewRows = 1;
+
+    const int rowTop = (index / cols) * ch;
+    const int rowBottom = rowTop + ch;
+    int want = scrollY_;
+    if (rowTop < scrollY_) {
+        want = rowTop;                                          // 在上面 → 顶到最上
+    } else if (rowBottom > scrollY_ + viewRows * ch) {
+        want = rowBottom - viewRows * ch;                        // 在下面 → 顶到最下
+    }
+    want = (want / ch) * ch;   // 整行对齐，和滚轮同一套规则
+    const int old = scrollY_;
+    scrollY_ = want;
+    ClampScroll();
+    if (scrollY_ != old) Redraw();
+}
+
+void FenceWindow::LocateItem(DesktopIconView* e) {
+    if (!e) return;
+    // 它在别的分组：先切过去，否则 CollectVisible 里根本找不到它
+    if (e->group != activeGroup()) SetActiveGroup(e->group);
+    locatePending_ = e;
+    if (collapsed_ || expandMode() == 0) SetCollapsed(false);
+    // 还在展开动画里：滚动量得等高度落定再算，交给 WM_TIMER
+    if (curH_ + 1 < height_) return;
+    DoLocateNow(e);
+}
+
+void FenceWindow::DoLocateNow(DesktopIconView* e) {
+    locatePending_ = nullptr;
+    if (!e || !all_ || e->owner != index_) return;
+    std::vector<DesktopIconView*> mine;
+    CollectVisible(mine);
+    int idx = -1;
+    for (size_t i = 0; i < mine.size(); ++i) {
+        if (mine[i] == e) {
+            idx = (int)i;
+            break;
+        }
+    }
+    if (idx < 0) return;   // 不在当前分组 / 不是这个盒子的，没什么可定位的
+    ScrollItemIntoView(idx);
+    StartFlash(e);
+}
+
+void FenceWindow::StartFlash(DesktopIconView* e) {
+    flash_ = e;
+    flashStep_ = 0;
+    if (hwnd_) SetTimer(hwnd_, kFlashTimer, kFlashInterval, nullptr);
+    Redraw();
+}
+
+void FenceWindow::TickFlash() {
+    if (!flash_) {
+        if (hwnd_) KillTimer(hwnd_, kFlashTimer);
+        return;
+    }
+    ++flashStep_;
+    if (flashStep_ >= kFlashPhases) {
+        flash_ = nullptr;   // 亮相 0/2，灭相 1/3 —— 数到 4 正好两下
+        if (hwnd_) KillTimer(hwnd_, kFlashTimer);
+    }
+    Redraw();
+}
+
 RECT FenceWindow::rect() const {
     RECT r{};
     if (hwnd_) GetWindowRect(hwnd_, &r);
@@ -2020,6 +2099,11 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER: {
+        // 搜索「定位」的闪烁（和桌面层同一套节奏）
+        if (wp == kFlashTimer) {
+            TickFlash();
+            return 0;
+        }
         if (wp != kAnimTimer) break;
         bool busy = false;
         bool waiting = false;   // 后台补抓还没回来：保住定时器，但这一帧不重画
@@ -2032,6 +2116,12 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             curH_ += step;
             if ((diff > 0 && curH_ > targetH_) || (diff < 0 && curH_ < targetH_))
                 curH_ = targetH_;
+            busy = true;
+        }
+
+        // 搜索「定位」：收起的盒子要先摊开才能算滚动量，所以等高度落定再做
+        if (locatePending_ && curH_ == targetH_) {
+            DoLocateNow(locatePending_);
             busy = true;
         }
 
@@ -2607,6 +2697,25 @@ void FenceWindow::Paint() {
             }
         }
 
+        // ---- 搜索「定位」的闪烁：只画亮相（0/2），灭相什么都不画 ----
+        if (!collapsed_ && flash_ && (flashStep_ & 1) == 0) {
+            std::vector<DesktopIconView*> mineFlash;
+            CollectVisible(mineFlash);
+            for (size_t i = 0; i < mineFlash.size(); ++i) {
+                if (mineFlash[i] != flash_) continue;
+                int ox = 0, oy = 0;
+                if (!ItemOrigin((int)i, ox, oy)) break;   // 滚出视野了就别画
+                RECT fr = ItemHighlightRect((int)i);
+                if (fr.right <= fr.left) break;
+                const Rect rc(fr.left + 3, fr.top + 3, fr.right - fr.left - 6, cellH() - 6);
+                SolidBrush ff{Color(84, 0, 120, 215)};
+                gfx.FillRectangle(&ff, rc);
+                Pen fp{Color(255, 0, 120, 215), 2.0f};
+                gfx.DrawRectangle(&fp, rc);
+                break;
+            }
+        }
+
         // ---- 框选矩形（和桌面同一个观感：淡蓝填充 + 1px 实线）----
         if (marquee_) {
             const int l = std::min(marqueeA_.x, marqueeB_.x);
@@ -3126,6 +3235,9 @@ void FenceWindow::Destroy() {
     if (hwnd_) {
         FileDrop::Detach(hwnd_);   // OLE 那边还挂着这个 HWND，先摘掉再销毁
         KillTimer(hwnd_, kAnimTimer);
+        KillTimer(hwnd_, kFlashTimer);
+        flash_ = nullptr;
+        locatePending_ = nullptr;
         SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;

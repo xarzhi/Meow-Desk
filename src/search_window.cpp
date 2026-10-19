@@ -35,6 +35,9 @@ const int kFooterH = 30;
 
 const int kEditId = 1001;
 
+// 每行右侧「定位」按钮的边长（正方形）
+const int kLocateSize = 28;
+
 // 「点到面板外面就关掉」的巡检定时器
 const UINT_PTR kWatchTimer = 31;
 
@@ -240,6 +243,19 @@ RECT SearchWindow::RowRect(int i) const {
     return r;
 }
 
+// 每行右端那个「定位」按钮。正方形、垂直居中、离右边缘 8px ——
+// 和行内文字之间再留 6px，长名字被省略号截断时也不会顶到按钮上。
+RECT SearchWindow::LocateRect(int i) const {
+    const RECT r = RowRect(i);
+    const int s = kLocateSize;
+    RECT o{};
+    o.right = r.right - 8;
+    o.left = o.right - s;
+    o.top = r.top + ((r.bottom - r.top) - s) / 2;
+    o.bottom = o.top + s;
+    return o;
+}
+
 void SearchWindow::Layout() {
     if (!hwnd_) return;
     RECT cr{};
@@ -336,6 +352,16 @@ void SearchWindow::Activate() {
     if (e && onOpen) onOpen(e);
 }
 
+// 「定位」：先把面板关掉（用户要看的是桌面），再让外面把那个图标高亮出来。
+// 面板是 TOPMOST 的，不关掉会一直盖在被高亮的图标上。
+void SearchWindow::Locate(int i) {
+    if (i < 0 || i >= (int)hits_.size()) return;
+    DesktopIconView* e = hits_[i];
+    Hide();
+    hotLoc_ = -1;
+    if (e && onLocate) onLocate(e);
+}
+
 void SearchWindow::ShowPalette() {
     if (!hwnd_) return;
     dark_ = !AppsUseLightTheme();
@@ -343,6 +369,8 @@ void SearchWindow::ShowPalette() {
     Layout();
     Filter();
     sel_ = 0;
+    hot_ = -1;
+    hotLoc_ = -1;
     if (edit_) SetWindowTextW(edit_, L"");
     Filter();
 
@@ -472,8 +500,34 @@ void SearchWindow::Repaint() {
         }
         g.DrawString(e->name.c_str(), -1, &fItem,
                      RectF((float)r.left + 58.0f, (float)r.top,
-                           (float)(r.right - r.left) - 70.0f, (float)(r.bottom - r.top)),
+                           (float)(r.right - r.left) - 70.0f - (float)(kLocateSize + 6),
+                           (float)(r.bottom - r.top)),
                      &sf, &brText);
+
+        // ---- 行尾「定位」按钮：十字准星。点一下关面板并高亮图标真实位置 ----
+        {
+            const RECT lr = LocateRect(i);
+            const bool lhot = (i == hotLoc_);
+            if (lhot) {
+                GraphicsPath lp;
+                AddRound(lp,
+                         RectF((float)lr.left, (float)lr.top, (float)(lr.right - lr.left),
+                               (float)(lr.bottom - lr.top)),
+                         6.0f);
+                SolidBrush lb(CA(t.accent, dark_ ? 70 : 36));
+                g.FillPath(&lb, &lp);
+            }
+            const float cx = ((float)lr.left + (float)lr.right) * 0.5f;
+            const float cy = ((float)lr.top + (float)lr.bottom) * 0.5f;
+            Pen cp(lhot ? C(t.accent) : C(t.sub), 1.5f);
+            g.DrawEllipse(&cp, cx - 5.5f, cy - 5.5f, 11.0f, 11.0f);
+            g.DrawLine(&cp, cx - 9.0f, cy, cx - 6.5f, cy);
+            g.DrawLine(&cp, cx + 6.5f, cy, cx + 9.0f, cy);
+            g.DrawLine(&cp, cx, cy - 9.0f, cx, cy - 6.5f);
+            g.DrawLine(&cp, cx, cy + 6.5f, cx, cy + 9.0f);
+            SolidBrush dot(lhot ? C(t.accent) : C(t.sub));
+            g.FillEllipse(&dot, cx - 1.5f, cy - 1.5f, 3.0f, 3.0f);
+        }
     }
 
     if (hits_.empty()) {
@@ -491,7 +545,8 @@ void SearchWindow::Repaint() {
         StringFormat lf;
         lf.SetLineAlignment(StringAlignmentCenter);
         SolidBrush hint(C(t.sub));
-        g.DrawString(L"\u2191\u2193 \u9009\u62e9   Enter \u6253\u5f00   Esc \u5173\u95ed", -1,
+        g.DrawString(L"\u2191\u2193 \u9009\u62e9   Enter \u6253\u5f00   \u51c6\u661f "
+                     L"\u5b9a\u4f4d   Esc \u5173\u95ed", -1,
                      &fSub, RectF((float)kPad + 4.0f, (float)h - (float)kFooterH,
                                   (float)w - kPad * 2, (float)kFooterH),
                      &lf, &hint);
@@ -538,20 +593,34 @@ LRESULT SearchWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         int hot = -1;
+        int hotLoc = -1;
         for (int i = 0; i < RowsVisible(); ++i) {
             RECT r = RowRect(i);
             if (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom) {
                 hot = i;
+                RECT lr = LocateRect(i);
+                if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom)
+                    hotLoc = i;
                 break;
             }
         }
-        if (hot != hot_) { hot_ = hot; Repaint(); }
+        if (hot != hot_ || hotLoc != hotLoc_) {
+            hot_ = hot;
+            hotLoc_ = hotLoc;
+            Repaint();
+        }
         return 0;
     }
 
     case WM_LBUTTONDOWN: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         for (int i = 0; i < RowsVisible(); ++i) {
+            // 先判「定位」按钮：它在行内，不先拦下来就会直接被当成「打开」
+            RECT lr = LocateRect(i);
+            if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom) {
+                Locate(i);
+                return 0;
+            }
             RECT r = RowRect(i);
             if (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom) {
                 sel_ = i;

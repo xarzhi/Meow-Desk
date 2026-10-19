@@ -202,6 +202,13 @@ public:
     // 拖放落点判定用：松手时要知道「放到哪个图标上了」。
     DesktopIconView* ItemAtScreen(POINT screenPt) const;
 
+    // 搜索窗口的「定位」：把光标带到某个图标上 ——
+    //   1) 它在别的分组 → 先切过去
+    //   2) 盒子是收起的 → 先展开（等展开动画结束再算滚动量，否则按 4px 高度算出来全是 0）
+    //   3) 滚到它那一行（整行对齐，和滚轮同一套规则）
+    //   4) 背景闪两下
+    void LocateItem(DesktopIconView* e);
+
     // 调试：最近一次拖动夹取的实况（障碍数量 / 期望位置 / 实际位置）。
     // 不参与任何逻辑，只往日志里写 —— 盒子互相避让出问题时，这一行能直接区分
     // 「一个障碍都没拿到」和「拿到了但没挡住」。
@@ -255,6 +262,17 @@ private:
     int MaxScroll() const;
     void ClampScroll();
     void ScrollBy(int deltaPx);
+    // 把第 index 个图标滚到可见范围内（按展开高度算视口，整行对齐）
+    void ScrollItemIntoView(int index);
+
+    // ---- 搜索「定位」的闪烁提示 ----
+    // 收起状态下要先展开再算滚动量，所以定位可能得「延后」到展开动画结束。
+    DesktopIconView* locatePending_ = nullptr;   // 等展开动画结束再定位
+    DesktopIconView* flash_ = nullptr;           // 正在闪的图标（空 = 没在闪）
+    int flashStep_ = 0;                           // 已翻过的相位数，偶数=亮
+    void DoLocateNow(DesktopIconView* e);
+    void StartFlash(DesktopIconView* e);
+    void TickFlash();
     int HitItem(POINT clientPt) const;
     // 当前宽度下能放几列（拖拽改宽度后要跟着变）。列表/详情恒为 1 列。
     int CellCols() const;

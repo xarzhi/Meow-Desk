@@ -121,6 +121,10 @@ public:
     // 否则输入框会压到图标上、或者离名字差半行。
     bool IconLabelScreenRect(const DesktopIconView* e, RECT& out) const;
 
+    // 搜索窗口的「定位」：让这个桌面图标闪两下（背景高亮），提醒用户它在哪。
+    // 图标在盒子里时不要用它 —— 那是 FenceWindow::LocateItem 的事。
+    void FlashIcon(DesktopIconView* e);
+
     // 桌面左上角起、按列（先从上到下扫完一列，再往右）的第一个空闲格子。
     // 删除盒子 / 删除分组把图标倒回桌面时用：图标会从左上角开始一个挨一个往下排，
     // 一列排满再换右边一列，而不是各自「就近抢一个」格子撒得满屏都是。
@@ -235,6 +239,10 @@ private:
 
     DesktopIconView* hover_ = nullptr;   // 当前悬停的桌面图标
     bool mouseTracking_ = false;          // 已经注册了 TME_LEAVE
+
+    // 搜索「定位」的闪烁（和盒子那边同一套节奏：170ms 一相，共 4 相 = 两下）
+    DesktopIconView* flash_ = nullptr;
+    int flashStep_ = 0;
 
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;

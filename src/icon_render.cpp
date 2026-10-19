@@ -108,21 +108,60 @@ std::wstring WrapLabel(HDC dc, const std::wstring& text, int maxW, int maxLines)
         if (ch == L" " && lines.back().empty()) continue;
         std::wstring trial = lines.back() + ch;
         if (MeasureCx(dc, trial) <= maxW) { lines.back() = std::move(trial); continue; }
-        // 单个 token 就比整格还宽（例如 "92015e61f37b71b8a1583477627.ttf" 这种长文件名）。
-        // 以前这里直接 break 会让 lines.back() 保持空串，整个标签 DIB 建不出来 →
-        // 「有的图标有名字、有的没名字」。现在硬截断 + 省略号，至少能看到开头几个字。
-        if (lines.back().empty()) {
-            std::wstring t = ch;
-            while (!t.empty() && MeasureCx(dc, t + L"...") > maxW) t.pop_back();
-            if (t.empty()) {
-                t = ch.substr(0, 1);   // 窄到连一个字符都放不下，也要画出来
-                lines.back() = std::move(t);
-            } else {
-                lines.back() = std::move(t) + L"...";
+
+        // 单个词块就比整格还宽：ASCII 长名（"warehouse-more" / "Archives_Tool" /
+        // "92015e61f37b71b8a1583477627.ttf"）整串是一个 chunk，中文名逐字断、带空格的按词断，
+        // 所以只有它们会走到这里。
+        // 以前是「硬截断 + 省略号 + break」——maxLines 再大也只有一行，
+        // 表现就是「文件快捷方式能折两行、文件夹（英文名）永远折不动」。
+        // 现在按字符硬切：能填几行填几行，真的超出 maxLines 才加省略号。
+        if (MeasureCx(dc, ch) > maxW) {
+            std::wstring rest = ch;
+            bool over = false;
+            while (!rest.empty()) {
+                std::wstring fit;
+                size_t k = 0;
+                while (k < rest.size()) {
+                    std::wstring cand = lines.back() + fit + rest[k];
+                    if (MeasureCx(dc, cand) > maxW) break;
+                    fit += rest[k];
+                    ++k;
+                }
+                if (fit.empty()) {
+                    // 这一行连一个字都塞不进去了
+                    if (lines.back().empty()) {
+                        // 整行宽度不足一个字：硬塞一个，否则死循环
+                        lines.back() += rest[0];
+                        rest.erase(0, 1);
+                    }
+                    if (rest.empty()) break;
+                    if ((int)lines.size() >= maxLines) { over = true; break; }
+                    lines.emplace_back();
+                    continue;
+                }
+                // 硬切的位置可能正好落在单词中间（"meow-des|k"）。
+                // 往回收一点，优先断在 - _ . 之后或小写转大写处，但至少用掉半行宽。
+                if (k > 1 && k < rest.size()) {
+                    for (size_t p = k; p >= 2; --p) {
+                        const wchar_t prev = rest[p - 1], next = rest[p];
+                        const bool brk = prev == L'-' || prev == L'_' || prev == L'.' ||
+                                         (iswlower((wint_t)prev) && iswupper((wint_t)next));
+                        if (!brk) continue;
+                        if (MeasureCx(dc, lines.back() + rest.substr(0, p)) * 2 >= maxW) k = p;
+                        break;
+                    }
+                }
+                lines.back() += rest.substr(0, k);
+                if (k > 0) rest.erase(0, k);
+                if (rest.empty()) break;
+                if ((int)lines.size() >= maxLines) { over = true; break; }
+                lines.emplace_back();
             }
-            truncated = false;   // 已经自带省略号，别再叠加
-            break;
+            if (over) { truncated = true; break; }
+            continue;
         }
+
+        // 普通情况：整个词块搬到下一行
         if ((int)lines.size() >= maxLines) { truncated = true; break; }
         if (ch == L" ") continue;
         lines.emplace_back(ch);

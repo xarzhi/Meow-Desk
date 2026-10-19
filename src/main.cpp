@@ -2536,6 +2536,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     g_search.SetIcons(&g_icons);
     g_search.onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
+    // 「定位」：把那个图标的位置高亮两下提醒用户。
+    // 桌面上的图标 → 桌面层自己闪；盒子里的 → 盒子自己切分组/展开/滚动/闪，
+    // 主程序只是个转发（盒子那边的几何只有它自己知道）。
+    g_search.onLocate = [](DesktopIconView* e) {
+        if (!e) return;
+        if (e->OnDesktop()) {
+            g_surface.FlashIcon(e);
+            return;
+        }
+        const int fi = e->owner;
+        if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi])
+            g_fences[fi]->LocateItem(e);
+    };
     g_search.onFiltered = [](const std::vector<DesktopIconView*>& hits) {
         // 自测用：把当前搜索命中写到 search.txt（前 8 条）
         FILE* f = nullptr;

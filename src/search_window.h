@@ -35,6 +35,9 @@ public:
 
     // 打开某个图标
     std::function<void(DesktopIconView*)> onOpen;
+    // 「定位」某个图标：面板会先自己关掉，再由外部把这个图标的位置高亮出来
+    // （桌面图标闪桌面层，盒内图标让盒子展开/滚动/闪两下）
+    std::function<void(DesktopIconView*)> onLocate;
     // 过滤结果变化（调试/自测用：把命中的名字 dump 出来）
     std::function<void(const std::vector<DesktopIconView*>&)> onFiltered;
 
@@ -49,8 +52,11 @@ private:
     void Filter();
     void MoveSel(int delta);
     void Activate();
+    // 第 i 行右侧「定位」按钮的矩形（点击后关面板 + 高亮那个图标的位置）
+    void Locate(int i);
     int RowsVisible() const;
     RECT RowRect(int i) const;
+    RECT LocateRect(int i) const;
 
     // 输入法组合串（未上屏的拼音）。面板要能在组字过程中实时过滤，
     // 同时组合态下 ESC 会被 IME 吃掉，所以顺手装个低级键盘钩子兜住 Esc。
@@ -71,6 +77,7 @@ private:
     std::vector<DesktopIconView*> hits_;
     int sel_ = 0;
     int hot_ = -1;
+    int hotLoc_ = -1;   // 光标压在哪一行的「定位」按钮上（-1 = 没有）
 
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;

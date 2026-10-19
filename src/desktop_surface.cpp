@@ -995,6 +995,26 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER:
+        // 搜索「定位」的闪烁：只重画那一格
+        if (wp == 2) {
+            DesktopIconView* e = flash_;
+            if (!e) {
+                KillTimer(h, 2);
+                return 0;
+            }
+            ++flashStep_;
+            if (flashStep_ >= 4) {
+                flash_ = nullptr;   // 亮相 0/2，灭相 1/3 —— 数到 4 正好两下
+                KillTimer(h, 2);
+            }
+            if (e->OnDesktop()) {
+                RECT r{e->pos.x - origin_.x - 4, e->pos.y - origin_.y - 4,
+                       e->pos.x - origin_.x + cellW_ + 4,
+                       e->pos.y - origin_.y + cellH_ + 4};
+                RepaintCells(r);
+            }
+            return 0;
+        }
         if (wp == 1) {
             // 每 500ms 拿「当前光标位置」校准一次悬停。正常情况下这里什么都不做
             // （命中的还是同一个图标，UpdateHover 直接返回），但万一某次
@@ -1063,6 +1083,20 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging) {
         };
         for (const auto& r : edge)
             FillRectAlpha(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, r, 150, RGB(0, 120, 215));
+    }
+
+    // 搜索「定位」的闪烁：亮相比选中态更亮更粗，保证一眼能找到
+    if (flash_ == e && (flashStep_ & 1) == 0) {
+        RECT fill{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
+        auto* b = reinterpret_cast<BYTE*>(bits_);
+        FillRectAlpha(b, bufW_, bufH_, fill, 90, RGB(0, 120, 215));
+        RECT edge[4] = {
+            {fill.left, fill.top, fill.right, fill.top + 2},
+            {fill.left, fill.bottom - 2, fill.right, fill.bottom},
+            {fill.left, fill.top, fill.left + 2, fill.bottom},
+            {fill.right - 2, fill.top, fill.right, fill.bottom},
+        };
+        for (const auto& r : edge) FillRectAlpha(b, bufW_, bufH_, r, 235, RGB(0, 120, 215));
     }
 
     if (!impl_) return;
@@ -1313,6 +1347,19 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging) {
         for (const auto& r : edge) FillRectBlend(hdc, r, 150, RGB(0, 120, 215));
     }
 
+    // 搜索「定位」的闪烁（和分层路径同一套观感）
+    if (flash_ == e && (flashStep_ & 1) == 0) {
+        RECT fill{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
+        FillRectBlend(hdc, fill, 90, RGB(0, 120, 215));
+        RECT edge[4] = {
+            {fill.left, fill.top, fill.right, fill.top + 2},
+            {fill.left, fill.bottom - 2, fill.right, fill.bottom},
+            {fill.left, fill.top, fill.left + 2, fill.bottom},
+            {fill.right - 2, fill.top, fill.right, fill.bottom},
+        };
+        for (const auto& r : edge) FillRectBlend(hdc, r, 235, RGB(0, 120, 215));
+    }
+
     if (!impl_) return;
 
     int ih = e->bmp.valid() ? e->bmp.height : 0;
@@ -1389,6 +1436,19 @@ void DesktopSurface::InvalidateCell(const DesktopIconView* e, POINT pos) {
     RECT r{pos.x - origin_.x - pad, pos.y - origin_.y - pad,
            pos.x - origin_.x + cellW_ + pad, pos.y - origin_.y + cellH_ + pad};
     Dirty(r);
+}
+
+// 搜索窗口的「定位」：让这个图标闪两下。
+// 桌面层的重绘是整屏的（分层窗口只能整张上传），所以只翻 4 相、每相 170ms：
+// 总时长 680ms，刚好够注意到，也不会长时间占着 CPU。
+void DesktopSurface::FlashIcon(DesktopIconView* e) {
+    if (!e || !hwnd_ || !e->OnDesktop()) return;
+    flash_ = e;
+    flashStep_ = 0;
+    SetTimer(hwnd_, 2, 170, nullptr);
+    RECT r{e->pos.x - origin_.x - 4, e->pos.y - origin_.y - 4,
+           e->pos.x - origin_.x + cellW_ + 4, e->pos.y - origin_.y + cellH_ + 4};
+    RepaintCells(r);
 }
 
 
