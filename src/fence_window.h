@@ -433,6 +433,10 @@ private:
     DWORD bdDue_ = 0;
     bool probeValid_ = false;
     int probeR_ = 0, probeG_ = 0, probeB_ = 0;
+    // 上一次采样用的屏幕坐标（采样块左上角）。
+    // 展开/收起/拖动/改尺寸都会让采样点换地方，不同位置的均值没有可比性 ——
+    // 换了位置就重新立基线，不能当成「壁纸变了」。
+    int probeX_ = 0, probeY_ = 0;
     // 连续几次采样都和基线不同。要求连续两次才动手：别的窗口扫过采样点
     // （或者那附近有个图标被 hover 高亮）也会让均值变一点，一次就信会误抓。
     int probeHits_ = 0;

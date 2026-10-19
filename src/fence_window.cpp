@@ -2203,10 +2203,13 @@ void FenceWindow::EnsureBackbuffer(int w, int h) {
 void FenceWindow::RefreshBackdrop(int pad) {
     // 同步抓的这一张比在途的后台那一单更新，作废掉，免得过两帧被旧的顶回去
     bdJob_.reset();
-    backdrop_.clear();
-    backdropW_ = backdropH_ = 0;
-    if (!cfg_ || !cfg_->acrylic || !hwnd_) return;
+    if (!cfg_ || !cfg_->acrylic || !hwnd_) {
+        backdrop_.clear();
+        backdropW_ = backdropH_ = 0;
+        return;
+    }
     RECT r = rect();
+    // 窗口还没建好：保持旧图，别清空
     if (r.right <= r.left || r.bottom <= r.top) return;
 
     // 一律按「展开尺寸」抓：收起时只用到上面一段（行距仍是 width_，可直接裁）
@@ -2224,7 +2227,7 @@ void FenceWindow::RefreshBackdrop(int pad) {
         const int x1 = std::min(x + w, (int)vs.right);
         const int y1 = std::min(y + h, (int)vs.bottom);
         if (x1 - x0 < 16 || y1 - y0 < 16) {
-            backdrop_.clear();
+            // 退化矩形（盒子几乎整个在屏幕外）：保持旧图，Paint 会把取样原点夹回来
             return;
         }
         x = x0;
@@ -2245,7 +2248,14 @@ void FenceWindow::RefreshBackdrop(int pad) {
     // 拖动时每 100ms 来一轮，看到的就是「磨砂一卡一卡」。
     bool ok = false;
     bool uni = false;
-    if (!preferDesktop) ok = CaptureBlurredBackdropFast(x, y, w, h, backdrop_, &uni);
+    // 抓进临时缓冲，成功了才换上新图。
+    // 以前这里直接把 backdrop_ 交出去抓 —— 开头先 clear、抓失败再 clear 一次，
+    // 结果就是「一次抓不到 = 盒子直接丢掉磨砂」，退回只剩半透明着色，
+    // 看起来就是**整块突然变暗**（背景从模糊壁纸变成一片深色）。
+    // 抓失败时保留旧图最多只是位置差几像素（Paint 会把取样原点夹回来），
+    // 比丢掉整块要好得多。
+    std::vector<uint8_t> px;
+    if (!preferDesktop) ok = CaptureBlurredBackdropFast(x, y, w, h, px, &uni);
 
     // uni：快路径抓到的是一片纯色 —— 可能是壁纸真的纯色，也可能是壁纸画在分层
     // 窗口上（快路径看不见它）。这条同步路径只在「首次 / 换壁纸 / 后台失败兜底」时走，
@@ -2257,14 +2267,12 @@ void FenceWindow::RefreshBackdrop(int pad) {
         const bool hook = s_captureExcluder != nullptr;
         if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, true);
         SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE);
-        ok = CaptureBlurredBackdrop(x, y, w, h, 20, backdrop_, preferDesktop);
+        ok = CaptureBlurredBackdrop(x, y, w, h, 20, px, preferDesktop);
         SetWindowDisplayAffinity(hwnd_, WDA_NONE);
         if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, false);
     }
-    if (!ok) {
-        backdrop_.clear();
-        return;
-    }
+    if (!ok || px.empty()) return;   // 抓不到：留着旧图
+    backdrop_.swap(px);
     backdropW_ = w;
     backdropH_ = h;
     backdropX_ = x;
@@ -3087,11 +3095,18 @@ void FenceWindow::PollBackdropChange() {
     int rr = 0, gg = 0, bb = 0;
     if (!SampleScreenMean(px, py, kProbe, kProbe, rr, gg, bb)) return;
 
-    if (!probeValid_) {
+    if (!probeValid_ || px != probeX_ || py != probeY_) {
+        // 采样点换地方了：盒子刚展开/收起、刚被拖动过、或者改了尺寸 —— 采样点会跟着
+        // 盒子矩形一起移动。**两个不同屏幕位置的均值没有任何可比性**，
+        // 拿它们比必然「变了」，而展开动画那两下正好能被连续两次判成变化 →
+        // 白抓一张底图。这就是「盒子展开后一秒左右突然变暗」的源头。
         probeValid_ = true;
+        probeX_ = px;
+        probeY_ = py;
         probeR_ = rr;
         probeG_ = gg;
         probeB_ = bb;
+        probeHits_ = 0;
         return;
     }
     const int diff = std::max({std::abs(rr - probeR_), std::abs(gg - probeG_),
@@ -3107,6 +3122,10 @@ void FenceWindow::PollBackdropChange() {
     probeR_ = rr;
     probeG_ = gg;
     probeB_ = bb;
+    // 壁纸真的换了：「这块地方是纯色」的旧结论作废。
+    // 不重置的话，动态壁纸（画在分层窗口上、快路径看不见）会被判成纯色然后
+    // 直接顶上去 —— 磨砂变成一块死色，看着也是「突然变暗」。
+    bdPlainArea_ = false;
     // 走后台抓（不是同步 RecaptureBackdrop）：壁纸在动的时候这会每隔一会儿
     // 来一次，同步抓就是十几毫秒的卡顿 —— 玩游戏时最不能要的就是这个。
     RequestBackdropAsync(0);
