@@ -396,13 +396,17 @@ bool DesktopSurface::CellIsFree(int x, int y, int cw, int ch,
 
 // 从桌面左上角开始按行扫（先从左到右扫完一行，再下移一行），
 // 找出第一个空闲格子。删除盒子 / 删除分组时图标从这里开始一个挨一个排。
+// 从桌面左上角开始**按列**扫（先从上到下扫完一列，再往右换下一列），
+// 找出第一个空闲格子。删除盒子 / 删除分组时图标从这里开始一个挨一个往下排。
+// 注意别写成「先扫完一行再下移」—— 桌面图标的排列顺序本来就是一列列往下长，
+// 横着排会让删完后图标横躺在屏幕顶上，和用户预期相反。
 POINT DesktopSurface::FirstFreeCell(const std::vector<DesktopIconView*>& exclude) const {
     const int cw = cellW_ > 0 ? cellW_ : 75;
     const int ch = cellH_ > 0 ? cellH_ : 98;
     const int maxX = origin_.x + width_ - cw;
     const int maxY = origin_.y + height_ - ch;
-    for (int y = origin_.y; y <= maxY; y += ch) {
-        for (int x = origin_.x; x <= maxX; x += cw) {
+    for (int x = origin_.x; x <= maxX; x += cw) {
+        for (int y = origin_.y; y <= maxY; y += ch) {
             if (CellIsFree(x, y, cw, ch, exclude)) return POINT{x, y};
         }
     }

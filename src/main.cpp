@@ -289,8 +289,8 @@ static void PlaceOnDesktop(DesktopIconView* e, POINT dropPt,
 }
 
 // 把一批图标从盒子里倒回桌面（删除盒子 / 删除分组时用）。
-// 落点规则：**从桌面左上角的第一格开始，按行找第一个空位**（一行填满就往下换一行），
-// 图标按原来的顺序一个挨一个排好；整批只向资源管理器提交一次位置。
+// 落点规则：**从桌面左上角的第一格开始，按列往下找第一个空位**（一列填满就换右边一列），
+// 图标按原来的顺序一个挨一个往下排；整批只向资源管理器提交一次位置。
 static void SendIconsToDesktop(int fi, const std::vector<DesktopIconView*>& list) {
     if (list.empty()) return;
     (void)fi;   // 落点不再参考盒子位置，统一从桌面左上角开始
