@@ -116,6 +116,11 @@ public:
     // 屏幕坐标是否落在盒子矩形内（含收起后的头部）
     bool HitTest(POINT screenPt) const;
 
+    // 伸缩模式下「光标已经不在盒子里了就把盒子收起来」。
+    // WM_MOUSELEAVE 靠不住的地方（拖拽期间鼠标被别的窗口 SetCapture 走）由它兜底，
+    // 也挂在 kIdleTimer 上每 200ms 自查一次。正在拖拽 / 拉尺寸 / 右键菜单 / 改名时不动。
+    void CollapseIfIdle();
+
     // 盒子内容区（去掉头部）的屏幕矩形，用来判断"松手时算不算放进了盒子"
     RECT bodyRect() const;
 

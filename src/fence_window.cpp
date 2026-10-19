@@ -120,6 +120,13 @@ const UINT_PTR kAnimTimer = 2;
 const UINT_PTR kFlashTimer = 3;
 const int kFlashInterval = 170;
 const int kFlashPhases = 4;
+// 「伸缩模式的盒子该不该收」的看门狗。
+// 正常情况下靠 WM_MOUSELEAVE，但拖拽期间鼠标被 SetCapture 走了：盒子一帧
+// WM_MOUSEMOVE 都收不到，拖动结束后也不会有「离开」消息补过来，
+// 于是一个被拖拽拉开的盒子会一直开着。这个定时器只做「光标还在盒子里吗」，
+// 不在就收起 —— 5 次/秒，只有一个 GetCursorPos + 矩形比较，状态没变不重画。
+const UINT_PTR kIdleTimer = 4;
+const int kIdleInterval = 200;
 // 「鼠标移入切分组」现在是一移上去就切（用户嫌 200ms 延迟明显），
 // 所以原来那个延迟定时器整个删掉了 —— 别再加回来。
 
@@ -1582,9 +1589,14 @@ int FenceWindow::itemCount() const {
 }
 
 void FenceWindow::ClearDropHint() {
-    if (drop_.item == -1 && drop_.insert == -1) return;
-    drop_ = DropHint{};
-    Redraw();
+    if (drop_.item != -1 || drop_.insert != -1) {
+        drop_ = DropHint{};
+        Redraw();
+    }
+    // 拖着图标进来把盒子拉开展示、又拖着走了 → 该收回去。
+    // 这一下不能指望 WM_MOUSELEAVE：拖动期间鼠标被桌面层 SetCapture 走了，
+    // 盒子根本收不到鼠标消息。所以每次「拖拽已经不在这个盒子上」都主动查一次。
+    CollapseIfIdle();
 }
 
 // 放弃盒内这次拖动，图标回到原来的位置（交棒给系统级拖放之前调）。
@@ -1966,7 +1978,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         const bool nativeMenu = (it >= 0);
-        menuOpen_ = nativeMenu;
+        // 两种菜单（系统原生 / 我们自绘）开着的时候都别让看门狗收盒子：
+        // 自绘菜单是弹出在光标处的，鼠标在里面挪来挪去很可能就出了盒子矩形。
+        menuOpen_ = true;
         if (onContextMenu) onContextMenu(it, sp);
         menuOpen_ = false;
         // 菜单关掉之后鼠标多半还停在外面：该收就收，别留一个开着却没人操作的盒子
@@ -2046,6 +2060,8 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             itemDragging_ = false;
             dragged_ = nullptr;
             dragItems_.clear();
+            // 图标拖到盒子外面松手了 → 盒子该收回去（拖动期间收不到 MOUSELEAVE）
+            CollapseIfIdle();
             Redraw();
             return 0;
         }
@@ -2102,6 +2118,11 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // 搜索「定位」的闪烁（和桌面层同一套节奏）
         if (wp == kFlashTimer) {
             TickFlash();
+            return 0;
+        }
+        // 「该不该收起来」的看门狗：拖拽期间收不到 WM_MOUSELEAVE，靠它兜底
+        if (wp == kIdleTimer) {
+            CollapseIfIdle();
             return 0;
         }
         if (wp != kAnimTimer) break;
@@ -3232,7 +3253,26 @@ bool FenceWindow::Create(int index, int x, int y, int w, int h) {
     Paint();
     Present();
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+    // 伸缩模式才需要「光标还在不在盒子里」的看门狗；始终展开的盒子不用
+    if (expandMode() == 0) SetTimer(hwnd_, kIdleTimer, kIdleInterval, nullptr);
     return true;
+}
+
+// 伸缩模式：光标不在盒子里 + 没有正在进行的操作 → 收起。
+// 只做判断，不做别的（所以可以放心在拖动结束、定时器里到处调）。
+void FenceWindow::CollapseIfIdle() {
+    if (!hwnd_ || collapsed_ || expandMode() != 0) return;
+    // 这些状态下「鼠标不在盒子里」是正常的：拖盒子 / 拉尺寸 / 盒内拖图标 /
+    // 右键菜单或改名输入框盖在上面。收起来会把用户正在操作的界面抽走。
+    // flash_ / locatePending_ 是搜索「定位」：它会把收起的盒子摊开、滚到目标图标
+    // 再闪两下，这几百毫秒里光标本来就不在盒子上，不能收。
+    if (menuOpen_ || holdOpen_ || itemDragging_ || dragging_ || resizing_) return;
+    if (flash_ || locatePending_) return;
+    POINT c{};
+    if (!GetCursorPos(&c)) return;
+    if (HitTest(c)) return;   // 光标还在盒子里，保持展开
+    autoExpanded_ = false;
+    SetCollapsed(true);
 }
 
 void FenceWindow::SetCollapsed(bool collapsed) {
@@ -3256,6 +3296,10 @@ void FenceWindow::SetExpandMode(int m) {
     // 切到「始终展开」就立刻摊开；切到「伸缩模式」不在这里收 ——
     // 是让鼠标离开时自然收（箭头那一下会自己 SetCollapsed(true) 给个即时反馈）
     if (v == 1) SetCollapsed(false);
+    if (hwnd_) {
+        if (v == 0) SetTimer(hwnd_, kIdleTimer, kIdleInterval, nullptr);
+        else KillTimer(hwnd_, kIdleTimer);
+    }
     Redraw();
     if (onStateChanged) onStateChanged();   // 存配置
 }
@@ -3265,6 +3309,7 @@ void FenceWindow::Destroy() {
         FileDrop::Detach(hwnd_);   // OLE 那边还挂着这个 HWND，先摘掉再销毁
         KillTimer(hwnd_, kAnimTimer);
         KillTimer(hwnd_, kFlashTimer);
+        KillTimer(hwnd_, kIdleTimer);
         flash_ = nullptr;
         locatePending_ = nullptr;
         SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
