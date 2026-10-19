@@ -716,6 +716,40 @@ static void InheritFenceSize(int& w, int& h) {
 }
 
 // 新建盒子：摆在当前盒子右边，超出工作区就换到下一行
+//
+// 光算「右边 20px」不够 —— 那个位置可能正压着别的盒子（新盒子一出生就重叠，
+// 拖动时避让算法只能把它「弹」出去，手感非常怪）。所以位置算完还要再找一次空位。
+static bool RectHitsFence(const RECT& r) {
+    for (auto& f : g_fences) {
+        if (!f || !f->hwnd()) continue;
+        const RECT o = f->rect();
+        if (r.right <= o.left + 1 || o.right <= r.left + 1) continue;
+        if (r.bottom <= o.top + 1 || o.bottom <= r.top + 1) continue;
+        return true;
+    }
+    return false;
+}
+
+// 把 (x,y,w,h) 挪到工作区里第一个不压其他盒子的位置；找不到就保持原样
+static void EnsureFreeSpot(int& x, int& y, int w, int h, const RECT& lim) {
+    auto fits = [&](int cx, int cy) {
+        if (cx < lim.left || cy < lim.top) return false;
+        if (cx + w > lim.right || cy + h > lim.bottom) return false;
+        RECT r{cx, cy, cx + w, cy + h};
+        return !RectHitsFence(r);
+    };
+    if (fits(x, y)) return;
+    for (int cy = lim.top + 24; cy + h <= lim.bottom; cy += 24) {
+        for (int cx = lim.left + 24; cx + w <= lim.right; cx += 24) {
+            if (fits(cx, cy)) {
+                x = cx;
+                y = cy;
+                return;
+            }
+        }
+    }
+}
+
 static void NewFenceNear(int fi) {
     int w = 340, h = 380;
     InheritFenceSize(w, h);
@@ -737,6 +771,8 @@ static void NewFenceNear(int fi) {
     if (y + h > lim.bottom) y = lim.bottom - h;
     if (x < lim.left) x = lim.left;
     if (y < lim.top) y = lim.top;
+    // 算出来的位置要是正压着别的盒子，就再找个空位（新盒子不能一出生就重叠）
+    EnsureFreeSpot(x, y, w, h, lim);
 
     FenceConfig c;
     c.x = x;
@@ -830,6 +866,8 @@ static int CreateRuleFence(const std::wstring& title) {
     if (y + h > lim.bottom) y = lim.bottom - h;
     if (x < lim.left) x = lim.left;
     if (y < lim.top) y = lim.top;
+    // 一次整理可能连着建好几个盒子，同样要保证互不重叠
+    EnsureFreeSpot(x, y, w, h, lim);
 
     FenceConfig c;
     c.x = x;
@@ -1261,6 +1299,10 @@ static void AddFenceWindow(int i) {
     f->onGeometryChanged = [i] {
         if (i >= (int)g_fences.size()) return;
         RECT r = g_fences[i]->rect();
+        // 拖动/改尺寸结束时打一行实况：避让出问题时能直接看出是「没拿到障碍」
+        // 还是「拿到了但没挡住」。
+        if (g_fences[i])
+            LogStep("fence " + std::to_string(i) + " geometry " + Narrow(g_fences[i]->DragDebug()));
         if (i < (int)g_config.fences.size()) {
             g_config.fences[i].x = r.left;
             g_config.fences[i].y = r.top;
@@ -1361,15 +1403,6 @@ static void AddFenceWindow(int i) {
     if (g_fences[i] && g_fences[i]->hwnd()) {
         InstallKeepAbove(g_fences[i]->hwnd(), [i] { return FenceAnchor(i); });
         PlaceAbove(g_fences[i]->hwnd(), FenceAnchor(i));
-        // 拖动时避让其他盒子（用实时窗口矩形，收起状态的盒子只占一条头部）
-        g_fences[i]->SetObstacles([i] {
-            std::vector<RECT> v;
-            for (size_t k = 0; k < g_fences.size(); ++k) {
-                if ((int)k == i) continue;
-                if (g_fences[k] && g_fences[k]->hwnd()) v.push_back(g_fences[k]->rect());
-            }
-            return v;
-        });
     }
 }
 
@@ -1683,6 +1716,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 
     // 6. 盒子
+    // 拖动避让的数据源：除了自己之外所有盒子的实时窗口矩形。
+    // 全局只注册一次，且按指针排除自己 —— 新建的盒子天然就在里面，
+    // 不会再出现「新盒子拖动时没有边界」这种事。
+    FenceWindow::SetObstacleProvider([](const FenceWindow* self) {
+        std::vector<RECT> v;
+        for (auto& f : g_fences) {
+            if (!f || f.get() == self) continue;
+            if (f->hwnd()) v.push_back(f->rect());
+        }
+        return v;
+    });
     for (int i = 0; i < (int)g_config.fences.size(); ++i) AddFenceWindow(i);
     LogStep("fences created: " + std::to_string(g_fences.size()));
 

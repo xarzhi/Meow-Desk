@@ -57,8 +57,13 @@ public:
     void SetCollapsed(bool collapsed);
     bool collapsed() const { return collapsed_; }
 
-    // 拖动时用来避让的其他盒子矩形（屏幕坐标），由 main 提供
-    void SetObstacles(std::function<std::vector<RECT>()> fn) { obstacles_ = std::move(fn); }
+    // 拖动时用来避让的其他盒子矩形（屏幕坐标），由 main 提供。
+    //
+    // 这里用「全局一份、按指针认自己」而不是「每个盒子各存一个捕获了下标的 lambda」：
+    // 盒子下标是数组下标，新建/删除都会变，捕获下标的 lambda 一旦错位，
+    // 轻则把自己当成障碍（盒子被自己弹开），重则一个障碍都拿不到（可以随意重叠）。
+    // 传 this 进来排除自己，永远不会错。
+    static void SetObstacleProvider(std::function<std::vector<RECT>(const FenceWindow*)> fn);
 
     // 屏幕坐标是否落在盒子矩形内（含收起后的头部）
     bool HitTest(POINT screenPt) const;
@@ -130,6 +135,11 @@ public:
     std::vector<RECT> TabRects() const;
     // 命中哪个标签，-1 = 没命中
     int HitTab(POINT clientPt) const;
+
+    // 调试：最近一次拖动夹取的实况（障碍数量 / 期望位置 / 实际位置）。
+    // 不参与任何逻辑，只往日志里写 —— 盒子互相避让出问题时，这一行能直接区分
+    // 「一个障碍都没拿到」和「拿到了但没挡住」。
+    std::wstring DragDebug() const;
 
     // 几何变化（移动后）→ 外部保存配置
     std::function<void()> onGeometryChanged;
@@ -271,7 +281,11 @@ private:
     bool showTitle_ = true;    // g_config.showFenceTitle 的镜像
 
     std::vector<DesktopIconView*>* all_ = nullptr;
-    std::function<std::vector<RECT>()> obstacles_;
+    static std::function<std::vector<RECT>(const FenceWindow*)> s_obstacleProvider;
+    // 拖动夹取的最后一次实况（只给 DragDebug 用）
+    mutable int dbgObstacles_ = -1;
+    mutable RECT dbgWant_{};
+    mutable POINT dbgGot_{0, 0};
 
     // 盒内标签缓存（按 图标+尺寸+颜色 复用）
     std::unordered_map<DesktopIconView*, LabelDib> labels_;
