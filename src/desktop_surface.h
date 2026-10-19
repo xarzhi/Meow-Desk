@@ -70,6 +70,11 @@ public:
     // 强制重建全部缓存（字体/DPI 变化时）
     void InvalidateCache();
 
+    // 系统层面变了（换壁纸 / 改分辨率 / 切主题）。主程序拿它去重抓盒子的磨砂底图 ——
+    // 盒子创建之后就再也不抓底图了，壁纸一换，磨砂里还是旧壁纸，只有挪一下
+    // 盒子（触发补抓）才会更新。
+    std::function<void()> onShellChanged;
+
     bool Create();
     void Redraw();
     void Destroy();

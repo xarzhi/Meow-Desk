@@ -2417,6 +2417,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     for (int i = 0; i < (int)g_config.fences.size(); ++i) AddFenceWindow(i);
     LogStep("fences created: " + std::to_string(g_fences.size()));
 
+    // 换壁纸 / 改分辨率 → 盒子重抓磨砂底图。
+    // 底图只在盒子创建时抓过一次，壁纸一换，磨砂里还是旧壁纸，看起来就像
+    // 「桌面变了、盒子没变」；以前得拖一下盒子（触发补抓）才会更新。
+    g_surface.onShellChanged = [] {
+        for (auto& f : g_fences)
+            if (f) f->RecaptureBackdrop();
+    };
+
     // 系统原生菜单里的「重命名」：菜单项由 shell 给，执行归我们（见 BeginRenameIcon）
     SetShellMenuRenameHandler([](HWND owner, const std::wstring& path) {
         return BeginRenameIcon(owner, path);

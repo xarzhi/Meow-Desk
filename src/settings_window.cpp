@@ -665,8 +665,9 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         g.DrawString(L"\u5934\u90e8\u9ad8\u5ea6", -1, &fBody,
                      RectF((float)kRowLeft, (float)rcHeaderH_.top, 90.0f, 30.0f), &sf,
                      &brText);
-        drawSlider(rcHeaderH_, 28, 72, std::clamp(g_config.headerHeight, 28, 72),
-                   std::to_wstring(std::clamp(g_config.headerHeight, 28, 72)) + L" px");
+        // 上限 50：再高头部就把内容区挤没了（用户定的上限）
+        drawSlider(rcHeaderH_, 26, 50, std::clamp(g_config.headerHeight, 26, 50),
+                   std::to_wstring(std::clamp(g_config.headerHeight, 26, 50)) + L" px");
 
         g.DrawString(L"Win11 \u4e9a\u514b\u529b\u6548\u679c", -1, &fBody,
                      RectF((float)kRowLeft, (float)(rcAcrylic_.top - 10), 300.0f, 26.0f),
@@ -812,6 +813,38 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                                (float)(rcOpenFolder_.right - rcOpenFolder_.left),
                                (float)(rcOpenFolder_.bottom - rcOpenFolder_.top)),
                          &sfCenter, &brText);
+        }
+
+        // ---- 开源项目 ----
+        // 本程序自身只依赖 Win32 / GDI+，第三方就这两样：
+        //   · SQLite：布局 / 配置的本地存储（third_party/sqlite，公有领域）
+        //   · iconfont：设置页导航和盒子锁按钮的图标字体（iconfont.cn 下载）
+        // 许可和用途写清楚，方便对外分发时对账。
+        const int c2 = 340;
+        drawCard(c2, 168);
+        g.DrawString(L"\u5f00\u6e90\u9879\u76ee", -1, &fSection,
+                     RectF((float)kRowLeft, (float)c2 + 16.0f, 300.0f, 24.0f), &sf, &brText);
+
+        struct OsItem {
+            const wchar_t* name;
+            const wchar_t* meta;
+            const wchar_t* use;
+        };
+        static const OsItem kOs[] = {
+            {L"SQLite", L"3.50.4 \u00b7 \u516c\u6709\u9886\u57df (Public Domain)",
+             L"\u672c\u5730\u6570\u636e\u5b58\u50a8\uff08\u56fe\u6807\u5e03\u5c40 / \u914d\u7f6e\uff09"},
+            {L"iconfont \u56fe\u6807\u5b57\u4f53", L"iconfont.cn \u00b7 \u56fe\u6807\u6388\u6743\u89c1\u5b98\u7f51",
+             L"\u8bbe\u7f6e\u9875\u5bfc\u822a\uff0c\u76d2\u5b50\u7684\u9501\u5b9a / \u89e3\u9501\u56fe\u6807"},
+        };
+        float oy = (float)c2 + 54.0f;
+        for (const OsItem& it : kOs) {
+            g.DrawString(it.name, -1, &fBody, RectF((float)kRowLeft, oy, 200.0f, 20.0f), &sf,
+                         &brText);
+            g.DrawString(it.meta, -1, &fSub, RectF((float)kRowLeft + 190.0f, oy, 360.0f, 20.0f),
+                         &sf, &brSub);
+            g.DrawString(it.use, -1, &fSub, RectF((float)kRowLeft, oy + 21.0f, 460.0f, 18.0f),
+                         &sf, &brSub);
+            oy += 58.0f;
         }
         break;
     }

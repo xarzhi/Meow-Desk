@@ -728,6 +728,12 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             dirtyValid_ = false;
             InvalidateRect(h, nullptr, FALSE);
         }
+        // 换壁纸（含幻灯片轮播）→ 让主程序重新抓盒子的磨砂底图。
+        // 只认 SPI_SETDESKWALLPAPER 和分辨率变化：WM_SETTINGCHANGE 广播得很勤，
+        // 别的参数一律去重抓一次底图（每个盒子几十毫秒）没必要。
+        if (onShellChanged &&
+            (msg == WM_DISPLAYCHANGE || (msg == WM_SETTINGCHANGE && wp == SPI_SETDESKWALLPAPER)))
+            onShellChanged();
         return 0;
 
     case WM_LBUTTONDOWN: {

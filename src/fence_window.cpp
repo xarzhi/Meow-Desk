@@ -53,8 +53,10 @@ const int kColInset = 10;
 const int kEdgeMargin = 6;
 
 // ---- 吸附（拖动位置 / 改尺寸共用）----
-// 吸附距离（像素）。太大就会「粘住」，太小又感觉不到
-constexpr int kSnapPx = 8;
+// 吸附距离（像素）：靠到这么近才贴上去。
+// 注意「吸住之后拖不动」不是阈值的问题，那要归 dragRawX_/Y_（见 WM_MOUSEMOVE）——
+// 拿吸附后的位置去累加位移，无论阈值多小都会粘死。
+constexpr int kSnapPx = 10;
 
 // 一维吸附：v 是盒子左边（上边），size 是宽（高）——
 // 我的左边贴候选线，或者我的右边贴候选线。
@@ -497,6 +499,8 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     GetWindowRect(h, &dragStartRect_);
     dragLastX_ = dragStartRect_.left;
     dragLastY_ = dragStartRect_.top;
+    dragRawX_ = dragLastX_;
+    dragRawY_ = dragLastY_;
     dragging_ = false;
     itemDragging_ = false;
     resizing_ = false;
@@ -1626,9 +1630,12 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (!dragging_ && (std::abs(dx) > 2 || std::abs(dy) > 2)) {
                     dragging_ = true;
                     // 从这一刻起按「每帧鼠标位移」跟手，而不是「按下点 + 总位移」。
-                    // 用总位移的话，被障碍挡掉的那段距离会一直欠着 —— 鼠标得原路
-                    // 退回被挡掉的距离盒子才重新动，拖到边上就像卡死了。
+                    // 用总位移的话，被夹住的那段距离会一直欠着 —— 鼠标得原路
+                    // 退回被夹住的距离盒子才重新动，拖到边上就像卡死了。
                     dragLastCursor_ = cur;
+                    // 未吸附的「原始位置」从当前实际位置起算
+                    dragRawX_ = dragLastX_;
+                    dragRawY_ = dragLastY_;
                 }
                 if (dragging_) {
                     const int mdx = cur.x - dragLastCursor_.x;
@@ -1637,12 +1644,31 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                         dragLastCursor_ = cur;
                         const int fw = (int)(dragStartRect_.right - dragStartRect_.left);
                         const int fh2 = (int)(dragStartRect_.bottom - dragStartRect_.top);
-                        // 起点是「现在的位置」：每帧都以当前实际位置为起点扫掠，
-                        // 才保证越不过任何障碍（目标直连的话，一帧跳几百像素就会穿过去）。
-                        const RECT now{dragLastX_, dragLastY_, dragLastX_ + fw,
-                                       dragLastY_ + fh2};
+
+                        // 累积到**未吸附**的原始位置上，再让吸附只影响「摆到哪儿」。
+                        //
+                        // 这一步是修「吸附之后盒子就动不了」：以前每帧都拿
+                        // 「吸附后的位置 + 这一帧位移」去算，一旦吸住，下一帧只移动
+                        // 1~2px 又落回吸附范围里，又被吸回去 —— 慢慢拖的时候盒子
+                        // 永远离不开那条线。现在原始位置该走多少走多少，鼠标累计
+                        // 离开阈值，吸附自然就断了。
+                        dragRawX_ += mdx;
+                        dragRawY_ += mdy;
+                        // 原始位置也要夹在屏幕里：否则鼠标推到屏幕外几百像素后，
+                        // 再往回拖要先把这段「欠账」还完，手感像卡住。
+                        {
+                            const RECT raw{dragRawX_, dragRawY_, dragRawX_ + fw,
+                                           dragRawY_ + fh2};
+                            const RECT c = ScreenUtil::ClampRect(
+                                raw, ScreenUtil::WorkAreaForRect(raw));
+                            dragRawX_ = (int)c.left;
+                            dragRawY_ = (int)c.top;
+                        }
+
                         int nx = dragLastX_, ny = dragLastY_;
-                        ResolveDragMove(now, dragLastX_ + mdx, dragLastY_ + mdy, nx, ny);
+                        ResolveDragMove(RECT{dragRawX_, dragRawY_, dragRawX_ + fw,
+                                             dragRawY_ + fh2},
+                                        dragRawX_, dragRawY_, nx, ny);
                         if (nx != dragLastX_ || ny != dragLastY_) {
                             dragLastX_ = nx;
                             dragLastY_ = ny;
@@ -2246,8 +2272,8 @@ void FenceWindow::Paint() {
             const float cx = (float)(lr.left + lr.right) * 0.5f;
             const float cy = (float)(lr.top + lr.bottom) * 0.5f;
             const bool on = locked();
-            const Color lc = on ? Color(255, 0, 120, 215)
-                                : (light ? Color(130, 96, 96, 102) : Color(140, 210, 210, 216));
+            // 白色：和头部标题一致，状态只靠「实心 / 淡」区分（锁上更实、未锁更淡）。
+            const Color lc = on ? Color(255, 255, 255, 255) : Color(150, 255, 255, 255);
             // 优先用图标字体里的「锁定 / 解锁」（iconfont：e635 / e616）：
             // 手搓的挂锁在 18px 里能表达的状态差异很有限（只有锁梁抬不抬起来），
             // 图标字体的解锁是另一张图，一眼就能分清。
@@ -2657,10 +2683,17 @@ void FenceWindow::Redraw() {
     Present();
 }
 
+void FenceWindow::RecaptureBackdrop() {
+    if (!cfg_ || !cfg_->acrylic || !hwnd_) return;
+    // 拖动 / 改尺寸途中就再抓一圈大的，别把正在用的那一圈收窄了
+    RefreshBackdrop((dragging_ || resizing_) ? 128 : 0);
+    Redraw();
+}
+
 void FenceWindow::ApplyConfig(bool recapture) {
     if (!hwnd_ || !cfg_) return;
 
-    const int newHeader = std::clamp(g_config.headerHeight, 26, 80);
+    const int newHeader = std::clamp(g_config.headerHeight, 26, 50);
     const bool newLabels = g_config.showLabels != 0;
     const bool newTitle = g_config.showFenceTitle != 0;
     if (newHeader != headerH_ || newLabels != showLabels_ || newTitle != showTitle_) {
@@ -2711,7 +2744,7 @@ bool FenceWindow::Create(int index, int x, int y, int w, int h) {
 
     width_ = w;
     height_ = h;
-    headerH_ = std::clamp(g_config.headerHeight, 26, 80);
+    headerH_ = std::clamp(g_config.headerHeight, 26, 50);
     showTitle_ = g_config.showFenceTitle != 0;
     showLabels_ = g_config.showLabels != 0;
     cellW_ = CellWForMode(cfg_->viewMode);

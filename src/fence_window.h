@@ -53,6 +53,11 @@ public:
     // recapture = true 时才重新抓取亚克力底图（很贵，拖动滑块时不要带）
     void ApplyConfig(bool recapture = false);
 
+    // 重新抓一次磨砂底图并重绘。换壁纸 / 改分辨率后由主程序调用 ——
+    // 盒子只在创建时抓过底图，壁纸变了不重抓的话磨砂里一直是旧壁纸
+    // （以前只有「拖一下盒子」触发补抓才会更新）。
+    void RecaptureBackdrop();
+
     void Redraw();
     void SetCollapsed(bool collapsed);
     bool collapsed() const { return collapsed_; }
@@ -403,6 +408,10 @@ private:
     POINT pressScreenPt_{0, 0};
     int dragLastX_ = 0;
     int dragLastY_ = 0;
+    // 拖动时「未吸附」的原始位置：鼠标位移直接累加到它上面，吸附只决定窗口摆到
+    // 哪儿。用吸附后的位置去累加会让盒子吸住之后再也走不动（每一帧都被吸回原处）。
+    int dragRawX_ = 0;
+    int dragRawY_ = 0;
     // 上一帧的鼠标屏幕坐标（拖动按每帧位移累计，被挡住的距离不留账）
     POINT dragLastCursor_{0, 0};
     // 系统原生右键菜单正开着：这时鼠标「离开」盒子是正常的，不能自动收起

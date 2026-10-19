@@ -23,7 +23,7 @@ const wchar_t* kClass = L"MeowDeskRenameField";
 
 // ---- 几何（像素）----
 const int kShadow = 10;   // 阴影留白：客户区比输入格每边大这么多
-const int kRound = 4;     // 圆角（贴着图标，比卡片小一号）
+const int kRound = 0;     // 不做圆角（用户要求直角；AddRoundRect 传 0 会退化成矩形）
 const int kPadX = 6;      // 输入格左右内缩：EDIT 比底槽窄，字不贴边框
 const int kPadY = 3;      // 输入格上下内边距
 
@@ -236,13 +236,14 @@ void Paint() {
 
         // 阴影：由外到内叠几层，越外越淡。这些圈是实心圆角矩形往外叠，
         // 同一像素会被好几圈覆盖，所以单圈 alpha 必须压得很低。
+        // 圆角跟输入格一致（现在 kRound = 0，阴影也是直角）。
         for (int i = kShadow; i >= 1; --i) {
             const int a = (i > kShadow - 3) ? 2 : 1;
             GraphicsPath sp;
             AddRoundRect(sp,
                          RectF(body.X - i * 0.5f, body.Y - i * 0.4f + 2.0f,
                                body.Width + i * 1.0f, body.Height + i * 0.9f),
-                         kRound + i * 0.4f);
+                         (float)kRound);
             SolidBrush sb{Color((BYTE)a, 0, 0, 0)};
             g.FillPath(&sb, &sp);
         }
