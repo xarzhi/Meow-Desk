@@ -2,9 +2,10 @@
 rem Package a distributable installer. Same logic as ./make-setup.sh -- no bash
 rem needed, so this works in cmd, PowerShell, and by double-clicking.
 rem
-rem   make-setup.bat              build -> dist\package\ -> zip
-rem   make-setup.bat --no-build   package the exe that is already in build\
-rem   make-setup.bat --help       full help
+rem   make-setup.bat                        build -> dist\package\ -> zip
+rem   make-setup.bat --version 1.2.0        set the version (also saved to version.txt)
+rem   make-setup.bat --no-build             package the exe that is already in build\
+rem   make-setup.bat --help                 full help
 setlocal
 cd /d "%~dp0"
 

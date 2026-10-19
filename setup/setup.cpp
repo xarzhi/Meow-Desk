@@ -27,6 +27,7 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "advapi32.lib")   // 注册表：记住装在哪、什么版本
 
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -55,6 +56,9 @@ const COLORREF kAccent = RGB(0, 103, 192);
 HWND g_path = nullptr, g_browse = nullptr, g_portable = nullptr, g_appdata = nullptr;
 HWND g_group = nullptr, g_install = nullptr, g_cancel = nullptr;
 HWND g_progress = nullptr, g_status = nullptr, g_hint = nullptr;
+// 打包时放在 setup.exe 旁边的 version.txt；没有就空（界面就不显示版本）
+std::wstring g_version;
+bool g_prevFound = false;   // 这台机器上已经有装好的 meow-desk
 HFONT g_font = nullptr, g_fontBold = nullptr;
 bool g_installed = false;
 std::wstring g_installedExe;
@@ -106,6 +110,96 @@ bool EnsureDir(const std::wstring& dir) {
         }
     }
     return GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// ---------------------------------------------------------------------------
+// 「上次装在哪」—— 装完写进 HKCU\Software\meow-desk，再运行安装程序时读回来
+//
+// 只记信息，不建系统卸载入口（卸载仍然是删目录 + 删快捷方式，见安装说明）。
+// 之所以要记：安装位置可以改，光靠「默认路径存不存在」猜不出用户装在哪儿。
+// 老版本（没写过注册表）靠默认路径 + 便携标记文件兜底，照样能认出来。
+// ---------------------------------------------------------------------------
+const wchar_t* kRegKey = L"Software\\meow-desk";
+
+std::wstring RegGetStr(const wchar_t* name) {
+    std::wstring out;
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegKey, 0, KEY_READ, &k) != ERROR_SUCCESS) return out;
+    wchar_t buf[1024]{};
+    DWORD cb = sizeof(buf) - sizeof(wchar_t);
+    DWORD type = 0;
+    if (RegQueryValueExW(k, name, nullptr, &type, (BYTE*)buf, &cb) == ERROR_SUCCESS &&
+        (type == REG_SZ || type == REG_EXPAND_SZ) && cb > 0) {
+        buf[sizeof(buf) / sizeof(wchar_t) - 1] = 0;
+        out = buf;
+    }
+    RegCloseKey(k);
+    return out;
+}
+
+void RegSetStr(const wchar_t* name, const std::wstring& v) {
+    HKEY k = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k,
+                        nullptr) != ERROR_SUCCESS)
+        return;
+    RegSetValueExW(k, name, 0, REG_SZ, (const BYTE*)v.c_str(),
+                   (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(k);
+}
+
+// 安装程序自己旁边的 version.txt（打包时放进去的），没有就空
+std::wstring SetupVersion() {
+    const std::wstring p = ExeDir() + L"\\version.txt";
+    HANDLE f = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return std::wstring();
+    char buf[64]{};
+    DWORD got = 0;
+    ReadFile(f, buf, sizeof(buf) - 1, &got, nullptr);
+    CloseHandle(f);
+    std::wstring w;
+    for (DWORD i = 0; i < got; ++i) {
+        const unsigned char c = (unsigned char)buf[i];
+        if (c < 32 || c >= 127) break;   // 只收一行 ASCII
+        w += (wchar_t)c;
+    }
+    while (!w.empty() && (w.back() == L' ' || w.back() == L'\t')) w.pop_back();
+    return w;
+}
+
+struct PrevInstall {
+    bool found = false;
+    std::wstring dir;
+    std::wstring version;
+    bool portable = false;
+};
+
+PrevInstall DetectPrevInstall() {
+    PrevInstall p;
+    auto hasExe = [](const std::wstring& d) {
+        return !d.empty() &&
+               GetFileAttributesW((d + L"\\meow-desk.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
+    };
+    std::wstring dir = RegGetStr(L"InstallDir");
+    if (!hasExe(dir)) dir = DefaultInstallDir();   // 老版本没记录：试试默认路径
+    if (!hasExe(dir)) return p;
+    p.found = true;
+    p.dir = dir;
+    p.version = RegGetStr(L"Version");
+    // 便携与否以标记文件为准 —— 主程序 storage::Dir() 就是看这个文件，
+    // 注册表里那一份只是顺手记的，用户手动删标记时不能骗自己。
+    p.portable =
+        GetFileAttributesW((dir + L"\\meow-desk.portable").c_str()) != INVALID_FILE_ATTRIBUTES;
+    return p;
+}
+
+// 装完把「装在哪 / 什么版本 / 数据在哪」记下来，下次运行安装程序时预填
+void RememberInstall(const std::wstring& dir, bool portable) {
+    RegSetStr(L"InstallDir", dir);
+    RegSetStr(L"Version", g_version);
+    RegSetStr(L"DataDir", portable ? dir
+                                   : KnownFolder(FOLDERID_RoamingAppData) + L"\\meow-desk");
+    RegSetStr(L"Portable", portable ? L"1" : L"0");
 }
 
 void SetStatus(const wchar_t* text, int percent) {
@@ -249,6 +343,9 @@ void DoInstall(HWND hwnd) {
     g_installed = true;
     g_installedExe = dst;
 
+    // 记住这次装到哪 —— 下次运行安装程序直接把这些值填回去
+    RememberInstall(dir, PortableSelected());
+
     SetWindowTextW(g_install, L"\u7acb\u5373\u8fd0\u884c");
     EnableWindow(g_install, TRUE);
     EnableWindow(g_cancel, TRUE);
@@ -281,12 +378,19 @@ HWND Child(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style, in
     return h;
 }
 
+void RefreshDataInfo();   // 定义在 CreateControls 后面
+
 void CreateControls(HWND h) {
     MakeFonts();
 
     g_path = Child(h, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_PATH);
     SendMessageW(g_path, WM_SETFONT, (WPARAM)g_font, TRUE);
-    SetWindowTextW(g_path, DefaultInstallDir().c_str());
+
+    // 装过就直接显示上次装的路径（注册表里有，或者默认路径下真有一个 meow-desk.exe），
+    // 没装过才用默认值 —— 否则升级时用户得自己再找一遍装在哪。
+    const PrevInstall prev = DetectPrevInstall();
+    g_prevFound = prev.found;
+    SetWindowTextW(g_path, (prev.found ? prev.dir : DefaultInstallDir()).c_str());
 
     g_browse = Child(h, L"BUTTON", L"\u6d4f\u89c8\u2026", WS_TABSTOP | BS_PUSHBUTTON, IDC_BROWSE);
 
@@ -303,6 +407,13 @@ void CreateControls(HWND h) {
                       L"\u4e0e\u4e4b\u524d\u7248\u672c\u4e00\u81f4\uff09",
                       WS_TABSTOP | BS_AUTORADIOBUTTON | BS_MULTILINE, IDC_APPDATA);
     SendMessageW(g_appdata, BM_SETCHECK, BST_CHECKED, 0);   // 默认保持现状
+
+    // 上次装的是便携模式就把「与程序同目录」选上，和现有数据对得上；
+    // 单选按钮程序化勾选不会自动互斥，这里手动把另一个清掉。
+    if (prev.found && prev.portable) {
+        SendMessageW(g_portable, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(g_appdata, BM_SETCHECK, BST_UNCHECKED, 0);
+    }
 
     g_progress = Child(h, PROGRESS_CLASSW, L"", PBS_SMOOTH, IDC_PROGRESS);
     SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
@@ -321,6 +432,37 @@ void CreateControls(HWND h) {
     SendMessageW(g_cancel, WM_SETFONT, (WPARAM)g_font, TRUE);
 
     SetFocus(g_install);
+
+    // 文案里带上真实路径（装过的话这就是上次的位置）
+    RefreshDataInfo();
+
+    if (g_prevFound) {
+        // 检测到已安装：把版本和「已填好」说清楚，按钮也改成「重新安装」
+        std::wstring msg = L"\u5df2\u68c0\u6d4b\u5230\u5b89\u88c5\uff1a";
+        msg += (prev.version.empty() ? L"\u5df2\u586b\u5165\u4e0a\u6b21\u7684\u4f4d\u7f6e"
+                                     : L"v" + prev.version + L"\uff0c\u5df2\u586b\u5165\u4e0a\u6b21\u7684\u4f4d\u7f6e");
+        SetWindowTextW(g_hint, msg.c_str());
+        SetWindowTextW(g_install, L"\u91cd\u65b0\u5b89\u88c5");
+    }
+}
+
+// 把两个单选项的文案换成「真实路径」：便携 = 安装目录，默认 = %APPDATA%\meow-desk。
+// 这样用户一眼能看到数据到底写到哪，装过的话这里显示的就是上次的位置。
+// 安装路径一改（手输或浏览）就跟着刷新。
+void RefreshDataInfo() {
+    if (!g_portable || !g_appdata) return;   // 控件还没建好（CreateControls 中途触发）
+    std::wstring dir = ReadPath();
+    if (dir.empty()) dir = DefaultInstallDir();
+    while (!dir.empty() && dir.back() == L'\\') dir.pop_back();
+
+    std::wstring appdata = KnownFolder(FOLDERID_RoamingAppData) + L"\\meow-desk";
+
+    SetWindowTextW(g_portable, (L"\u4e0e\u7a0b\u5e8f\u540c\u76ee\u5f55"
+                                L"\uff08\u4fbf\u643a\u6a21\u5f0f\uff09\n" +
+                                dir)
+                                   .c_str());
+    SetWindowTextW(g_appdata, (L"%APPDATA%\\meow-desk\uff08\u9ed8\u8ba4\uff09\n" + appdata)
+                                  .c_str());
 }
 
 void LayoutChildren(HWND h) {
@@ -332,9 +474,10 @@ void LayoutChildren(HWND h) {
     MoveWindow(g_path, pad, 96, W - pad * 2 - 96, 30, TRUE);
     MoveWindow(g_browse, W - pad - 84, 96, 84, 30, TRUE);
 
-    MoveWindow(g_group, pad, 148, W - pad * 2, 116, TRUE);
-    MoveWindow(g_portable, pad + 16, 176, W - pad * 2 - 34, 28, TRUE);
-    MoveWindow(g_appdata, pad + 16, 212, W - pad * 2 - 34, 28, TRUE);
+    // 单选项里写着真实路径（两行），所以要比单行高一些
+    MoveWindow(g_group, pad, 148, W - pad * 2, 132, TRUE);
+    MoveWindow(g_portable, pad + 16, 170, W - pad * 2 - 34, 40, TRUE);
+    MoveWindow(g_appdata, pad + 16, 212, W - pad * 2 - 34, 40, TRUE);
 
     MoveWindow(g_progress, pad, 288, W - pad * 2, 8, TRUE);
     MoveWindow(g_status, pad, 302, W - pad * 2, 22, TRUE);
@@ -385,8 +528,10 @@ void PaintWindow(HWND h) {
     HGDIOBJ old = SelectObject(dc, g_fontBold);
     SetTextColor(dc, kFg);
     RECT tr{44, 24, rc.right - 26, 56};
-    DrawTextW(dc, L"meow-desk \u5b89\u88c5\u7a0b\u5e8f", -1, &tr,
-              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    std::wstring title = L"meow-desk \u5b89\u88c5\u7a0b\u5e8f";
+    if (!g_version.empty()) title += L"  v" + g_version;
+    DrawTextW(dc, title.c_str(), -1, &tr,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
 
     SelectObject(dc, g_font);
     SetTextColor(dc, kFgDim);
@@ -446,6 +591,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         switch (LOWORD(w)) {
         case IDC_BROWSE:
             PickFolder(h);
+            RefreshDataInfo();
+            return 0;
+        case IDC_PATH:
+            // 手输 / 浏览改了安装路径 → 便携模式那一项里显示的路径跟着变
+            if (HIWORD(w) == EN_CHANGE) RefreshDataInfo();
             return 0;
         case IDC_INSTALL:
             if (g_installed) {
@@ -504,6 +654,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     CreateMutexW(nullptr, TRUE, L"meow-desk-setup-singleton");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
+    // 打包时放在 setup.exe 旁边的 version.txt（没放也能跑，只是不显示版本）
+    g_version = SetupVersion();
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
@@ -529,8 +682,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, 0);
     const int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
 
+    std::wstring cap = L"meow-desk \u5b89\u88c5\u7a0b\u5e8f";
+    if (!g_version.empty()) cap += L" v" + g_version;
     HWND h = CreateWindowExW(
-        0, L"MeowDeskSetup", L"meow-desk \u5b89\u88c5\u7a0b\u5e8f",
+        0, L"MeowDeskSetup", cap.c_str(),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
         (sw - ww) / 2, (sh - wh) / 2, ww, wh, nullptr, nullptr, inst, nullptr);
     if (!h) return 1;

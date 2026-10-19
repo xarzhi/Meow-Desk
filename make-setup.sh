@@ -3,6 +3,7 @@
 # 所以 cmd / PowerShell 里用 make-setup.bat 效果完全一样。
 #
 #   ./make-setup.sh              编译 → dist/package/ → zip
+#   ./make-setup.sh --version 1.2.0   指定版本号（写回 version.txt，下次继续用）
 #   ./make-setup.sh --no-build   不编译，用 build/ 里现成的 exe 打包
 #   ./make-setup.sh --help       完整说明
 set -u
