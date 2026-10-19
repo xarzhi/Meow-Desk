@@ -63,6 +63,9 @@ enum : int {
     ID_AUTOSTART = 43,
     ID_HIGHPRIORITY = 44,
     ID_SNAP = 45,        // 自动吸附
+    ID_BG_SOLID = 46,    // 盒子背景三档：纯色 / 透明 / 亚克力
+    ID_BG_TRANS = 47,
+    ID_BG_ACRYLIC = 48,
     ID_NAV0 = 60,     // 60..64 = 导航项
     // 规则行的 EDIT 子控件：5000 + 行号*2（名字）/ +1（扩展名）
     ID_RULE_EDIT = 5000,
@@ -213,9 +216,16 @@ void SettingsWindow::Layout() {
         const int tl = kContentX + 112;
         const int tr = kContentX + kCardW - 24;
         rcRadius_ = RECT{tl, c1 + 100, tr, c1 + 130};
-        rcAlpha_ = RECT{tl, c1 + 152, tr, c1 + 182};
-        rcHeaderH_ = RECT{tl, c1 + 204, tr, c1 + 234};
-        rcAcrylic_ = RECT{tr - 36, c1 + 250, tr, c1 + 272};
+        // 盒子背景三档（纯色 / 透明 / 亚克力）：横排三个分段按钮
+        const int segW = (tr - tl - 16) / 3;
+        for (int i = 0; i < 3; ++i) {
+            rcBgMode_[i] = RECT{tl + i * (segW + 8), c1 + 148, tl + i * (segW + 8) + segW,
+                                c1 + 180};
+        }
+        rcAlpha_ = RECT{tl, c1 + 204, tr, c1 + 234};   // 仅「透明」档可调
+        rcHeaderH_ = RECT{tl, c1 + 256, tr, c1 + 286};
+        // 档位说明 + 内存提示放在卡片底部一行
+        rcAcrylic_ = RECT{tl, c1 + 300, tr, c1 + 318};
 
         const int c2 = 436;
         rcShowLabels_ = RECT{tr - 36, c2 + 62, tr, c2 + 84};
@@ -275,9 +285,11 @@ int SettingsWindow::HitTest(POINT pt) const {
             if (in(swatches_[i], 4, 4)) return ID_SWATCH0 + i;
         }
         if (in(rcRadius_, 0, 8)) return ID_RADIUS;
+        if (in(rcBgMode_[0], 0, 8)) return ID_BG_SOLID;
+        if (in(rcBgMode_[1], 0, 8)) return ID_BG_TRANS;
+        if (in(rcBgMode_[2], 0, 8)) return ID_BG_ACRYLIC;
         if (in(rcAlpha_, 0, 8)) return ID_ALPHA;
         if (in(rcHeaderH_, 0, 8)) return ID_HEADER_H;
-        if (in(rcAcrylic_, 150, 16)) return ID_ACRYLIC;
         if (in(rcShowLabels_, 150, 16)) return ID_SHOW_LABELS;
         if (in(rcShowFenceTitle_, 150, 16)) return ID_SHOW_FENCE_TITLE;
         break;
@@ -662,13 +674,53 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         drawSlider(rcRadius_, 0, kRadiusMax, std::min(radius, kRadiusMax),
                    std::to_wstring(std::min(radius, kRadiusMax)));
 
+        // ---- 盒子背景三档：纯色 / 透明 / 亚克力 ----
+        // 纯色 = 完全不透明，不抓屏不磨砂，内存最低；
+        // 透明 = 半透明着色，不磨砂；
+        // 亚克力 = 模糊壁纸打底，要抓屏 + 磨砂，内存最高。
+        const int bgMode = acrylic ? 2 : (alpha >= 255 ? 0 : 1);
+        static const wchar_t* kBgNames[3] = {L"\u7eaf\u8272", L"\u900f\u660e",
+                                             L"\u4e9a\u514b\u529b"};
+        g.DrawString(L"\u76d2\u5b50\u80cc\u666f", -1, &fBody,
+                     RectF((float)kRowLeft, (float)(rcBgMode_[0].top - 10), 320.0f, 26.0f),
+                     &sf, &brText);
+        for (int i = 0; i < 3; ++i) {
+            const RECT& r = rcBgMode_[i];
+            const bool sel = (bgMode == i);
+            GraphicsPath seg;
+            AddRound(seg, RectF((float)r.left, (float)r.top,
+                                (float)(r.right - r.left), (float)(r.bottom - r.top)),
+                     8.0f);
+            SolidBrush segFill(C(sel ? t.accent : t.track));
+            g.FillPath(&segFill, &seg);
+            if (!sel) {
+                Pen segPen(C(dark_ ? RGB(90, 90, 90) : RGB(200, 200, 200)), 1.0f);
+                g.DrawPath(&segPen, &seg);
+            }
+            SolidBrush segText(C(sel ? RGB(255, 255, 255) : t.text));
+            StringFormat sfSeg;
+            sfSeg.SetAlignment(StringAlignmentCenter);
+            sfSeg.SetLineAlignment(StringAlignmentCenter);
+            sfSeg.SetFormatFlags(StringFormatFlagsNoWrap);
+            g.DrawString(kBgNames[i], -1, &fBody,
+                         RectF((float)r.left, (float)r.top,
+                               (float)(r.right - r.left), (float)(r.bottom - r.top)),
+                         &sfSeg, &segText);
+        }
+
+        // 透明度滑块：只有「透明」档才生效，其它档置灰（值固定 255）
         g.DrawString(L"\u900f\u660e\u5ea6", -1, &fBody,
                      RectF((float)kRowLeft, (float)rcAlpha_.top, 90.0f, 30.0f), &sf,
                      &brText);
         {
             wchar_t buf[16];
-            swprintf_s(buf, L"%d%%", (int)std::lround(alpha * 100.0 / 255.0));
-            drawSlider(rcAlpha_, 40, 255, alpha, buf);
+            if (bgMode == 1) {
+                swprintf_s(buf, L"%d%%", (int)std::lround(alpha * 100.0 / 255.0));
+                drawSlider(rcAlpha_, 40, 255, alpha, buf);
+            } else {
+                // 纯色 / 亚克力档：透明度滑块置灰，不响应
+                drawSlider(rcAlpha_, 40, 255, 255, L"100%");
+            }
         }
 
         g.DrawString(L"\u5934\u90e8\u9ad8\u5ea6", -1, &fBody,
@@ -678,14 +730,24 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         drawSlider(rcHeaderH_, 26, 50, std::clamp(g_config.headerHeight, 26, 50),
                    std::to_wstring(std::clamp(g_config.headerHeight, 26, 50)) + L" px");
 
-        g.DrawString(L"Win11 \u4e9a\u514b\u529b\u6548\u679c", -1, &fBody,
-                     RectF((float)kRowLeft, (float)(rcAcrylic_.top - 10), 300.0f, 26.0f),
-                     &sf, &brText);
-        g.DrawString(L"\u6a21\u7cca\u80cc\u666f\uff0c\u66f4\u63a5\u8fd1\u7cfb\u7edf\u539f\u751f\u8d28\u611f",
-                     -1, &fSub,
-                     RectF((float)kRowLeft, (float)(rcAcrylic_.top + 12), 340.0f, 16.0f),
-                     &sf, &brSub);
-        drawToggle(rcAcrylic_, acrylic);
+        // 档位说明 + 内存提示
+        {
+            const wchar_t* hint;
+            switch (bgMode) {
+            case 0:
+                hint = L"\u5185\u5b58\u5360\u7528\u6700\u4f4e\uff1a\u4e0d\u6293\u5c4f\u3001\u4e0d\u6a21\u7cca";
+                break;
+            case 1:
+                hint = L"\u534a\u900f\u660e\u7740\u8272\uff0c\u4e0d\u6a21\u7cca\uff0c\u5185\u5b58\u5360\u7528\u8f83\u4f4e";
+                break;
+            default:
+                hint = L"\u6a21\u7cca\u80cc\u666f\u9700\u8981\u5b9e\u65f6\u6293\u5c4f\uff0c\u4f1a\u660e\u663e\u589e\u52a0\u5185\u5b58\u5360\u7528";
+                break;
+            }
+            g.DrawString(hint, -1, &fSub,
+                         RectF((float)kRowLeft, (float)(rcAcrylic_.top - 4), 460.0f, 18.0f),
+                         &sf, &brSub);
+        }
 
         const int c2 = 436;
         drawCard(c2, 170);
@@ -1080,11 +1142,19 @@ void SettingsWindow::Paint() {
 // ---------------------------------------------------------------------------
 void SettingsWindow::Toggle(int id) {
     switch (id) {
-    case ID_ACRYLIC: {
-        const int nv = g_config.fences.empty() ? 1 : (g_config.fences[0].acrylic ? 0 : 1);
-        for (auto& f : g_config.fences) f.acrylic = nv;
+    case ID_BG_SOLID:    // 纯色：完全不透明，不抓屏不磨砂，内存最低
+        for (auto& f : g_config.fences) { f.acrylic = 0; f.alpha = 255; }
         break;
-    }
+    case ID_BG_TRANS:    // 透明：半透明着色，不磨砂
+        for (auto& f : g_config.fences) {
+            f.acrylic = 0;
+            // 从纯色切回来时给回默认半透明（255 就完全不透明了）
+            if (f.alpha >= 255) f.alpha = 236;
+        }
+        break;
+    case ID_BG_ACRYLIC:  // 亚克力：模糊壁纸打底，要抓屏，内存最高
+        for (auto& f : g_config.fences) f.acrylic = 1;
+        break;
     case ID_SHADOW: g_config.textShadow = g_config.textShadow ? 0 : 1; break;
     case ID_ARROW: g_config.shortcutArrow = g_config.shortcutArrow ? 0 : 1; break;
     case ID_SHOW_LABELS: g_config.showLabels = g_config.showLabels ? 0 : 1; break;
@@ -1394,6 +1464,15 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == ID_RADIUS || id == ID_ALPHA || id == ID_HEADER_H) {
+            // 透明度滑块只在「透明」档生效；纯色/亚克力档置灰，点它不响应
+            if (id == ID_ALPHA) {
+                const int acrylic =
+                    g_config.fences.empty() ? 0 : g_config.fences[0].acrylic;
+                const int alpha =
+                    g_config.fences.empty() ? 236 : g_config.fences[0].alpha;
+                const int bgMode = acrylic ? 2 : (alpha >= 255 ? 0 : 1);
+                if (bgMode != 1) return 0;
+            }
             sliderDrag_ = id;
             SetCapture(h);
             SendMessageW(h, WM_MOUSEMOVE, 0, lp);   // 立刻按点击位置设值

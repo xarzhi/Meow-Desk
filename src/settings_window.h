@@ -109,6 +109,7 @@ private:
     RECT rcAlpha_{};
     RECT rcHeaderH_{};
     RECT rcAcrylic_{};
+    RECT rcBgMode_[3]{};   // 盒子背景三档：纯色 / 透明 / 亚克力（分段选择）
     RECT rcShowLabels_{};
     RECT rcShowFenceTitle_{};
     // ---- 交互 ----

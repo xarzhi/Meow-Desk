@@ -1320,6 +1320,29 @@ static void ApplyHighPriority(bool on) {
 }
 
 // ---------------------------------------------------------------------------
+// 空闲内存回收
+//
+// 任务管理器里的「内存」是工作集（Working Set），里面除了真正在用的私有页，
+// 还堆着大量「抓屏 / 缩略图解码 / 模糊」临时分配过后没被系统收回去的页。
+// 在真正空闲（没有拖动、没有正在抓的底图）时，把这些页交还给系统 —— 数字会
+// 明显降下来，且不影响任何功能：下次真要用时系统会按需再映射。
+//
+// 只在「足够久没动静」时才做一次，绝不在拖动 / 动画中做（那会害它重新加载
+// 整屏 DIB，反而卡）。频率控制在 ~30 秒一次。
+// ---------------------------------------------------------------------------
+static DWORD g_lastTrim = 0;
+static void TrimWorkingSetIfIdle() {
+    // 拖动 / 改尺寸期间绝不裁剪（帧泵停着、UI 在抢帧）
+    for (auto& f : g_fences)
+        if (f && f->IsGeometryBusy()) return;
+    const DWORD now = GetTickCount();
+    if ((int)(now - g_lastTrim) < 30000) return;
+    g_lastTrim = now;
+    // 只回收「可重新加载」的页：把工作集里最近没碰过的页标成软页
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+}
+
+// ---------------------------------------------------------------------------
 // 盒子右键菜单（自绘）——「新建盒子 / 新建文件夹 / 排序方式 / 查看 /
 // 打开设置面板 / 重命名分区」。排序方式、查看带二级菜单，和资源管理器一致。
 // ---------------------------------------------------------------------------
@@ -2797,6 +2820,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         SetBackdropFrameRegion(have ? &want : nullptr);
         // busy（拖动 / 改尺寸）期间一律不抓屏：那几帧要和鼠标赛跑，绝不能抢 GDI 锁
         SetBackdropFramePaused(busy);
+        // 空闲时回收工作集（任务管理器「内存」列会明显降下来）
+        if (!busy) TrimWorkingSetIfIdle();
     };
 
     RestoreZOrder();
