@@ -27,6 +27,21 @@ struct IconBitmap {
 bool LoadShellIcon(const std::wstring& path, int size, IconBitmap& out,
                    bool linkOverlay = false);
 
+// 从 Shell 加载**缩略图**（图片 / 视频 / 音乐内嵌封面 / PDF 等）。
+//
+// 和 LoadShellIcon 的区别只有一点：走 SIIGBF_THUMBNAILONLY，也就是「只要真缩略图，
+// 不要类型图标」。没有缩略图可取的（普通 exe、没有封面的 mp3、文件夹）直接返回
+// false —— 调用方保留已经加载好的类型图标即可。
+//
+// 成功时 out 一定是 size×size 的正方形：Shell 给的缩略图保持原比例（宽图会回来
+// 48×27 这种），这里居中补一圈透明边。桌面和盒子的排版都假设「图标位图是正方形」，
+// 不补的话图标会顶在格子左上角、标题跟着上移，跟旁边的图标对不齐。
+//
+// 这条比 LoadShellIcon 慢得多（要解码图片 / 抽视频帧，几十到几百毫秒），
+// **不要直接在 UI 线程上调**，走 thumb_loader.h 的后台队列。
+bool LoadShellThumbnail(const std::wstring& path, int size, IconBitmap& out,
+                        bool linkOverlay = false);
+
 // 是否是快捷方式（.lnk / .url）
 bool IsShortcutPath(const std::wstring& path);
 

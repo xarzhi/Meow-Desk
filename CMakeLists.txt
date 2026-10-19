@@ -106,6 +106,7 @@ add_executable(meow-desk WIN32
     src/main.cpp
     src/desktop_icons.cpp
     src/shell_icons.cpp
+    src/thumb_loader.cpp
     src/icon_render.cpp
     src/desktop_surface.cpp
     src/drag_layer.cpp

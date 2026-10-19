@@ -192,6 +192,36 @@ static void ApplyLinkOverlay(IconBitmap& icon) {
     std::memcpy(icon.pixels.data(), base.bits, icon.pixels.size());
 }
 
+// 把任意比例的位图居中放进 size×size 的正方形（透明边）。
+//
+// Shell 的缩略图是**保持原比例**的：4000×3000 的照片请求 48×48 会回来 48×36，
+// 视频封面、专辑封面同理。而桌面和盒子的排版全都按「正方形图标」算位置
+// （标题贴着图标底边、格子居中），所以必须在这里补成方的。
+static bool FitIntoSquare(const IconBitmap& src, int size, IconBitmap& out) {
+    if (src.width <= 0 || src.height <= 0 || size <= 0) return false;
+    if (src.width == size && src.height == size) {
+        out = src;
+        return true;
+    }
+    out.width = size;
+    out.height = size;
+    out.pixels.assign((size_t)size * (size_t)size * 4, 0);
+    const int w = src.width < size ? src.width : size;
+    const int h = src.height < size ? src.height : size;
+    const int ox = (size - w) / 2;
+    const int oy = (size - h) / 2;
+    // 源比目标还大（理论上不带 SIIGBF_BIGGERSIZEOK 不会发生）：居中裁一刀
+    const int cx = (src.width - w) / 2;
+    const int cy = (src.height - h) / 2;
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* s = src.pixels.data() +
+                           ((size_t)(y + cy) * (size_t)src.width + (size_t)cx) * 4;
+        uint8_t* d = out.pixels.data() + ((size_t)(y + oy) * (size_t)size + (size_t)ox) * 4;
+        std::memcpy(d, s, (size_t)w * 4);
+    }
+    return true;
+}
+
 bool LoadShellIcon(const std::wstring& path, int size, IconBitmap& out, bool linkOverlay) {
     out = IconBitmap{};
 
@@ -225,6 +255,36 @@ bool LoadShellIcon(const std::wstring& path, int size, IconBitmap& out, bool lin
     if (!ok) return false;
 
     NormalizePremultiplied(out);
+    if (linkOverlay && IsShortcutPath(path)) ApplyLinkOverlay(out);
+    return true;
+}
+
+bool LoadShellThumbnail(const std::wstring& path, int size, IconBitmap& out,
+                        bool linkOverlay) {
+    out = IconBitmap{};
+    if (size <= 0) return false;
+
+    IShellItemImageFactory* factory = nullptr;
+    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr,
+                                           IID_IShellItemImageFactory, (void**)&factory)) ||
+        !factory)
+        return false;
+
+    SIZE sz{size, size};
+    HBITMAP hbmp = nullptr;
+    // 只要真缩略图。取不到就失败，交给调用方留着类型图标 ——
+    // 退回 SIIGBF_ICONONLY 只会把「类型图标」再画一遍，白花一次提取。
+    const HRESULT hr = factory->GetImage(sz, SIIGBF_THUMBNAILONLY, &hbmp);
+    factory->Release();
+    if (FAILED(hr) || !hbmp) return false;
+
+    IconBitmap raw;
+    const bool ok = BitmapToPixels(hbmp, raw);
+    DeleteObject(hbmp);
+    if (!ok) return false;
+
+    NormalizePremultiplied(raw);
+    if (!FitIntoSquare(raw, size, out)) return false;
     if (linkOverlay && IsShortcutPath(path)) ApplyLinkOverlay(out);
     return true;
 }

@@ -439,6 +439,30 @@ void DesktopSurface::InvalidateCache() {
     Redraw();
 }
 
+void DesktopSurface::RefreshIconBitmaps(const std::vector<DesktopIconView*>& list) {
+    if (!impl_ || list.empty()) return;
+    RECT dirty{};
+    bool any = false;
+    for (DesktopIconView* e : list) {
+        if (!e) continue;
+        impl_->icons.erase(e);        // 位图换了，那张 IconDib 就作废了
+        if (!e->OnDesktop()) continue; // 盒子里的由盒子自己 Redraw
+        const int ex = e->pos.x - origin_.x;
+        const int ey = e->pos.y - origin_.y;
+        const RECT r{ex, ey, ex + cellW_, ey + cellH_};
+        if (!any) {
+            dirty = r;
+            any = true;
+        } else {
+            dirty.left = std::min(dirty.left, r.left);
+            dirty.top = std::min(dirty.top, r.top);
+            dirty.right = std::max(dirty.right, r.right);
+            dirty.bottom = std::max(dirty.bottom, r.bottom);
+        }
+    }
+    if (any) RepaintCells(dirty);
+}
+
 POINT DesktopSurface::AutoGridAnchor(POINT nearPt) const {
     // 资源管理器的桌面图标网格有自己的左上留白，格子不是从屏幕 (0,0) 起算的，
     // 直接对绝对坐标 round(x/cw)*cw 会让图标落下时整体偏掉半格甚至更多。

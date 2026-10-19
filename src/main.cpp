@@ -28,6 +28,7 @@
 #include "shell_drag.h"
 #include "shell_icons.h"
 #include "storage.h"
+#include "thumb_loader.h"
 #include "tray.h"
 #include "zorder.h"
 
@@ -216,16 +217,35 @@ static void CommitPositions(const std::vector<DesktopIconView*>& list) {
     }
 }
 
+// 图标位图该多大：桌面上固定 kIconPx；盒子里跟着那个盒子的查看档位
+// （「大图标」就真的加载 64px 的位图，小图标 32px）。
+static int IconPxFor(const DesktopIconView* e) {
+    if (e && e->owner >= 0 && e->owner < (int)g_fences.size() && g_fences[e->owner])
+        return g_fences[e->owner]->iconPx();
+    return kIconPx;
+}
+
+// 加载一个图标的位图。
+//
+// 分两步，都是为了让界面「立刻可用」：
+//   1. 同步放**类型图标**（LoadShellIcon，毫秒级）；
+//   2. 把**缩略图**排进后台队列 —— 图片 / 视频 / 音乐（带内嵌封面）这类文件
+//      过一会儿会被换成真缩略图（见 DrainThumbnails）。取不到缩略图的
+//      （exe、没有封面的 mp3、文件夹）就保持类型图标不变。
+static void LoadIconFor(DesktopIconView* e, int px) {
+    if (!e || px <= 0) return;
+    LoadShellIcon(e->path, px, e->bmp, g_config.shortcutArrow != 0);
+    RequestThumbnail(e->path, px, g_config.shortcutArrow != 0);
+}
+
 // 图标的位图尺寸跟着「所属盒子」的查看档位走：
 // 盒子里是「大图标」就真的加载 64px 的位图，回到桌面再换回 48px。
 // 只对盒子里的图标做（数量有限），桌面上 200 个图标始终是 48px。
 static void FitIconToOwner(DesktopIconView* e) {
     if (!e) return;
-    int px = kIconPx;
-    if (e->owner >= 0 && e->owner < (int)g_fences.size() && g_fences[e->owner])
-        px = g_fences[e->owner]->iconPx();
+    const int px = IconPxFor(e);
     if (e->bmp.width == px && e->bmp.height == px) return;
-    LoadShellIcon(e->path, px, e->bmp, g_config.shortcutArrow != 0);
+    LoadIconFor(e, px);
 }
 
 // 某个盒子换了查看档位：把它的图标位图统一换到新尺寸
@@ -550,12 +570,43 @@ static void UpdateAllDropHints(POINT pt) {
 // ---------------------------------------------------------------------------
 static void ApplyIconAppearance() {
     for (auto* e : g_icons) {
-        if (e) LoadShellIcon(e->path, kIconPx, e->bmp, g_config.shortcutArrow != 0);
+        if (e) LoadIconFor(e, IconPxFor(e));
     }
     // 盒子里可能是「大图标」，刚被统一成 48px 的得换回去
     for (int i = 0; i < (int)g_fences.size(); ++i) EnsureFenceIconSize(i);
     g_surface.InvalidateCache();
     for (auto& f : g_fences) if (f) f->Redraw();
+}
+
+// 后台缩略图回来了（工作线程 PostThreadMessage 叫醒的，见 thumb_loader.h）。
+//
+// 只做两件事：换位图、重画受影响的那几格。**不要整屏重画** —— 启动时几十个
+// 缩略图是陆续回来的，每次都整屏重画等于把启动拖慢一倍。
+// 取不到缩略图的结果（普通 exe、没有封面的音频、文件夹）直接丢掉，
+// 那些图标继续用类型图标。
+static void DrainThumbnails() {
+    ThumbResult r;
+    std::vector<DesktopIconView*> touched;
+    std::vector<int> fences;
+    while (TakeThumbnail(r)) {
+        if (!r.bmp.valid()) continue;
+        for (auto* e : g_icons) {
+            if (!e || e->path != r.path) continue;
+            // 只替换「尺寸对得上」的那张位图。取缩略图期间用户可能切了查看档位
+            // （48 → 64），那份 48px 的缩略图就过期了，硬套上去会跟格子对不齐；
+            // 新档位那边重新排的单会自己回来。
+            if (e->bmp.valid() && e->bmp.width != r.px) continue;
+            e->bmp = std::move(r.bmp);            // 一个 path 只对应一个图标，move 安全
+            touched.push_back(e);
+            if (!e->OnDesktop() && e->owner >= 0 &&
+                std::find(fences.begin(), fences.end(), e->owner) == fences.end())
+                fences.push_back(e->owner);
+        }
+    }
+    if (touched.empty()) return;
+    g_surface.RefreshIconBitmaps(touched);
+    for (int fi : fences)
+        if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) g_fences[fi]->Redraw();
 }
 
 // 重新枚举真实桌面（位置可能被用户在外部改了）
@@ -602,7 +653,7 @@ static void ReloadDesktopIcons(bool keepPositions = false) {
         // 不能都堆在左上角压着别的图标
         e->pos = (it.pos.x >= 0 && it.pos.y >= 0) ? it.pos : g_surface.FirstFreeCell({});
         e->dragPos = e->pos;
-        LoadShellIcon(e->path, kIconPx, e->bmp, g_config.shortcutArrow != 0);
+        LoadIconFor(e.get(), kIconPx);
         e->pidl = it.pidl;
         seen.push_back(e.get());
         g_icons.push_back(e.get());
@@ -832,6 +883,9 @@ static DWORD AcceptDroppedFiles(const std::vector<std::wstring>& paths, POINT sc
 // 不能当场枚举：拖放回调返回之后调用方还要收尾，这时候把图标对象析构掉会用到悬空指针。
 static const UINT kMsgReloadIcons = WM_APP + 9;
 static void RequestIconReload() { PostMessageW(nullptr, kMsgReloadIcons, 0, 0); }
+
+// 后台缩略图出来了（见 thumb_loader.h）。工作线程 PostThreadMessage 叫醒消息循环。
+static const UINT kMsgThumbReady = WM_APP + 11;
 
 // 松手点下面的图标：先看盒子（盒子盖在桌面层上面），再看桌面层
 static DesktopIconView* IconAtScreen(POINT pt) {
@@ -2367,6 +2421,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_lastAcrylic = g_config.fences.empty() ? 0 : g_config.fences[0].acrylic;
 
     // 2. 图标
+    // 缩略图队列要知道「结果回来说给谁听」：UI 线程 + 一条自定义消息。
+    // 必须赶在第一批图标加载之前 —— 它同时也是「GDI+ 已经起来了」的保证。
+    InitThumbnailLoader(GetCurrentThreadId(), kMsgThumbReady);
     auto items = EnumerateDesktopIcons();
     LogStep("enum icons: " + std::to_string(items.size()) + " diag: " + LastEnumDiag());
     // 诊断用：跳过位图加载，用来分离「图标数据」占的内存
@@ -2378,7 +2435,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         e->name = it.name;
         e->pos = it.pos;
         e->dragPos = it.pos;
-        if (!probeNoIcon) LoadShellIcon(e->path, kIconPx, e->bmp, g_config.shortcutArrow != 0);
+        if (!probeNoIcon) LoadIconFor(e.get(), kIconPx);
         e->pidl = it.pidl;
         g_icons.push_back(e.get());
         g_iconStore.push_back(std::move(e));
@@ -2730,6 +2787,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (msg.message == kMsgReloadIcons) {
             ReloadDesktopIcons(true);
             RedrawAll();
+            continue;
+        }
+        // 后台缩略图回来了：把类型图标换成真缩略图（图片 / 视频 / 音乐封面）
+        if (msg.message == kMsgThumbReady) {
+            DrainThumbnails();
             continue;
         }
         TranslateMessage(&msg);
