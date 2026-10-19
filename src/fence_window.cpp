@@ -2610,7 +2610,11 @@ void FenceWindow::Paint() {
             const std::vector<RECT> tabs = TabRects();
             const int act = activeGroup();
             FontFamily family(L"Microsoft YaHei UI");
-            const int fontPx = (headerH_ >= 40) ? 14 : 13;
+            // 13px → 14px：特意渲染过对照图（13/14/15/16 各画一行），
+            // 灰度抗锯齿下 13px 的汉字笔画太细，糊在模糊壁纸上就是「看不清」；
+            // 14px 明显变实，15px 在 24px 高的胶囊里又开始挤。
+            // ClearType 用不了（per-pixel alpha 分层窗口会出色边），只能靠字号。
+            const int fontPx = (headerH_ >= 40) ? 15 : 14;
             Font tabFont(&family, (float)fontPx, FontStyleRegular, UnitPixel);
             Font tabFontBold(&family, (float)fontPx, FontStyleBold, UnitPixel);
 
@@ -2648,23 +2652,25 @@ void FenceWindow::Paint() {
             tf.SetLineAlignment(StringAlignmentCenter);
             tf.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsNoClip);
             tf.SetTrimming(StringTrimmingEllipsisCharacter);
+            // 非当前分组原来是「同一个字色 + 低 alpha（48%/57%）」：字是半透明的，
+            // 和背后那块壁纸混在一起，壁纸一花字就散了。现在换成**不透明的中性灰**，
+            // 层级只靠明度差（黑/深灰、白/浅灰），字始终是实的。
+            const ARGB idleFg = light ? 0xFF55575F : 0xFFC2C4CC;
+            const BYTE fadeA8 = (BYTE)std::lround(255.0f * headFade);
             for (size_t i = 0; i < tabs.size(); ++i) {
                 const RECT& tr = tabs[i];
                 const bool on = ((int)i == act);
                 const RectF rr((float)tr.left, (float)tr.top, (float)(tr.right - tr.left),
                                (float)(tr.bottom - tr.top));
-                // 非当前分组：以前只有 48%（浅色）/ 57%（深色）不透明度，
-                // 压在模糊壁纸上就发灰、发虚 —— 这是「tab 文字不清晰」的另一半。
-                // 提到 67% / 78%：层级差异还在，但字读得清。
-                const BYTE tabA = on ? fadeA : (BYTE)((light ? 172 : 200) * headFade);
-                SolidBrush txt{Color(WithAlpha(fg, tabA))};
+                SolidBrush txt{Color(WithAlpha(on ? fg : idleFg, fadeA8))};
                 const std::wstring name = GroupName((int)i);
                 const RectF box(rr.X + 2.0f, rr.Y, std::max(4.0f, rr.Width - 4.0f), rr.Height);
                 gfx.DrawString(name.c_str(), -1, on ? &tabFontBold : &tabFont, box, &tf, &txt);
             }
         } else if (drawHead && g_config.showLabels) {
             FontFamily family(L"Microsoft YaHei UI");
-            const float fs = headerH_ >= 40 ? 14.0f : 12.5f;
+            // 和分组标签同步放大（12.5 → 13.5）：同一个头部的字不该一粗一细
+            const float fs = headerH_ >= 40 ? 15.0f : 13.5f;
             Font titleFont(&family, fs, FontStyleRegular, UnitPixel);
             SolidBrush brush{Color(WithAlpha(fg, fadeA))};
             StringFormat fmt;
