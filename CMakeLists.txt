@@ -34,6 +34,7 @@ add_executable(meow-desk WIN32
     src/layout_store.cpp
     src/file_drop.cpp
     src/rename_box.cpp
+    src/rename_dialog.cpp
     src/shell_drag.cpp
     src/app_icon.cpp
     src/icon_font.cpp
