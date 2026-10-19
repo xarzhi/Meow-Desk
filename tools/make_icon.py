@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """从 logo.png 生成程序图标：res/meow-desk.ico + res/logo-256.png + res/logo-128.png
 
-为什么需要这个脚本：
-    设计稿 logo.png 是「白底圆角底板 + 一只猫」的 512px 方图。直接缩成 16px 之后，
-    白底板和桌面/任务栏背景糊成一片，看不出形状；外圈那层描边缩下来还会变成脏边。
-    所以这里重做一遍：量出猫的墨迹包围盒 → 贴着它裁 → 在**我们自己的**圆角底板上
-    用「正片叠底」把猫压上去（白底自然消失）→ 导出 9 个尺寸的 ICO。
+原则：**原图怎么画就怎么用，只做等比缩放。不裁、不重新合成、不改构图。**
+
+logo.png 本身是 512x512 RGBA 的标准图标稿：圆角底板铺满整块画布、四角透明，
+所以每个尺寸都是「整张图缩到 N×N」就完事。
+
+（早期版本量出猫的墨迹包围盒、贴着裁掉空白、再在自绘底板上正片叠底重画 ——
+那会改变猫在底板里的占比，还会丢掉原图的描边和内阴影，等于擅自改了设计稿。
+已废弃，别再写回来。）
 
 依赖：python3 + ffmpeg（用来解码/缩放，脚本里会在几个常见位置找一个）
 
@@ -13,11 +16,10 @@
     python tools/make_icon.py
 产物：
     res/meow-desk.ico     exe / 托盘 / 窗口图标（9 个尺寸，≤64 用 BMP，128/256 用 PNG）
-    res/logo-256.png      圆角底板版（备用）
+    res/logo-256.png      256 版（备用）
     res/logo-128.png      关于页显示的 app 图标（RC 编进 exe）
 """
 
-import math
 import os
 import shutil
 import struct
@@ -38,9 +40,9 @@ FFMPEG_CANDIDATES = [
     r"D:\Program Files\EVCapture\ffmpeg.exe",
 ]
 
-W = H = 512     # logo.png 的尺寸
-S = 256         # 生成的主图边长
 SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
+# 缩小用 area（区域平均）：细线条缩到 16px 时比 lanczos 干净，不会 ringing 出白边
+SCALE_FLAGS = "area"
 
 
 def find_ffmpeg():
@@ -57,25 +59,21 @@ def ff(*args):
     subprocess.run([FFMPEG, "-v", "error", "-y"] + list(args), check=True)
 
 
-def raw(path, w, h):
+def raw_rgba(path):
+    """解码成 raw RGBA，同时读出宽高。"""
+    with open(path, "rb") as f:
+        head = f.read(33)
+    w, h = struct.unpack(">II", head[16:24])
     out = subprocess.run(
         [FFMPEG, "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "rgba", "-"],
         capture_output=True, check=True).stdout
-    assert len(out) == w * h * 4, (path, len(out))
-    return bytearray(out)
+    assert len(out) == w * h * 4, (path, len(out), w, h)
+    return bytearray(out), w, h
 
 
-def row_span(fy, radius):
-    """圆角方块在第 fy 行（行中心）的 x 范围 [xl, xr)。"""
-    dy = 0.0
-    if fy < radius:
-        dy = radius - fy
-    elif fy > S - radius:
-        dy = fy - (S - radius)
-    if dy <= 0:
-        return 0, S
-    dx = math.sqrt(max(0.0, radius * radius - dy * dy))
-    return int(round(radius - dx)), int(round(S - radius + dx))
+def scale(src, dst, size):
+    """整张图等比缩放到 size×size，保留 alpha。"""
+    ff("-i", src, "-vf", f"scale={size}:{size}:flags={SCALE_FLAGS}", dst)
 
 
 def ico_bmp_entry(rgba, w, h):
@@ -91,10 +89,10 @@ def ico_bmp_entry(rgba, w, h):
         for x in range(w):
             si = srow + x * 4
             di = drow + x * 4
-            xor[di] = rgba[si + 2]
-            xor[di + 1] = rgba[si + 1]
-            xor[di + 2] = rgba[si]
-            xor[di + 3] = rgba[si + 3]
+            xor[di] = rgba[si + 2]        # B
+            xor[di + 1] = rgba[si + 1]    # G
+            xor[di + 2] = rgba[si]        # R
+            xor[di + 3] = rgba[si + 3]    # A
             if rgba[si + 3] < 128:
                 mask[mrow + (x >> 3)] |= 0x80 >> (x & 7)
     return hdr + bytes(xor) + bytes(mask)
@@ -106,92 +104,27 @@ def main():
     os.makedirs(RES, exist_ok=True)
     os.makedirs(TMP, exist_ok=True)
 
-    src = raw(SRC, W, H)
-    print("read logo", flush=True)
-
-    # ---- 1. 猫的墨迹包围盒（蓝色描边，白色底/粉色耳朵都不命中）----
-    minx, miny, maxx, maxy = 10 ** 9, 10 ** 9, -1, -1
-    for y in range(256):
-        row = y * W * 4
-        for x in range(256):
-            i = row + x * 4
-            if src[i + 2] - src[i] > 60:            # b - r
-                minx = min(minx, x)
-                maxx = max(maxx, x)
-                miny = min(miny, y)
-                maxy = max(maxy, y)
-    print("cat ink", minx, miny, maxx, maxy, maxx - minx + 1, maxy - miny + 1, flush=True)
-
-    # 贴着墨迹包围盒裁（不留余量）：原图那块白底圆角底板的描边/内阴影就在墨迹外侧
-    # 几个像素处，一旦留余量就会把那一圈边框也裁进来，贴到我们自己的底板上会出现
-    # 一个「里面还有一个方块」的鬼影。
-    m = 0
-    cx0, cy0 = max(0, minx - m), max(0, miny - m)
-    cw = min(256 - cx0, maxx + m - cx0 + 1)
-    ch = min(256 - cy0, maxy + m - cy0 + 1)
-
-    cat_px = round(S * 0.76)   # 猫在底板里占多宽
-    sc = cat_px / max(cw, ch)
-    dw, dh = max(1, round(cw * sc)), max(1, round(ch * sc))
-    ff("-i", SRC, "-vf", f"crop={cw}:{ch}:{cx0}:{cy0},scale={dw}:{dh}:flags=lanczos",
-       "-f", "rawvideo", "-pix_fmt", "rgba", os.path.join(TMP, "cat.rgba"))
-    cat = bytearray(open(os.path.join(TMP, "cat.rgba"), "rb").read())
-    print("cat scaled", dw, dh, flush=True)
-
-    # ---- 2. 底板：圆角方块 + 极淡竖向渐变 + 2px 描边 ----
-    radius = S * 0.225
-    border = bytes((232, 234, 242, 255))
-    canvas = bytearray(S * S * 4)
-    for y in range(S):
-        fy = y + 0.5
-        t = y / (S - 1)
-        inner = bytes((round(252 - 6 * t), round(253 - 5 * t), 255, 255))
-        xl, xr = row_span(fy, radius)
-        if xr <= xl:
-            continue
-        ix0, ix1 = xl + 2, xr - 2          # 左右各留 2px 描边
-        base = y * S * 4
-        canvas[base + xl * 4: base + xr * 4] = border * (xr - xl)
-        if ix1 > ix0:
-            canvas[base + ix0 * 4: base + ix1 * 4] = inner * (ix1 - ix0)
-    print("tile ok", flush=True)
-
-    # ---- 3. 猫按「正片叠底」贴上去：白底自然消失，边缘不会留白框 ----
-    ox = (S - dw) // 2
-    oy = (S - dh) // 2 - round(S * 0.005)
-    for yy in range(dh):
-        ty = oy + yy
-        if not (0 <= ty < S):
-            continue
-        sbase = yy * dw * 4
-        dbase = (ty * S + ox) * 4
-        for xx in range(dw):
-            si = sbase + xx * 4
-            sa = cat[si + 3]
-            if sa < 4:
-                continue
-            f = sa / 255.0
-            di = dbase + xx * 4
-            for k in range(3):
-                v = canvas[di + k]
-                s = cat[si + k] / 255.0
-                canvas[di + k] = round(v * (s * f + (1 - f)))
-    print("composited", flush=True)
-
-    master = os.path.join(RES, "logo-256.png")
-    subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba",
-                    "-s", f"{S}x{S}", "-i", "-", master], input=bytes(canvas), check=True)
-    ff("-i", master, "-vf", "scale=128:128:flags=lanczos", os.path.join(RES, "logo-128.png"))
-
-    # ---- 4. 多尺寸 ICO ----
-    entries = []
+    # 每个尺寸 = 整张原图的等比缩放，不做任何裁切 / 重排
+    scaled = {}
     for s in SIZES:
         p = os.path.join(TMP, f"s{s}.png")
-        ff("-i", master, "-vf", f"scale={s}:{s}:flags=lanczos", p)
-        # ≤64 用 BMP（老 API 不认 PNG 压缩的 ICO 项），128/256 用 PNG 省体积
-        data = ico_bmp_entry(raw(p, s, s), s, s) if s <= 64 else open(p, "rb").read()
+        scale(SRC, p, s)
+        scaled[s] = p
+    print("scaled", " ".join(str(s) for s in SIZES), flush=True)
+
+    # 关于页 / 备用图：同样直接从原图缩
+    shutil.copyfile(scaled[256], os.path.join(RES, "logo-256.png"))
+    shutil.copyfile(scaled[128], os.path.join(RES, "logo-128.png"))
+
+    entries = []
+    for s in SIZES:
+        if s <= 64:
+            # ≤64 用 BMP：老 API 不认 PNG 压缩的 ICO 项
+            rgba, w, h = raw_rgba(scaled[s])
+            data = ico_bmp_entry(rgba, w, h)
+        else:
+            data = open(scaled[s], "rb").read()   # 128 / 256 用 PNG 省体积
         entries.append((s, data))
-    print("entries ok", flush=True)
 
     out = bytearray(struct.pack("<HHH", 0, 1, len(entries)))
     offset = 6 + 16 * len(entries)

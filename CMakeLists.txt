@@ -56,6 +56,17 @@ if(MSVC)
         COMPILE_OPTIONS "/w")
 endif()
 
+# rc.exe 引用的那些图片/字体**不会**被自动跟踪：cmcldeps 生成的 .d 只记 rc 里
+# #include 的头文件，不记 ICON / RCDATA 指向的文件。结果是「换了 ico 或 png，
+# ninja 认为资源没变，exe 里还是旧图标」—— 而且完全没有任何报错，只有肉眼看出来。
+# 这里手动把它们声明成依赖。
+set_source_files_properties(res/resources.rc PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/res/meow-desk.ico;${CMAKE_CURRENT_SOURCE_DIR}/res/logo-128.png;${CMAKE_CURRENT_SOURCE_DIR}/src/iconfont/iconfont.ttf"
+)
+set_source_files_properties(res/setup_res.rc PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/res/meow-desk.ico"
+)
+
 # /MD：与 GDI+ / UCRT 导入符号对齐
 set_property(TARGET meow-desk PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
