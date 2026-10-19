@@ -41,6 +41,14 @@ const wchar_t* kAppExe = L"MeowDesk.exe";
 // 改名会让老用户「布局全没了」，所以这里一个字符都不动。
 const wchar_t* kPortableMarker = L"meow-desk.portable";
 
+// 快捷方式（开始菜单 / 桌面）叫这个。以前叫 meow-desk.lnk，和程序名不一致，
+// 用户看到「meow-desk 快捷方式 -> MeowDesk.exe」会以为是两个东西。
+// 老名字在新建时顺手删掉，探测上次安装位置时两个名字都认。
+const wchar_t* kLnkName = L"MeowDesk.lnk";
+const wchar_t* kLnkNameOld = L"meow-desk.lnk";
+// 安装器自己的标题（窗口标题栏 + 页头）
+const wchar_t* kSetupTitle = L"MeowDesk \u5b89\u88c5\u7a0b\u5e8f";
+
 // ---- 控件 ----
 enum : int {
     IDC_TITLE = 100,
@@ -224,14 +232,18 @@ PrevInstall DetectPrevInstall() {
     if (!hasExe(dir)) {
         // 注册表里没有（老版本没写过 / 用户手动删过）：看安装器建的快捷方式指向哪。
         // 开始菜单优先，其次桌面 —— 两个都是安装时创建的。
+        // 新旧两个快捷方式名都试：老版本建的是 meow-desk.lnk。
         const KNOWNFOLDERID folders[] = {FOLDERID_Programs, FOLDERID_Desktop};
         for (const KNOWNFOLDERID& f : folders) {
             const std::wstring base = KnownFolder(f);
             if (base.empty()) continue;
-            const std::wstring target = ReadShortcutTarget(base + L"\\meow-desk.lnk");
-            dir = DirOfPath(target);
+            for (const wchar_t* lnk : {kLnkName, kLnkNameOld}) {
+                const std::wstring target = ReadShortcutTarget(base + L"\\" + lnk);
+                dir = DirOfPath(target);
+                if (hasExe(dir)) break;
+                dir.clear();
+            }
             if (hasExe(dir)) break;
-            dir.clear();
         }
     }
     if (!hasExe(dir)) dir = DefaultInstallDir();   // 最后才退回默认路径
@@ -442,14 +454,15 @@ void DoInstall(HWND hwnd) {
 
     SetStatus(L"\u6b63\u5728\u521b\u5efa\u5feb\u6377\u65b9\u5f0f\u2026", 80);
     {
-        const std::wstring menu = KnownFolder(FOLDERID_Programs);   // 开始菜单\程序
-        if (!menu.empty() && EnsureDir(menu))
-            CreateShortcut(dst, menu + L"\\meow-desk.lnk");
-
-        // 桌面快捷方式（用户要求：装完就能在桌面直接点开）
-        const std::wstring desk = KnownFolder(FOLDERID_Desktop);
-        if (!desk.empty())
-            CreateShortcut(dst, desk + L"\\meow-desk.lnk");
+        // 老版本建的 meow-desk.lnk 直接删掉，否则桌面 / 开始菜单会并排出现
+        // 两个名字不一样、点开却是同一个程序的快捷方式。
+        auto replaceLnk = [&](const std::wstring& folder) {
+            if (folder.empty()) return;
+            DeleteFileW((folder + L"\\" + kLnkNameOld).c_str());
+            if (EnsureDir(folder)) CreateShortcut(dst, folder + L"\\" + kLnkName);
+        };
+        replaceLnk(KnownFolder(FOLDERID_Programs));   // 开始菜单\程序
+        replaceLnk(KnownFolder(FOLDERID_Desktop));    // 桌面：装完就能直接点开
     }
 
     SetStatus(L"\u5b89\u88c5\u5b8c\u6210", 100);
@@ -641,7 +654,7 @@ void PaintWindow(HWND h) {
     HGDIOBJ old = SelectObject(dc, g_fontBold);
     SetTextColor(dc, kFg);
     RECT tr{44, 24, rc.right - 26, 56};
-    std::wstring title = L"meow-desk \u5b89\u88c5\u7a0b\u5e8f";
+    std::wstring title = kSetupTitle;
     if (!g_version.empty()) title += L"  v" + g_version;
     DrawTextW(dc, title.c_str(), -1, &tr,
               DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -795,7 +808,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, 0);
     const int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
 
-    std::wstring cap = L"meow-desk \u5b89\u88c5\u7a0b\u5e8f";
+    std::wstring cap = kSetupTitle;
     if (!g_version.empty()) cap += L" v" + g_version;
     HWND h = CreateWindowExW(
         0, L"MeowDeskSetup", cap.c_str(),

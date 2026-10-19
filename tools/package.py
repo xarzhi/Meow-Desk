@@ -13,15 +13,15 @@
     --no-verify   跳过图标自检
 
 版本号：仓库根的 version.txt（一行，默认 0.1.0）。不带参数就用它，
-产物名字会带上：dist/MeowDesk-<版本>.zip，包内根目录 MeowDesk-<版本>/。
+产物名字会带上：dist/MeowDesk_v<版本>.zip，包内根目录 MeowDesk_v<版本>/。
 
 产物：
     dist/MeowDesk.exe + dist/MeowDesk_v<版本>_setup.exe   平铺一份（老习惯，直接能跑安装程序）
     dist/package/                               分发目录（两个 exe + 安装说明.txt + version.txt）
-    dist/MeowDesk-<版本>.zip                    发给别人就发这个
+    dist/MeowDesk_v<版本>.zip                   发给别人就发这个
 
-命名：安装器带版本号（MeowDesk_v0.1.0_setup.exe），装完的主程序固定叫
-MeowDesk.exe —— 这两个名字是用户定的，改之前先问。
+命名（全套统一，别再各写各的）：安装器 MeowDesk_v0.1.0_setup.exe、主程序
+MeowDesk.exe、zip 与包内目录 MeowDesk_v0.1.0。这些名字是用户定的，改之前先问。
 
 主程序已经编进安装器（IDR_PAYLOAD），所以 setup 单独拷走也能装；
 包里再放一份 MeowDesk.exe 是为了「不想安装、直接双击就跑」。
@@ -44,7 +44,7 @@ STAGE = os.path.join(DIST, "package")
 VERSION_FILE = os.path.join(CORE, "version.txt")
 DEFAULT_VERSION = "0.1.0"
 
-README = """meow-desk 安装说明
+README = """MeowDesk 安装说明
 ==============================
 
 版本：{ver}（{commit}）
@@ -64,7 +64,7 @@ README = """meow-desk 安装说明
      · 默认：%APPDATA%\\meow-desk（跟着用户走，重装不丢）
      · 便携：程序同目录（U 盘带着走）
    已经装过的话，这里会直接填好上次的位置，点「重新安装」即可。
-3. 点「安装」，开始菜单和桌面上会各建一个 meow-desk 快捷方式，指向 MeowDesk.exe。
+3. 点「安装」，开始菜单和桌面上会各建一个 MeowDesk 快捷方式，指向 MeowDesk.exe。
 
 默认装到
 --------
@@ -74,7 +74,7 @@ README = """meow-desk 安装说明
 ----
 安装器只做「复制程序 + 建快捷方式」，没有注册系统卸载入口，手动删这几样就行：
   1. 安装目录（默认 %LOCALAPPDATA%\\Programs\\meow-desk，里面是 MeowDesk.exe）
-  2. 开始菜单和桌面上的 meow-desk 快捷方式
+  2. 开始菜单和桌面上的 MeowDesk 快捷方式
   3. 想连布局记忆一起清掉，再删 %APPDATA%\\meow-desk
      （便携模式删安装目录里的 meow-desk.db 和 meow-desk.portable）
 """
@@ -163,8 +163,9 @@ def main(argv):
         print("")
         print("== 2/4 图标自检（跳过）==")
 
-    zip_path = os.path.join(DIST, "MeowDesk-%s.zip" % ver)
-    root = "MeowDesk-%s" % ver
+    # 命名全用一套：MeowDesk_v<版本>（zip / 包内目录 / 安装器）+ MeowDesk.exe（主程序）
+    zip_path = os.path.join(DIST, "MeowDesk_v%s.zip" % ver)
+    root = "MeowDesk_v%s" % ver
     # 包里的文件名：安装器带版本号，主程序固定叫 MeowDesk.exe
     setup_name = "MeowDesk_v%s_setup.exe" % ver
     files = ((os.path.join(BUILD, "meow-desk.exe"), "MeowDesk.exe"),
