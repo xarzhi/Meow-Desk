@@ -20,6 +20,7 @@
 #include "file_drop.h"
 #include "layout_store.h"
 #include "popup_menu.h"
+#include "rename_box.h"
 #include "search_window.h"
 #include "settings_window.h"
 #include "shell_icons.h"
@@ -945,6 +946,118 @@ static DWORD DropFilesOntoIcon(const std::vector<std::wstring>& paths, DesktopIc
 static DWORD DropIconOntoIcon(DesktopIconView* src, DesktopIconView* tgt) {
     if (!src || !tgt || src == tgt || src->path.empty()) return DROPEFFECT_NONE;
     return DropFilesOntoIcon({src->path}, tgt);
+}
+
+// ---------------------------------------------------------------------------
+// 重命名
+//
+// 菜单项由系统原生菜单提供（QueryContextMenu 带 CMF_CANRENAME 才有「重命名」），
+// 但 shell 的 rename 动词要求宿主是 IShellView（资源管理器靠它开原地编辑框），
+// 我们的桌面是自己画的窗口，不是 shell 视图 —— 所以点下去什么都不发生。
+// 因此菜单命令在 InvokeShellMenu 里被拦下来，改由这里弹自己的输入框。
+//
+// 只传 path、不传图标指针：菜单回调之后 main 会重新枚举图标，指针可能已经失效。
+// ---------------------------------------------------------------------------
+static void CommitRename(const std::wstring& oldPath, const std::wstring& newName) {
+    if (oldPath.empty() || newName.empty()) return;
+    const size_t slash = oldPath.find_last_of(L'\\');
+    if (slash == std::wstring::npos || slash + 1 >= oldPath.size()) return;
+
+    const std::wstring dir = oldPath.substr(0, slash + 1);
+    const std::wstring oldName = oldPath.substr(slash + 1);
+    if (newName == oldName) return;   // 没改
+    // 文件名里不能有这些字符（否则 MoveFileEx 会失败，但先挡掉能给出准确日志）
+    if (newName.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) {
+        LogStep("rename rejected: illegal char");
+        return;
+    }
+    const std::wstring dst = dir + newName;
+    if (GetFileAttributesW(dst.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        LogStep("rename skipped: target exists " + Narrow(dst));
+        return;
+    }
+
+    // 归属 / 坐标先记下来：布局表用 path 当主键，改完名就是「另一个图标」，
+    // 不搬过去的话它会被当成新文件丢到桌面第一个空格里（从盒子里跳出来）。
+    int owner = -1, group = 0;
+    POINT pos{0, 0};
+    for (auto* o : g_icons) {
+        if (o && o->path == oldPath) {
+            owner = o->owner;
+            group = o->group;
+            pos = o->pos;
+            break;
+        }
+    }
+
+    BOOL ok = FALSE;
+    if (_wcsicmp(oldPath.c_str(), dst.c_str()) == 0) {
+        // 只改大小写：NTFS 上直接改名会被当成「同名已存在」，要过一道临时名
+        const std::wstring tmp = dir + L".meow-rename-tmp";
+        if (MoveFileExW(oldPath.c_str(), tmp.c_str(), 0)) {
+            ok = MoveFileExW(tmp.c_str(), dst.c_str(), 0);
+            if (!ok) MoveFileExW(tmp.c_str(), oldPath.c_str(), 0);   // 失败就退回去
+        }
+    } else {
+        ok = MoveFileExW(oldPath.c_str(), dst.c_str(), 0);
+    }
+    LogStep("rename " + Narrow(oldName) + " -> " + Narrow(newName) + (ok ? " ok" : " FAILED"));
+    if (!ok) return;
+
+    {
+        // 改完立刻重新枚举，别等文件系统监听那一拍（不然图标会闪一下旧名字）
+        ReloadDesktopIcons(true);
+        for (auto* n : g_icons) {
+            if (!n || _wcsicmp(n->path.c_str(), dst.c_str()) != 0) continue;
+            n->owner = owner;
+            n->group = group;
+            n->pos = pos;
+            n->dragPos = pos;
+            n->selected = true;
+            break;
+        }
+        SaveIconLayout();
+        NoteKnownDesktopPaths();   // 用户刚改的名字，别让自动整理当成新文件搬走
+        RedrawAll();
+        DrainDesktopWatch();   // 这次改名是我们自己写盘造成的，别再触发一轮重载
+    }
+}
+
+// 菜单点了「重命名」→ 找到那个图标，在它的标题上弹输入框
+static bool BeginRenameIcon(HWND /*owner*/, const std::wstring& path) {
+    DesktopIconView* e = nullptr;
+    for (auto* o : g_icons) {
+        if (o && o->path == path) {
+            e = o;
+            break;
+        }
+    }
+    if (!e) {
+        LogStep("rename: icon not found " + Narrow(path));
+        return false;
+    }
+
+    RECT box{};
+    if (e->owner >= 0 && e->owner < (int)g_fences.size() && g_fences[e->owner])
+        box = g_fences[e->owner]->ItemLabelScreenRect(e);
+    else
+        box = g_surface.IconLabelScreenRect(e);
+    if (box.right <= box.left) {
+        // 拿不到标签位置（图标不在屏幕上）：退回到鼠标位置附近，聊胜于无
+        POINT cur{};
+        GetCursorPos(&cur);
+        box = RECT{cur.x, cur.y, cur.x + 200, cur.y + 24};
+    }
+
+    // 预填「真实文件名」（带扩展名），让用户改的是磁盘上的名字。
+    // 输入框里只选中主文件名（不带扩展名），所以直接打字不会把 .lnk 打掉。
+    const size_t slash = path.find_last_of(L'\\');
+    const std::wstring fileName = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+    const std::wstring oldPath = path;
+    RenameBox::Show(nullptr, box, fileName,
+                    [oldPath](const std::wstring& name) { CommitRename(oldPath, name); });
+    LogStep("rename box open for " + Narrow(fileName));
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2207,6 +2320,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     });
     for (int i = 0; i < (int)g_config.fences.size(); ++i) AddFenceWindow(i);
     LogStep("fences created: " + std::to_string(g_fences.size()));
+
+    // 系统原生菜单里的「重命名」：菜单项由 shell 给，执行归我们（见 BeginRenameIcon）
+    SetShellMenuRenameHandler([](HWND owner, const std::wstring& path) {
+        return BeginRenameIcon(owner, path);
+    });
 
     // 盒子建好之后才能校验盒号 → 在这里还原上次的图标布局
     ApplyIconLayout();

@@ -140,6 +140,9 @@ public:
     // 拖放落点判定用：松手时要知道「放到哪个图标上了」。
     DesktopIconView* ItemAtScreen(POINT screenPt) const;
 
+    // 图标标题在屏幕上的矩形（重命名输入框贴在它上面）。拿不到返回全 0。
+    RECT ItemLabelScreenRect(DesktopIconView* e) const;
+
     // 调试：最近一次拖动夹取的实况（障碍数量 / 期望位置 / 实际位置）。
     // 不参与任何逻辑，只往日志里写 —— 盒子互相避让出问题时，这一行能直接区分
     // 「一个障碍都没拿到」和「拿到了但没挡住」。

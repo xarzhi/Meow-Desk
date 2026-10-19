@@ -155,7 +155,44 @@ int EstimateMenuHeight(HMENU menu) {
     return h + GetSystemMetrics(SM_CYEDGE) * 2 + 4;
 }
 
-void InvokeShellMenu(HWND hwnd, IContextMenu* cm, HMENU menu, POINT pt) {
+// 菜单里的「重命名」由宿主接管（见 desktop_surface.h 的说明）。
+std::function<bool(HWND, const std::wstring&)> g_renameHandler;
+
+// 这个命令号是不是「重命名」。
+//
+// 坑：GetCommandString 的第一个参数是**相对 idCmdFirst 的命令偏移**，不是菜单位置。
+// 菜单里一堆分隔符和自绘项占着位置，用位置去问会拿到隔壁项的动词 ——
+// 实测按位置问出来是 link/delete/rename/properties 整体错位。
+// 所以这里按「偏移」扫一遍，找到动词为 rename 的那个偏移，换算回命令号比较。
+bool IsRenameCommand(IContextMenu* cm, HMENU menu, int cmd) {
+    if (cmd <= 0) return false;
+    const int count = GetMenuItemCount(menu);
+
+    for (int k = 0; k < count + 8; ++k) {
+        wchar_t verb[64]{};
+        // IContextMenu 的签名是 ANSI 的，但传 GCS_VERBW 时它按宽字符写缓冲区，
+        // 所以这里必须强转 —— 这是 shell 接口的老习惯用法。
+        if (FAILED(cm->GetCommandString(k, GCS_VERBW, nullptr,
+                                        reinterpret_cast<LPSTR>(verb), (UINT)sizeof(verb))))
+            continue;
+        if (!verb[0]) continue;
+        if (_wcsicmp(verb, L"rename") == 0) return cmd == k + 1;
+    }
+
+    // 兜底：拿不到动词时按菜单文字对（中文 "重命名" / 英文 "Rename"）。
+    // 位置 → 命令号用 GetMenuItemID 反查，不要再拿位置当命令号。
+    for (int pos = 0; pos < count; ++pos) {
+        if ((int)GetMenuItemID(menu, pos) != cmd) continue;
+        wchar_t text[128]{};
+        if (GetMenuStringW(menu, pos, text, 128, MF_BYPOSITION) > 0 &&
+            (wcsstr(text, L"重命名") || wcsstr(text, L"Rename")))
+            return true;
+    }
+    return false;
+}
+
+void InvokeShellMenu(HWND hwnd, IContextMenu* cm, HMENU menu, POINT pt,
+                     const std::wstring& path = std::wstring()) {
     IContextMenu2* cm2 = nullptr;
     cm->QueryInterface(IID_IContextMenu2, (void**)&cm2);
     g_menuOwner = cm2;
@@ -186,17 +223,32 @@ void InvokeShellMenu(HWND hwnd, IContextMenu* cm, HMENU menu, POINT pt) {
     PostMessageW(hwnd, WM_NULL, 0, 0);
     if (TraceOn())
         LogSurface("menu cmd=%d elapsed=%lu ms", cmd, (unsigned long)(GetTickCount() - t0));
-    if (prevFg && prevFg != hwnd) SetForegroundWindow(prevFg);
 
     g_menuOwner = nullptr;
     if (cm2) cm2->Release();
-    if (cmd <= 0) return;
+    if (cmd <= 0) {
+        if (prevFg && prevFg != hwnd) SetForegroundWindow(prevFg);
+        return;
+    }
 
     if (TraceOn()) {
         wchar_t txt[128]{};
         GetMenuStringW(menu, cmd - 1, txt, 128, MF_BYPOSITION);
         LogSurface("menu pick cmd=%d item=%ls", cmd, txt);
     }
+
+    // 点的是「重命名」→ 交给宿主自己弹输入框。
+    // 不拦的话会走下面的 InvokeCommand：shell 的 rename 动词要一个真正的
+    // IShellView 才能开原地编辑框，我们没有，点下去毫无反应。
+    // 注意这里**不还原前台窗口**：接着要弹输入框并让它拿到键盘焦点，
+    // 先把前台还给别人，SetForegroundWindow 就会失败、用户打不了字。
+    if (!path.empty() && g_renameHandler && IsRenameCommand(cm, menu, cmd) &&
+        g_renameHandler(hwnd, path)) {
+        if (TraceOn()) LogSurface("menu pick=rename -> host handled");
+        return;
+    }
+
+    if (prevFg && prevFg != hwnd) SetForegroundWindow(prevFg);
 
     CMINVOKECOMMANDINFOEX info{};
     info.cbSize = sizeof(info);
@@ -266,10 +318,15 @@ void ShowItemMenu(HWND hwnd, const std::wstring& path, POINT pt) {
 
     HMENU menu = CreatePopupMenu();
     HRESULT hrq = E_FAIL;
-    if (menu) hrq = cm->QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL | CMF_EXPLORE);
+    // CMF_CANRENAME：不带这个标志，shell 根本不会往菜单里放「重命名」。
+    // 它等于向 shell 承诺「宿主能就地改名」—— 我们确实能，只是走自己的输入框
+    // （命令行子在 InvokeShellMenu 里被 find/拦下来）。
+    if (menu)
+        hrq = cm->QueryContextMenu(menu, 0, 1, 0x7FFF,
+                                   CMF_NORMAL | CMF_EXPLORE | CMF_CANRENAME);
     if (TraceOn()) LogSurface("item menu hr=0x%08lX count=%d", (unsigned long)hrq,
                               menu ? GetMenuItemCount(menu) : -1);
-    if (menu && SUCCEEDED(hrq)) InvokeShellMenu(hwnd, cm, menu, pt);
+    if (menu && SUCCEEDED(hrq)) InvokeShellMenu(hwnd, cm, menu, pt, path);
     if (menu) DestroyMenu(menu);
     cm->Release();
 }
@@ -281,6 +338,10 @@ void ShowItemMenu(HWND hwnd, const std::wstring& path, POINT pt) {
 // ---------------------------------------------------------------------------
 void ShowShellItemMenu(HWND owner, const std::wstring& path, POINT screenPt) {
     ShowItemMenu(owner, path, screenPt);
+}
+
+void SetShellMenuRenameHandler(std::function<bool(HWND owner, const std::wstring& path)> fn) {
+    g_renameHandler = std::move(fn);
 }
 
 bool ForwardShellMenuMessage(HWND /*owner*/, UINT msg, WPARAM wp, LPARAM lp) {
@@ -572,6 +633,18 @@ RECT DesktopSurface::CellRect(const DesktopIconView* e) const {
     r.right = r.left + cellW_;
     r.bottom = r.top + cellH_;
     return r;
+}
+
+RECT DesktopSurface::IconLabelScreenRect(const DesktopIconView* e) const {
+    RECT out{};
+    if (!e || !hwnd_ || !e->OnDesktop()) return out;
+    const int ih = e->bmp.valid() ? e->bmp.height : iconPx_;
+    // 桌面层的客户区和屏幕是同一个原点（窗口铺满整块屏幕，origin_ 就是它的左上角）
+    out.left = e->pos.x + 2;
+    out.right = e->pos.x + cellW_ - 2;
+    out.top = e->pos.y + kIconTopPad + ih + kTextGap;
+    out.bottom = out.top + IconLabelLineHeight() * 2;
+    return out;
 }
 
 DesktopIconView* DesktopSurface::HitTest(POINT pt) const {

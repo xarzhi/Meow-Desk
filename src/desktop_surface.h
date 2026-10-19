@@ -107,6 +107,10 @@ public:
     // HitTestScreen 会因为 mode_ != None 一律返回 nullptr。
     DesktopIconView* ItemAtScreen(POINT screenPt) const;
 
+    // 图标标题在屏幕上的矩形（重命名输入框贴在它上面）。
+    // 图标不在桌面上时返回全 0。
+    RECT IconLabelScreenRect(const DesktopIconView* e) const;
+
     // 桌面左上角起、按列（先从上到下扫完一列，再往右）的第一个空闲格子。
     // 删除盒子 / 删除分组把图标倒回桌面时用：图标会从左上角开始一个挨一个往下排，
     // 一列排满再换右边一列，而不是各自「就近抢一个」格子撒得满屏都是。
@@ -266,3 +270,13 @@ void ShowShellItemMenu(HWND owner, const std::wstring& path, POINT screenPt);
 
 // 返回 true = 这条消息已经被菜单处理掉了，宿主窗口直接 return TRUE / 0
 bool ForwardShellMenuMessage(HWND owner, UINT msg, WPARAM wp, LPARAM lp);
+
+// 菜单里的「重命名」由谁执行。
+//
+// 关键：QueryContextMenu 必须带 CMF_CANRENAME 才会出现「重命名」项 ——
+// 而这个标志等于向 shell 承诺「宿主能就地改名」。shell 的 rename 动词背后
+// 要求宿主是 IShellView（资源管理器靠它开原地编辑框），我们不是，
+// 所以点下去什么都不发生。于是：菜单项交给 shell，真正改名交给这个回调。
+//
+// 回调返回 true = 已经接管（不再把命令转发给 InvokeCommand）。
+void SetShellMenuRenameHandler(std::function<bool(HWND owner, const std::wstring& path)> fn);

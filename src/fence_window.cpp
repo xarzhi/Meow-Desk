@@ -1285,6 +1285,34 @@ DesktopIconView* FenceWindow::ItemAtScreen(POINT screenPt) const {
     return (i < (int)mine.size()) ? mine[i] : nullptr;
 }
 
+RECT FenceWindow::ItemLabelScreenRect(DesktopIconView* e) const {
+    RECT out{};
+    if (!hwnd_ || collapsed_ || !e) return out;
+    std::vector<DesktopIconView*> mine;
+    CollectVisible(mine);
+    int idx = -1;
+    for (size_t i = 0; i < mine.size(); ++i) {
+        if (mine[i] == e) {
+            idx = (int)i;
+            break;
+        }
+    }
+    if (idx < 0) return out;
+
+    // 网格模式的格子高度就是「图标 + 两行标题」，标题正好落在格子底部两行；
+    // 列表/详情模式借同一块位置（视觉上就是图标下方那一条），够用。
+    RECT cell{};
+    ItemRect(idx, cell);
+    const int two = LabelTextHeight() * 2;
+    out.left = cell.left + 4;
+    out.right = cell.right - 4;
+    out.top = cell.bottom - two;
+    out.bottom = cell.bottom;
+    POINT org{rect().left, rect().top};
+    OffsetRect(&out, org.x, org.y);
+    return out;
+}
+
 int FenceWindow::HitItem(POINT clientPt) const {
     // 头部 / 卡片内边距里不该命中任何图标（滚动之后第一排的格子可能伸到上面去）
     if (clientPt.y < HeadH() + kPad || clientPt.y >= curH_ - kPad) return -1;
