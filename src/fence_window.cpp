@@ -575,9 +575,14 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     // 放在这里而不是「第一次移动」时抓，是为了让拖动的第一帧就跟手：
     // 抓屏 + 模糊是十几毫秒，压在移动的第一帧上就是一次可见的启动停顿
     // （用户说的「拖起来黏」）。按下时盒子纹丝不动，这点时间根本看不出来。
-    // 单击头部（只是想切焦点）也照样会抓一次，十几毫秒，感觉不到。
-    if ((pressHeader_ || pressArrow_) && cfg_ && cfg_->acrylic) {
-        RefreshBackdrop(128);
+    //
+    // 但**只抓不换**（defer）：点分组标签、点空白、点一下头部都走这里，
+    // 换了底图就等于「点一下 tab，盒子背景忽然变了一下」——用户实测发现的。
+    // 真正开始拖的那一帧在 WM_MOUSEMOVE 里 ApplyPreBackdrop() 换上。
+    // 点在标签上时不抓（pressTab_ >= 0）：那是导航操作，不会拖动盒子，
+    // 抓了纯属浪费十几毫秒。
+    if ((pressHeader_ || pressArrow_) && pressTab_ < 0 && cfg_ && cfg_->acrylic) {
+        RefreshBackdrop(128, /*defer=*/true);
         pressCaptured_ = true;
     }
 
@@ -1783,10 +1788,14 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     // 未吸附的「原始位置」从当前实际位置起算
                     dragRawX_ = dragLastX_;
                     dragRawY_ = dragLastY_;
-                    // 底图在「按下」那一刻就抓好了（见 BeginPress），这里通常什么都不做。
+                    // 底图在「按下」那一刻就抓好放进暂存区了（见 BeginPress），
+                    // 到这里才换上 —— 早换的话单击也会让背景变一下。
                     // 兜底：按下之后才打开磨砂 / 那次抓失败了，这里补一次；
                     // 同步抓完再动，异步会和前几帧抢 win32k 的 GDI 锁反而更卡。
-                    if (!pressCaptured_ && cfg_ && cfg_->acrylic) {
+                    if (bdPreValid_) {
+                        ApplyPreBackdrop();
+                        pressCaptured_ = true;
+                    } else if (!pressCaptured_ && cfg_ && cfg_->acrylic) {
                         pressCaptured_ = true;
                         RefreshBackdrop(128);
                     }
@@ -2021,6 +2030,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         pressHeader_ = false;
         pressBody_ = false;
         marquee_ = false;
+        // 按下时抓的那张暂存图到此为止：拖动的话已经在 mousemove 里换上了，
+        // 没拖的话（点标签 / 点空白 / 点一下头部）就是白抓，直接丢掉释放内存。
+        DropPreBackdrop();
 
         if (lockPress) {
             ToggleLock();   // 锁 / 解锁（SetLocked 里会存盘并重画）
@@ -2221,10 +2233,11 @@ void FenceWindow::EnsureBackbuffer(int w, int h) {
 // 截下的这一圈存成 backdrop_，同时还记着抓的时候的屏幕坐标（backdropX_/Y_）。
 // 之后盒子在这个圈里怎么挪，绘制时按偏移「取子窗口」就行 —— 不用每帧重新
 // 抓屏 + 模糊（那一步是几十毫秒的量级，拖动时每帧做必然卡）。
-void FenceWindow::RefreshBackdrop(int pad) {
+void FenceWindow::RefreshBackdrop(int pad, bool defer) {
     // 同步抓的这一张比在途的后台那一单更新，作废掉，免得过两帧被旧的顶回去
     bdJob_.reset();
     if (!cfg_ || !cfg_->acrylic || !hwnd_) {
+        if (defer) return;   // 暂存模式下「没抓」不该把正在用的底图清掉
         backdrop_.clear();
         backdropW_ = backdropH_ = 0;
         return;
@@ -2293,12 +2306,41 @@ void FenceWindow::RefreshBackdrop(int pad) {
         if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, false);
     }
     if (!ok || px.empty()) return;   // 抓不到：留着旧图
+    if (defer) {
+        // 只暂存。注意这里不能用 swap：backdrop_ 还在显示，换了等于当场变背景
+        bdPre_ = std::move(px);
+        bdPreW_ = w;
+        bdPreH_ = h;
+        bdPreX_ = x;
+        bdPreY_ = y;
+        bdPreValid_ = true;
+        return;
+    }
     backdrop_.swap(px);
     backdropW_ = w;
     backdropH_ = h;
     backdropX_ = x;
     backdropY_ = y;
     backdropCoverT_ = GetTickCount();
+}
+
+// 真正开始拖了：把「按下时抓好的那一张」换上。
+// 按下到这一刻之间盒子还没动过，所以坐标仍然对得上。
+void FenceWindow::ApplyPreBackdrop() {
+    if (!bdPreValid_) return;
+    backdrop_.swap(bdPre_);
+    backdropW_ = bdPreW_;
+    backdropH_ = bdPreH_;
+    backdropX_ = bdPreX_;
+    backdropY_ = bdPreY_;
+    backdropCoverT_ = GetTickCount();
+    bdPreValid_ = false;
+    std::vector<uint8_t>().swap(bdPre_);
+}
+
+void FenceWindow::DropPreBackdrop() {
+    bdPreValid_ = false;
+    std::vector<uint8_t>().swap(bdPre_);   // swap 才会真的释放那几 MB
 }
 
 // 提交一次后台抓取：矩形 = 当前盒子 + 四周 pad，夹在虚拟桌面内。

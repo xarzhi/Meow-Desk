@@ -256,7 +256,16 @@ private:
     void Present();
     // pad > 0：多抓一圈（拖动/改尺寸期间用）。之后盒子在这个圈里挪动时，
     // 底图直接按偏移「取子窗口」就够了 —— 不用每帧重新抓屏+模糊。
-    void RefreshBackdrop(int pad = 0);
+    //
+    // defer = true：抓下来的这张先放暂存区（bdPre_），**不换上**。
+    // 「按下」那一刻抓是为了让拖动的第一帧跟手，但单击（点分组标签、点空白、
+    // 点一下头部）也会走到「按下」—— 那时候换底图，用户看到的就是
+    // 「点一下 tab，盒子背景忽然变了」。所以按下只抓不换，真的开始拖再换。
+    void RefreshBackdrop(int pad = 0, bool defer = false);
+    // 把暂存的那张换上（拖动真正开始时调用）
+    void ApplyPreBackdrop();
+    // 丢掉暂存，释放那几 MB
+    void DropPreBackdrop();
     // 把「抓一块」丢给工作线程（pad：四周多抓一圈）。已有在途请求时直接返回。
     void RequestBackdropAsync(int pad);
     // 底图还盖得住当前矩形吗？盖不住就提交一次后台补抓
@@ -450,6 +459,12 @@ private:
     bool bdPlainArea_ = false;
     // 后台正在抓的那一单（抓屏 + 模糊在工作线程做，UI 线程每帧问一次好了没）
     std::shared_ptr<BackdropCaptureJob> bdJob_;
+    // 「按下就抓好、真拖起来才换上」的那一张（见 RefreshBackdrop 的 defer 参数）。
+    // 只在一次按下的生命周期里存在，松开就丢。
+    std::vector<uint8_t> bdPre_;
+    int bdPreW_ = 0, bdPreH_ = 0;
+    int bdPreX_ = 0, bdPreY_ = 0;
+    bool bdPreValid_ = false;
 
     DropHint drop_;
 
