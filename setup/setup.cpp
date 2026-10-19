@@ -17,6 +17,8 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 
+#include "app_res.h"   // IDI_APP（res/ 在 meow-setup 的 include 路径里）
+
 #include <cstring>
 #include <string>
 
@@ -508,7 +510,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     wc.hInstance = inst;
     wc.lpszClassName = L"MeowDeskSetup";
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(inst, L"IDI_APPLICATION");
+    // 窗口 / 任务栏图标：用资源里的 IDI_APP。
+    // 以前这里写的是 LoadIconW(inst, L"IDI_APPLICATION") —— 那是把宏当成**字符串**
+    // 资源名传进去了，我们根本没有叫这个名字的图标，于是永远拿到 NULL，
+    // 安装器窗口和任务栏就只能显示系统默认图标。
+    const int cxBig = GetSystemMetrics(SM_CXICON), cyBig = GetSystemMetrics(SM_CYICON);
+    const int cxSm = GetSystemMetrics(SM_CXSMICON), cySm = GetSystemMetrics(SM_CYSMICON);
+    wc.hIcon = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, cxBig, cyBig,
+                                LR_DEFAULTCOLOR);
+    wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, cxSm, cySm,
+                                  LR_DEFAULTCOLOR);
     RegisterClassExW(&wc);
 
     // 客户区高度 = 最下面一排按钮的底边(406) + 10px 内边距
