@@ -1,11 +1,10 @@
 // meow-desk 安装程序
 //
 // 设计取舍：
-//   · 不嵌资源。安装包需要把 MeowDesk.exe 一起分发，这里从「setup.exe 所在目录」
-//     读它并复制到用户选定的安装位置。这样 build 产物直接可用，不必在 CMake 里
-//     造一条「先构建主程序、再把 exe 打进 rc」的依赖链（那条链在增量构建里很容易
-//     出现「改了主程序但安装包还是旧的」）。
-//     packaging: 见 package.sh，把两个 exe 一起拷到 dist/。
+//   · 主程序**编进安装器自己**（IDR_PAYLOAD，见 CMakeLists 里生成的 payload.rc），
+//     所以一个 setup.exe 就能装完。曾经改成「读同目录的 MeowDesk.exe」，结果
+//     用户直接从资源管理器里双击 zip 内的 setup —— Windows 只把那一个文件解到
+//     %TEMP% 运行 —— 弹「找不到 MeowDesk.exe」。同目录文件只作为回退。
 //   · 只改「数据存哪儿」这一件事：便携模式在 exe 同目录留一个 meow-desk.portable
 //     标记文件，主程序的 storage::Dir() 看到它就改用 exe 目录；否则用
 //     %APPDATA%\meow-desk（和之前完全一致，不破坏已有数据）。
@@ -313,6 +312,34 @@ bool SamePath(const std::wstring& a, const std::wstring& b) {
     return _wcsicmp(fa, fb) == 0;
 }
 
+// 安装器自带的主程序（CMake 把 build/meow-desk.exe 以 RCDATA 编进来）。
+// 有它就能「一个 setup.exe 装完」，不依赖旁边的文件。
+bool HavePayload() {
+    return FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_PAYLOAD), RT_RCDATA) != nullptr;
+}
+
+bool WritePayload(const std::wstring& dst) {
+    HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_PAYLOAD), RT_RCDATA);
+    if (!res) return false;
+    HGLOBAL h = LoadResource(nullptr, res);
+    if (!h) return false;
+    const void* data = LockResource(h);
+    const DWORD size = SizeofResource(nullptr, res);
+    if (!data || size == 0) return false;
+
+    HANDLE f = CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    const BOOL ok = WriteFile(f, data, size, &wrote, nullptr);
+    CloseHandle(f);
+    if (!ok || wrote != size) {
+        DeleteFileW(dst.c_str());   // 半个 exe 比没有更糟
+        return false;
+    }
+    return true;
+}
+
 void DoInstall(HWND hwnd) {
     const std::wstring dir = ReadPath();
     if (dir.empty()) {
@@ -321,13 +348,24 @@ void DoInstall(HWND hwnd) {
         return;
     }
 
-    // 安装包里带的主程序。NTFS 大小写不敏感，build 里那个 meow-desk.exe 也认。
+    // 主程序从哪来（优先级见下）：
+    //   ① 安装器自己的资源 IDR_PAYLOAD —— 正常发行版都有，一个 exe 就能装；
+    //   ② setup 同目录的 MeowDesk.exe —— 开发时直接跑 build/ 里的安装器，或用户
+    //      把分发包里那份 exe 挪到了同目录。NTFS 大小写不敏感，build 产物
+    //      meow-desk.exe 也算命中。
     const std::wstring src = ExeDir() + L"\\" + kAppExe;
-    if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    const bool hasSib = GetFileAttributesW(src.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!HavePayload() && !hasSib) {
+        // 理论上不该走到这里。真走到了说明安装器被单独抽出来且少了资源
+        // （比如被某个解压工具截断），把目录也打出来，省得用户瞎猜。
         MessageBoxW(hwnd,
-                    L"\u627e\u4e0d\u5230 MeowDesk.exe\u3002\n\n"
-                    L"\u8bf7\u628a\u5b89\u88c5\u7a0b\u5e8f\u548c MeowDesk.exe "
-                    L"\u653e\u5728\u540c\u4e00\u4e2a\u6587\u4ef6\u5939\u91cc\u518d\u8fd0\u884c\u3002",
+                    (L"\u627e\u4e0d\u5230\u4e3b\u7a0b\u5e8f\u3002\n\n"
+                     L"\u5b89\u88c5\u7a0b\u5e8f\u81ea\u5e26\u7684\u4e3b\u7a0b\u5e8f\u6570\u636e"
+                     L"\u4e22\u4e86\uff0c\u65c1\u8fb9\u4e5f\u6ca1\u6709 " + std::wstring(kAppExe) +
+                     L"\u3002\n\u5df2\u67e5\u627e\uff1a\n" + src +
+                     L"\n\n\u8bf7\u91cd\u65b0\u89e3\u538b\u4e00\u4efd\u5b8c\u6574\u7684"
+                     L"\u5b89\u88c5\u5305\u518d\u8bd5\u3002")
+                        .c_str(),
                     L"meow-desk", MB_ICONERROR);
         return;
     }
@@ -348,13 +386,23 @@ void DoInstall(HWND hwnd) {
 
     SetStatus(L"\u6b63\u5728\u590d\u5236\u7a0b\u5e8f\u6587\u4ef6\u2026", 35);
     const std::wstring dst = dir + L"\\" + kAppExe;
-    // 便携模式装到「安装程序自己所在的目录」时，源和目标就是同一个文件，
-    // CopyFileW 会直接失败 —— 这种情况本来就不用复制。
-    if (!SamePath(src, dst) && !CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
+    bool copied;
+    if (hasSib && SamePath(src, dst)) {
+        // 便携装到「安装程序自己所在的目录」：主程序本来就在这儿，
+        // 复制等于自己复制自己（CopyFileW 会失败）。
+        copied = true;
+    } else if (HavePayload() && WritePayload(dst)) {
+        copied = true;
+    } else if (hasSib && CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
+        copied = true;   // 资源写不出来（极少见）时退回复制旁边那份
+    } else {
+        copied = false;
+    }
+    if (!copied) {
         SetStatus(L"\u590d\u5236\u5931\u8d25", 0);
         MessageBoxW(hwnd,
                     (L"\u65e0\u6cd5\u5199\u5165\uff1a\n" + dst +
-                     L"\n\n\u5982\u679c meow-desk \u6b63\u5728\u8fd0\u884c\uff0c"
+                     L"\n\n\u5982\u679c MeowDesk \u6b63\u5728\u8fd0\u884c\uff0c"
                      L"\u8bf7\u5148\u9000\u51fa\u5b83\u3002")
                         .c_str(),
                     L"meow-desk", MB_ICONERROR);
