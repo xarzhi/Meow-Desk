@@ -34,10 +34,8 @@ const int kColInset = 10;
 // 四条边/四角可以拖拽改大小的判定宽度
 const int kEdgeMargin = 6;
 const UINT_PTR kAnimTimer = 2;
-// 「鼠标移入切分组」的延迟：光标扫过标签栏时不能一路乱切，
-// 停在一个标签上够久（200ms）才真的切过去。
-const UINT_PTR kTabHoverTimer = 3;
-const int kTabHoverDelayMs = 200;
+// 「鼠标移入切分组」现在是一移上去就切（用户嫌 200ms 延迟明显），
+// 所以原来那个延迟定时器整个删掉了 —— 别再加回来。
 
 void AddRoundRect(GraphicsPath& p, const RectF& r, float rad) {
     float d = rad * 2.0f;
@@ -440,6 +438,10 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     pressTab_ = -1;
     pressHeader_ = false;
     pressBody_ = false;
+    marquee_ = false;
+    // 多选的修饰键必须在「按下」这一刻取：松手时用户可能已经松开 Ctrl 了
+    pressCtrl_ = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    pressShift_ = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
     // 锁按钮优先级最高：它压在头部右侧，点在它上面不能算「拖头部」
     if (showTitle_ && pt.y < HeadH()) {
@@ -474,6 +476,8 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     } else if (!collapsed_) {
         pressBody_ = true;
         pressItem_ = HitItem(pt);
+        // 空白处拖 = 框选；按住 Ctrl 拖框是「追加选中」
+        marqueeAdditive_ = pressCtrl_;
     }
     SetCapture(h);
 }
@@ -526,7 +530,7 @@ void FenceWindow::ApplyResize(POINT screenPt) {
     dragLastY_ = t;
     SetWindowPos(hwnd_, nullptr, l, t, nw, nh, SWP_NOZORDER | SWP_NOACTIVATE);
     // 尺寸变了，图标可能换行/换列；列宽也变了，标签和详情列缓存都得重做
-    sel_ = -1;
+    ClearSelection();
     hot_ = -1;
     if (nw != 0) {
         labels_.clear();
@@ -584,7 +588,7 @@ void FenceWindow::SetViewMode(int m) {
     StopFlip();
     if (m == 5) BuildDetailInfo();
     else detailInfo_.clear();
-    sel_ = -1;
+    ClearSelection();
     hot_ = -1;
     Redraw();
     if (onStateChanged) onStateChanged();
@@ -735,7 +739,7 @@ void FenceWindow::SetSort(int key, bool asc) {
     CollectVisible(after);
     StartFlip(fromSlot, after);
 
-    sel_ = -1;
+    ClearSelection();
     hot_ = -1;
     Redraw();
     if (onStateChanged) onStateChanged();
@@ -824,13 +828,14 @@ void FenceWindow::SetActiveGroup(int g) {
     cfg_->activeGroup = g;
 
     hot_ = -1;
-    sel_ = -1;
+    ClearSelection();
     pressItem_ = -1;
     pressTab_ = -1;
-    hoverTab_ = -1;
+    marquee_ = false;
     drop_ = DropHint{};
-    dragged_ = nullptr;
-    itemDragging_ = false;
+    // 拖拽过程中（把图标划过标签栏）也会走到这里：这时只能作废「下标」，
+    // 绝不能清 itemDragging_ / dragItems_ —— 否则一次拖动会被打断成「松手什么都不发生」。
+    if (!itemDragging_) dragged_ = nullptr;
     StopFlip();
     InvalidateDetail();
     KickTabPill(pillBefore);
@@ -919,7 +924,7 @@ void FenceWindow::RemoveActiveGroup() {
     const int n = (int)cfg_->groups.size();
     cfg_->activeGroup = std::min(g, n - 1);
     hot_ = -1;
-    sel_ = -1;
+    ClearSelection();
     drop_ = DropHint{};
     StopFlip();
     InvalidateDetail();
@@ -1159,6 +1164,61 @@ void FenceWindow::CollectVisible(std::vector<DesktopIconView*>& out) const {
     // 会在松手之前就往前挤。它由 Paint() 画成半透明的「空位」。
 }
 
+// ---------------------------------------------------------------------------
+// 多选
+//
+// 选中标志存在 DesktopIconView::selected 上，盒子这边只负责维护它：
+//   · 单击        → 只选它
+//   · Ctrl + 单击 → 加/减选
+//   · Shift + 单击→ 从锚点到它的整段
+//   · 空白处拖框  → 框住的都选（Ctrl 拖框 = 追加）
+// 这样「拖一整批」「跨分组」「排序后高亮跟着走」都不用另存下标。
+// ---------------------------------------------------------------------------
+void FenceWindow::ClearSelection() {
+    if (!all_) return;
+    // 只清这个盒子里的：桌面上的选中和盒子里互不影响
+    for (auto* e : *all_)
+        if (e && e->owner == index_) e->selected = false;
+    selAnchor_ = -1;
+}
+
+std::vector<DesktopIconView*> FenceWindow::Selection() const {
+    std::vector<DesktopIconView*> out;
+    Collect(out);   // 按显示顺序
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [](DesktopIconView* e) { return !e || !e->selected; }),
+              out.end());
+    return out;
+}
+
+void FenceWindow::SelectRange(int a, int b, bool keepOthers) {
+    std::vector<DesktopIconView*> mine;
+    Collect(mine);
+    if (mine.empty()) return;
+    if (a > b) std::swap(a, b);
+    a = std::max(0, a);
+    b = std::min((int)mine.size() - 1, b);
+    if (!keepOthers) {
+        for (auto* e : mine) e->selected = false;
+    }
+    for (int i = a; i <= b; ++i) mine[i]->selected = true;
+}
+
+void FenceWindow::UpdateMarqueeSelection() {
+    std::vector<DesktopIconView*> mine;
+    CollectVisible(mine);
+    RECT m{std::min(marqueeA_.x, marqueeB_.x), std::min(marqueeA_.y, marqueeB_.y),
+           std::max(marqueeA_.x, marqueeB_.x), std::max(marqueeA_.y, marqueeB_.y)};
+    for (size_t i = 0; i < mine.size(); ++i) {
+        RECT r{};
+        ItemRect((int)i, r);
+        const bool hit = (r.left < m.right && m.left < r.right && r.top < m.bottom &&
+                          m.top < r.bottom);
+        if (hit) mine[i]->selected = true;
+        else if (!marqueeAdditive_) mine[i]->selected = false;
+    }
+}
+
 int FenceWindow::itemCount() const {
     std::vector<DesktopIconView*> mine;
     CollectVisible(mine);
@@ -1240,11 +1300,16 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         BeginPress(h, pt);
         if (!resizing_ && pressItem_ >= 0) {
             const int item = pressItem_;
-            sel_ = item;
-            pressItem_ = -1;    // 随后的 LBUTTONUP 别再打开一次
-            pressBody_ = false;
             std::vector<DesktopIconView*> mine;
             Collect(mine);
+            // 双击 = 「只留这一个」，不然多选状态下双击打开还会残留一堆高亮
+            ClearSelection();
+            if (item < (int)mine.size()) {
+                mine[item]->selected = true;
+                selAnchor_ = item;
+            }
+            pressItem_ = -1;    // 随后的 LBUTTONUP 别再打开一次
+            pressBody_ = false;
             Redraw();
             if (item < (int)mine.size() && onOpen) onOpen(mine[item]);
         }
@@ -1319,19 +1384,56 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
 
+            // 拖图标优先：一旦拖起来就一直走这里，哪怕中途因为划过标签切了分组、
+            // pressItem_ 已经被清成 -1，也不能掉到下面的框选分支去。
+            if (itemDragging_) {
+                // 拖着图标划到某个分组标签上 → 立刻切过去，松手就落进那个分组。
+                // 这里不能只靠下面的悬停逻辑：鼠标已被 SetCapture 抓住，
+                // 上面早就 return 了，根本走不到那段。
+                if (showTitle_ && pt.y >= 0 && pt.y < HeadH()) {
+                    const int t = HitTab(pt);
+                    if (t >= 0 && t != activeGroup()) SetActiveGroup(t);
+                }
+                if (onItemsDragMove) onItemsDragMove(cur);
+                return 0;
+            }
+
             if (pressBody_ && pressItem_ >= 0) {
-                if (!itemDragging_ && (std::abs(dx) > 4 || std::abs(dy) > 4)) {
-                    itemDragging_ = true;
+                if (std::abs(dx) > 4 || std::abs(dy) > 4) {
                     std::vector<DesktopIconView*> mine;
                     Collect(mine);
                     if (pressItem_ < (int)mine.size()) {
-                        dragged_ = mine[pressItem_];
-                        if (onItemDragStart) onItemDragStart(dragged_, cur);
+                        DesktopIconView* e = mine[pressItem_];
+                        // 按下的那个不在选中集里 → 先切成「只选它」，再拖它一个。
+                        // 在选中集里 → 拖着整批走（多选拖出）。
+                        if (!e->selected) {
+                            ClearSelection();
+                            e->selected = true;
+                            selAnchor_ = pressItem_;
+                        }
+                        itemDragging_ = true;
+                        dragged_ = e;
+                        dragItems_ = Selection();
+                        // 主图标（光标下面那个）放最前面：浮层和落点都以它为准
+                        auto it = std::find(dragItems_.begin(), dragItems_.end(), e);
+                        if (it != dragItems_.end()) std::rotate(dragItems_.begin(), it, it + 1);
+                        if (onItemsDragStart) onItemsDragStart(dragItems_, cur);
                     }
                     Redraw();
                 }
-                if (itemDragging_) {
-                    if (dragged_ && onItemDragMove) onItemDragMove(dragged_, cur);
+            }
+
+            // 空白处拖动 = 框选（和桌面同一个操作习惯）
+            if (pressBody_ && pressItem_ < 0 && !itemDragging_) {
+                if (!marquee_ && (std::abs(dx) > 3 || std::abs(dy) > 3)) {
+                    marquee_ = true;
+                    marqueeA_ = pressPt_;
+                    if (!marqueeAdditive_) ClearSelection();
+                }
+                if (marquee_) {
+                    marqueeB_ = pt;
+                    UpdateMarqueeSelection();
+                    Redraw();
                     return 0;
                 }
             }
@@ -1352,22 +1454,12 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             Redraw();
         }
 
-        // 分组标签：设置成「鼠标移入就切」时，光标要在一个标签上停够 kTabHoverDelayMs
-        // 才切 —— 否则从左边划到右边时途经的每个标签都会被切一遍。
+        // 分组标签：设置成「鼠标移入就切」时，光标一落到别的标签上就立刻切
+        // （以前有 200ms 延迟定时器，用户实测觉得"卡了一下"，去掉了）。
         // 设置成「点击才切」时这里什么都不做，交给 WM_LBUTTONUP 里的 tabPress 分支。
-        {
-            const int t = (g_config.switchTabOnHover && showTitle_ && pt.y < HeadH())
-                              ? HitTab(pt)
-                              : -1;
-            if (t >= 0 && t != activeGroup()) {
-                if (hoverTab_ != t) {
-                    hoverTab_ = t;
-                    SetTimer(h, kTabHoverTimer, kTabHoverDelayMs, nullptr);
-                }
-            } else if (hoverTab_ != -1) {
-                hoverTab_ = -1;
-                KillTimer(h, kTabHoverTimer);
-            }
+        if (g_config.switchTabOnHover && showTitle_ && !collapsed_ && pt.y < HeadH()) {
+            const int t = HitTab(pt);
+            if (t >= 0 && t != activeGroup()) SetActiveGroup(t);
         }
 
         if (!trackingLeave_) {
@@ -1380,10 +1472,6 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSELEAVE:
         trackingLeave_ = false;
         suppressAutoExpand_ = false;   // 离开过一次，下次悬停又能展开了
-        if (hoverTab_ != -1) {
-            hoverTab_ = -1;
-            KillTimer(h, kTabHoverTimer);
-        }
         if (hot_ != -1) { hot_ = -1; Redraw(); }
         if (autoExpanded_) {
             if (itemDragging_ || dragging_) {
@@ -1418,6 +1506,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         const bool wasDragging = dragging_;
         const bool wasItemDrag = itemDragging_;
         const bool wasResizing = resizing_;
+        const bool wasMarquee = marquee_;
 
         dragging_ = false;
         itemDragging_ = false;
@@ -1429,6 +1518,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         pressTab_ = -1;
         pressHeader_ = false;
         pressBody_ = false;
+        marquee_ = false;
 
         if (lockPress) {
             ToggleLock();   // 锁 / 解锁（SetLocked 里会存盘并重画）
@@ -1445,14 +1535,20 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             Redraw();
             return 0;
         }
+        if (wasMarquee) {
+            // 框选过程中已经实时改过选中态了，这里只要重画一帧把框去掉
+            Redraw();
+            return 0;
+        }
         if (wasItemDrag) {
             // 用拖动开始时缓存的指针：松手后 owner 可能已经变了
             // 注意：这里临时把 itemDragging_ 恢复成 true，让 CollectVisible 仍然排除被拖的图标，
             // 这样 main 拿到的 dropHint 下标和拖动过程中显示的一致。
             itemDragging_ = true;
-            if (dragged_ && onItemDrop) onItemDrop(dragged_, cur);
+            if (onItemsDrop && !dragItems_.empty()) onItemsDrop(dragItems_, cur);
             itemDragging_ = false;
             dragged_ = nullptr;
+            dragItems_.clear();
             Redraw();
             return 0;
         }
@@ -1468,11 +1564,25 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (item >= 0) {
-            // 单击只选中，双击（WM_LBUTTONDBLCLK）才打开
-            sel_ = item;
+            // 单击只选中，双击（WM_LBUTTONDBLCLK）才打开。
+            // Ctrl / Shift 按下的那一刻状态在 BeginPress 里存好了。
+            std::vector<DesktopIconView*> mine;
+            Collect(mine);
+            if (item < (int)mine.size()) {
+                if (pressShift_ && selAnchor_ >= 0) {
+                    SelectRange(selAnchor_, item, pressCtrl_);
+                } else if (pressCtrl_) {
+                    mine[item]->selected = !mine[item]->selected;
+                    selAnchor_ = item;
+                } else {
+                    ClearSelection();
+                    mine[item]->selected = true;
+                    selAnchor_ = item;
+                }
+            }
             Redraw();
-        } else if (pt.y >= HeadH() && sel_ != -1) {
-            sel_ = -1;   // 点空白处取消选中
+        } else if (pt.y >= HeadH() && !Selection().empty()) {
+            ClearSelection();   // 点空白处取消选中
             Redraw();
         }
         (void)pt;
@@ -1480,19 +1590,6 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER: {
-        if (wp == kTabHoverTimer) {
-            KillTimer(h, kTabHoverTimer);
-            const int t = hoverTab_;
-            hoverTab_ = -1;
-            if (t >= 0 && t != activeGroup()) {
-                // 这 200ms 里光标可能已经走开了，确认还停在这个标签上再切
-                POINT c{};
-                GetCursorPos(&c);
-                ScreenToClient(h, &c);
-                if (c.y >= 0 && c.y < HeadH() && HitTab(c) == t) SetActiveGroup(t);
-            }
-            return 0;
-        }
         if (wp != kAnimTimer) break;
         bool busy = false;
 
@@ -1699,11 +1796,12 @@ void FenceWindow::Paint() {
                 const RectF pr((float)pill.left, (float)pill.top,
                                (float)(pill.right - pill.left), (float)(pill.bottom - pill.top));
                 GraphicsPath pp;
-                AddRoundRect(pp, pr, 7.0f);
+                // 圆角 4px：之前 7px 太圆，跟头部的分段控件气质不搭（用户要求改小）
+                AddRoundRect(pp, pr, 4.0f);
                 if (light) {
                     // 先垫一层淡影：不然纯白块贴在浅色卡片上是「死」的，没有层次
                     GraphicsPath sh;
-                    AddRoundRect(sh, RectF(pr.X, pr.Y + 1.0f, pr.Width, pr.Height), 7.0f);
+                    AddRoundRect(sh, RectF(pr.X, pr.Y + 1.0f, pr.Width, pr.Height), 4.0f);
                     SolidBrush shadow{Color(18, 0, 0, 0)};
                     gfx.FillPath(&shadow, &sh);
                     SolidBrush face{Color(242, 255, 255, 255)};
@@ -1816,16 +1914,34 @@ void FenceWindow::Paint() {
             }
         }
 
-        // ---- 单击选中高亮（双击才打开，所以要有可见的选中态）----
-        if (!collapsed_ && sel_ >= 0 && !itemDragging_) {
-            RECT sr = ItemHighlightRect(sel_);
-            if (sr.right > sr.left) {
+        // ---- 选中高亮（支持多选；双击才打开，所以要有可见的选中态）----
+        if (!collapsed_ && !itemDragging_) {
+            std::vector<DesktopIconView*> mineSel;
+            CollectVisible(mineSel);
+            SolidBrush fill{light ? Color(34, 0, 0, 0) : Color(44, 255, 255, 255)};
+            Pen pen{light ? Color(70, 0, 0, 0) : Color(80, 255, 255, 255), 1.0f};
+            for (size_t i = 0; i < mineSel.size(); ++i) {
+                if (!mineSel[i] || !mineSel[i]->selected) continue;
+                RECT sr = ItemHighlightRect((int)i);
+                if (sr.right <= sr.left) continue;
                 const Rect rc(sr.left + 3, sr.top + 3, sr.right - sr.left - 6, cellH() - 6);
                 // 浅色卡片上用暗一点的高亮，深色卡片上用亮一点的
-                SolidBrush fill{light ? Color(34, 0, 0, 0) : Color(44, 255, 255, 255)};
                 gfx.FillRectangle(&fill, rc);
-                Pen pen{light ? Color(70, 0, 0, 0) : Color(80, 255, 255, 255), 1.0f};
                 gfx.DrawRectangle(&pen, rc);
+            }
+        }
+
+        // ---- 框选矩形（和桌面同一个观感：淡蓝填充 + 1px 实线）----
+        if (marquee_) {
+            const int l = std::min(marqueeA_.x, marqueeB_.x);
+            const int t = std::min(marqueeA_.y, marqueeB_.y);
+            const int r = std::max(marqueeA_.x, marqueeB_.x);
+            const int b = std::max(marqueeA_.y, marqueeB_.y);
+            if (r - l > 1 && b - t > 1) {
+                SolidBrush mf{Color(38, 0, 120, 215)};
+                gfx.FillRectangle(&mf, Rect(l, t, r - l, b - t));
+                Pen mp{Color(255, 0, 120, 215), 1.0f};
+                gfx.DrawRectangle(&mp, Rect(l, t, r - l - 1, b - t - 1));
             }
         }
 
@@ -1903,8 +2019,10 @@ void FenceWindow::Paint() {
             const int ix = posOf[i].x;
             const int iy = posOf[i].y;
 
-            // 正在被拖的那个留在原位当「空位」：变淡 + 变暗，松手后才重新排位
-            const bool ghost = itemDragging_ && e == dragged_;
+            // 正在被拖的（多选时是整批）留在原位当「空位」：变淡 + 变暗，松手后才重新排位
+            const bool ghost =
+                itemDragging_ &&
+                std::find(dragItems_.begin(), dragItems_.end(), e) != dragItems_.end();
             const int ga = ghost ? 110 : 255;   // 图标不透明度
             const int gd = ghost ? 120 : 255;   // 额外压暗
             const int gaLabel = ga;

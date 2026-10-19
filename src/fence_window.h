@@ -136,9 +136,10 @@ public:
     // 点击盒内图标
     std::function<void(DesktopIconView*)> onOpen;
     // 盒内图标被拖出：开始 / 移动 / 松手（POINT 为屏幕坐标）
-    std::function<void(DesktopIconView*, POINT)> onItemDragStart;
-    std::function<void(DesktopIconView*, POINT)> onItemDragMove;
-    std::function<void(DesktopIconView*, POINT)> onItemDrop;
+    // 传的是一批：单选拖动时 list 长度为 1，多选拖动时是整批（第一个 = 按下的那个）。
+    std::function<void(const std::vector<DesktopIconView*>&, POINT)> onItemsDragStart;
+    std::function<void(POINT)> onItemsDragMove;
+    std::function<void(const std::vector<DesktopIconView*>&, POINT)> onItemsDrop;
     // 右键（POINT 是屏幕坐标；item 为 -1 表示点在空白/头部）
     std::function<void(int item, POINT)> onContextMenu;
     // 「查看 / 排序 / 重命名」改完之后：外部存配置 + 存图标布局
@@ -289,16 +290,31 @@ private:
 
     DropHint drop_;
 
-    DesktopIconView* dragged_ = nullptr;   // 正在拖出盒子的那个图标
+    // ---- 多选 ----
+    // 选中态存在 DesktopIconView::selected 上（和桌面共用同一套语义）。
+    // 盒子不另存一份「当前分组里的下标」：切分组 / 拖拽 / 排序都会让下标错位，
+    // 存指针或标志位才不会出现「高亮框跳到别的图标上」。
+    void ClearSelection();
+    std::vector<DesktopIconView*> Selection() const;   // 当前分组里选中的（按显示顺序）
+    void UpdateMarqueeSelection();                     // 空白处拖框 → 实时更新选中
+    void SelectRange(int a, int b, bool keepOthers);   // Shift 范围选
+
+    DesktopIconView* dragged_ = nullptr;   // 正在拖出盒子的那个图标（多选时 = 按下那个）
+    std::vector<DesktopIconView*> dragItems_;   // 这次拖动的一整批（含 dragged_）
+    int selAnchor_ = -1;      // Shift 范围选的锚点（当前分组里的显示下标）
+    bool pressCtrl_ = false;  // 按下时 Ctrl / Shift 的状态（松手时判多选）
+    bool pressShift_ = false;
+    // 空白处拖框多选
+    bool marquee_ = false;
+    bool marqueeAdditive_ = false;   // 按住 Ctrl 拖框 = 叠加，不清掉原有选中
+    POINT marqueeA_{0, 0};
+    POINT marqueeB_{0, 0};
     int hot_ = -1;
-    int sel_ = -1;            // 单击选中的图标（双击才打开，所以要有个选中态）
     int pressItem_ = -1;
     bool pressArrow_ = false;
     bool pressLock_ = false;
-    // 「鼠标移入就切分组」是延迟触发的：光标扫过标签栏时不能一路乱切，
-    // 所以记下当前悬停的标签，等一个短定时器到期、光标还在原地才真切。
+    // 点击标签：松手时（没拖动过）才切
     int pressTab_ = -1;
-    int hoverTab_ = -1;
 
     // ---- 标签滑块（当前分组身后那块底色）----
     // 切分组时滑块从旧标签的位置滑到新标签，而不是「啪」一下跳过去。

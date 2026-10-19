@@ -26,15 +26,14 @@ const int kSepH = 9;        // 分隔线占位
 const int kPadL = 30;       // 左侧：勾选标记
 const int kPadR = 34;       // 右侧：子菜单箭头
 const int kPadV = 5;        // 上下边距
-const int kShadow = 10;     // 阴影留白
+const int kShadow = 18;     // 阴影留白（越大影子铺得越开）
 const int kRound = 8;       // 圆角
-// 阴影单圈 alpha 的基准：第 i 圈取 (kShadowAlpha - i)，越靠外越淡。
-// 注意这些圈是**叠加**的（同一像素会被多圈覆盖），所以单圈 alpha 必须压得很低：
-//   16-i  → 卡片边缘接近 46% 的黑，像一圈灰边
-//   11-i  → 约 20%，柔和很多
-//    7-i  → 约 9%，只剩一层几乎察觉不到的过渡（用户还要更淡，取这个）
-const int kShadowAlpha = 7;
-const int kShadowMin = 2;   // 单圈下限，别让最外圈直接降到 0（会断成一圈硬边）
+// 阴影的每一圈都是**实心圆角矩形**往外叠，所以同一像素会被好几圈覆盖 ——
+// 单圈 alpha 必须压到极低。以前的算法（7-i、10 圈）会在卡片边缘聚成一条
+// 4.5px 宽的深灰边，用户一直说「看着还是重」。
+// 现在改成：圈数加到 18、每圈 alpha 只取 1~2，铺开 ~11px，
+// 边缘叠出来的浓度约 7%，是一层「散开的淡影」而不是「一圈灰边」。
+const int kShadowMin = 1;   // 单圈下限（0 就等于不画）
 // 定时检查「鼠标是不是已经跑到菜单外面并按下了键」，用来收菜单。
 // 只依赖 WM_ACTIVATE 不够：菜单窗口有时拿不到前台（没有真实用户输入时
 // SetForegroundWindow 会被系统拒绝），那就永远等不到失活。
@@ -168,13 +167,15 @@ void PopupMenu::Paint() {
 
         const RectF body((float)kShadow, (float)kShadow, (float)contentW_, (float)contentH_);
 
-        // 阴影：由外到内叠几层，越外越淡
+        // 阴影：由外到内叠几层，越外越淡。
+        // 圈数多、单圈极淡 → 出来的是一层散开的柔影；只有最里面 4 圈给到 2，
+        // 让贴边的地方稍微实一点，不然卡片像浮在空气里。
         for (int i = kShadow; i >= 1; --i) {
-            const int a = std::max(kShadowMin, kShadowAlpha - i);
+            const int a = (i <= 4) ? 2 : kShadowMin;
             GraphicsPath sp;
-            AddRoundRect(sp, RectF(body.X - i * 0.45f, body.Y - i * 0.35f + 2.0f,
-                                   body.Width + i * 0.9f, body.Height + i * 0.8f),
-                         kRound + i * 0.5f);
+            AddRoundRect(sp, RectF(body.X - i * 0.6f, body.Y - i * 0.5f + 2.0f,
+                                   body.Width + i * 1.2f, body.Height + i * 1.0f),
+                         kRound + i * 0.35f);
             SolidBrush sb(Color((BYTE)a, 0, 0, 0));
             g.FillPath(&sb, &sp);
         }

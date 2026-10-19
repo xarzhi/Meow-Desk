@@ -527,8 +527,11 @@ bool LabelDib::Build(const std::wstring& text, HFONT font, int boxW, int boxH, i
 
         std::vector<BYTE> shadow((size_t)n * 4, 0);
         for (size_t i = 0; i < n; ++i) {
-            unsigned a1 = (unsigned)dil[i] * 232 / 255;
-            unsigned a2 = (unsigned)blurred[i] * 200 / 255;
+            // 浓度：之前是 232 / 200，白字在壁纸上看着像「描了一圈黑边」，
+            // 用户要求调清一些。现在留个淡影子就够 —— 主要是让浅色壁纸上的白字有轮廓，
+            // 不是把字镶起来。
+            unsigned a1 = (unsigned)dil[i] * 150 / 255;
+            unsigned a2 = (unsigned)blurred[i] * 115 / 255;
             unsigned v = a1 > a2 ? a1 : a2;
             shadow[i * 4 + 3] = (BYTE)(v > 255 ? 255 : v);
         }
