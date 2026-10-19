@@ -116,8 +116,13 @@ bool EnsureDir(const std::wstring& dir) {
 // 「上次装在哪」—— 装完写进 HKCU\Software\meow-desk，再运行安装程序时读回来
 //
 // 只记信息，不建系统卸载入口（卸载仍然是删目录 + 删快捷方式，见安装说明）。
-// 之所以要记：安装位置可以改，光靠「默认路径存不存在」猜不出用户装在哪儿。
-// 老版本（没写过注册表）靠默认路径 + 便携标记文件兜底，照样能认出来。
+//
+// 三级探测，按可靠程度排：
+//   1. 注册表（新版自己写的，最准）
+//   2. **快捷方式指向哪** —— 安装位置可以自己改（有人装 D 盘），
+//      老版本又没写过注册表；但快捷方式是安装器自己建的，它指哪就是哪
+//   3. 默认路径 %LOCALAPPDATA%\Programs\meow-desk 下有没有 meow-desk.exe
+// 只有前面都拿不到才用默认值 —— 之前漏了第 2 步，装到 D 盘的用户会看到错的路径。
 // ---------------------------------------------------------------------------
 const wchar_t* kRegKey = L"Software\\meow-desk";
 
@@ -174,14 +179,53 @@ struct PrevInstall {
     bool portable = false;
 };
 
+// 读 .lnk 的 TargetPath（安装器自己建的快捷方式，指向真正的 meow-desk.exe）
+std::wstring ReadShortcutTarget(const std::wstring& lnk) {
+    std::wstring out;
+    IShellLinkW* link = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW,
+                                (void**)&link)))
+        return out;
+    IPersistFile* pf = nullptr;
+    if (SUCCEEDED(link->QueryInterface(IID_IPersistFile, (void**)&pf))) {
+        if (SUCCEEDED(pf->Load(lnk.c_str(), STGM_READ))) {
+            wchar_t buf[MAX_PATH * 2]{};
+            if (SUCCEEDED(link->GetPath(buf, MAX_PATH * 2, nullptr, SLGP_RAWPATH)) && buf[0])
+                out = buf;
+        }
+        pf->Release();
+    }
+    link->Release();
+    return out;
+}
+
+std::wstring DirOfPath(const std::wstring& p) {
+    const size_t k = p.find_last_of(L'\\');
+    return k == std::wstring::npos ? std::wstring() : p.substr(0, k);
+}
+
 PrevInstall DetectPrevInstall() {
     PrevInstall p;
     auto hasExe = [](const std::wstring& d) {
         return !d.empty() &&
                GetFileAttributesW((d + L"\\meow-desk.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
     };
+
     std::wstring dir = RegGetStr(L"InstallDir");
-    if (!hasExe(dir)) dir = DefaultInstallDir();   // 老版本没记录：试试默认路径
+    if (!hasExe(dir)) {
+        // 注册表里没有（老版本没写过 / 用户手动删过）：看安装器建的快捷方式指向哪。
+        // 开始菜单优先，其次桌面 —— 两个都是安装时创建的。
+        const KNOWNFOLDERID folders[] = {FOLDERID_Programs, FOLDERID_Desktop};
+        for (const KNOWNFOLDERID& f : folders) {
+            const std::wstring base = KnownFolder(f);
+            if (base.empty()) continue;
+            const std::wstring target = ReadShortcutTarget(base + L"\\meow-desk.lnk");
+            dir = DirOfPath(target);
+            if (hasExe(dir)) break;
+            dir.clear();
+        }
+    }
+    if (!hasExe(dir)) dir = DefaultInstallDir();   // 最后才退回默认路径
     if (!hasExe(dir)) return p;
     p.found = true;
     p.dir = dir;

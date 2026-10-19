@@ -77,8 +77,16 @@ def build(quiet=False):
 def diagnose(log):
     """把编译器/链接器的报错翻译成人话。"""
     if "LNK1104" in log:
-        return ("build/meow-desk.exe 被占用：meow-desk 还开着。\n"
-                "  退出程序后再跑一次（脚本不替你杀进程）。")
+        # 从 "LNK1104: 无法打开文件“meow-setup.exe”" 里抠出到底谁被占用，
+        # 以前一律写 meow-desk.exe，实际经常是 meow-setup.exe（安装器开着）
+        import re
+        m = re.search(r"LNK1104[^\u201c\u201d\n]*[\u201c\"]([^\u201d\"]+)[\u201d\"]", log)
+        name = m.group(1) if m else "meow-desk.exe"
+        who = "安装程序（meow-setup）" if "setup" in name else "主程序（meow-desk）"
+        return ("%s 被占用：%s 还开着。\n"
+                "  退出它再跑一次（脚本不替你杀进程）。\n"
+                "  实在不方便退：把它改名占开也算（build\\%s → build\\%s.<时间>.exe）。"
+                % (name, who, name, name.rsplit(".", 1)[0]))
     if "C1083" in log or "C1034" in log:
         return ("头文件 / 环境问题：确认 msvc-toolchain.cmake 里的 VS 和 Windows SDK 路径\n"
                 "  还对不对（VS 升级后 MSVC 版本号会变）。")
