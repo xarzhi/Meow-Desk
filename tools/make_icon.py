@@ -138,6 +138,9 @@ def main():
     open(ico, "wb").write(out)
     print("ico bytes", len(out), "->", ico)
 
+    # 中间产物不留在仓库里（_tmp_ico 是纯临时目录，每次跑都会重建）
+    shutil.rmtree(TMP, ignore_errors=True)
+
 
 if __name__ == "__main__":
     main()
