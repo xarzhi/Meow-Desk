@@ -1239,6 +1239,36 @@ static void ApplyCellSize() {
 // ---------------------------------------------------------------------------
 // 设置变化
 // ---------------------------------------------------------------------------
+// 重算磨砂帧泵的「需求区域」并立即同步给它。
+//
+// 心跳里每 500ms 会调一次（正常兜底），但设置里「切到亚克力」这种时刻不能等
+// 下一次心跳 —— 那时帧泵是停着的（纯色/透明档不抓屏），等 500ms 心跳 + 150ms
+// 泵周期，用户会看到「开了亚克力背景却没立刻出来」。所以这里抽成独立函数，
+// 设置变化时立即调一次，帧泵马上抓出第一帧。
+static void UpdateBackdropDemand() {
+    RECT want{};
+    bool have = false;
+    bool busy = false;
+    for (auto& f : g_fences) {
+        if (!f) continue;
+        RECT r{};
+        if (f->NeedsBackdropFrame(&r)) {
+            if (!have) {
+                want = r;
+                have = true;
+            } else {
+                want.left = std::min(want.left, r.left);
+                want.top = std::min(want.top, r.top);
+                want.right = std::max(want.right, r.right);
+                want.bottom = std::max(want.bottom, r.bottom);
+            }
+        }
+        if (f->IsGeometryBusy()) busy = true;
+    }
+    SetBackdropFrameRegion(have ? &want : nullptr);
+    SetBackdropFramePaused(busy);
+}
+
 static void ApplySettings() {
     if (g_config.shortcutArrow != g_lastArrow) {
         g_lastArrow = g_config.shortcutArrow;
@@ -1252,6 +1282,9 @@ static void ApplySettings() {
     g_surface.SetShowLabels(g_config.showLabels != 0);
     ApplyCellSize();   // 标题开关会改桌面格子高度
     for (auto& f : g_fences) if (f) f->ApplyConfig(recapture);
+    // 切到亚克力这一刻就立刻让帧泵抓第一帧（不等下个 500ms 心跳），
+    // 否则「开了亚克力背景却没出来」；切走时也立刻停手释放内存。
+    if (recapture) UpdateBackdropDemand();
 }
 
 // ---------------------------------------------------------------------------
@@ -2792,35 +2825,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         RestoreZOrder();
         CheckAutoOrganize();
         PollDesktopWatch();
-        // 整屏帧泵的「需求区域」：有盒子真的要看磨砂（开着 + 可见 + 没被盖住）
-        // 才让它抓，抓的范围也只是这些盒子的并集。抓一次是 GPU 回读，游戏全屏 /
-        // 全部盒子被盖住时白花这份钱最不值 —— 所以每个心跳都重算一次。
-        RECT want{};
-        bool have = false;
-        bool busy = false;
-        for (auto& f : g_fences) {
-            if (!f) continue;
-            RECT r{};
-            if (f->NeedsBackdropFrame(&r)) {
-                if (!have) {
-                    want = r;
-                    have = true;
-                } else {
-                    want.left = std::min(want.left, r.left);
-                    want.top = std::min(want.top, r.top);
-                    want.right = std::max(want.right, r.right);
-                    want.bottom = std::max(want.bottom, r.bottom);
-                }
-            }
-            if (f->IsGeometryBusy()) busy = true;
-            // 延后的重抓（换壁纸广播那条路）在这里落地；平时是新帧叫醒的，
-            // 这里只是兜底，避免「没新帧就永远不处理」。
-            f->PollBackdropChange();
-        }
-        SetBackdropFrameRegion(have ? &want : nullptr);
-        // busy（拖动 / 改尺寸）期间一律不抓屏：那几帧要和鼠标赛跑，绝不能抢 GDI 锁
-        SetBackdropFramePaused(busy);
+        // 磨砂帧泵的需求区域（见 UpdateBackdropDemand）。平时是新帧叫醒盒子，
+        // 这里每 500ms 兜底重算一次，避免「没新帧就永远不处理」。
+        for (auto& f : g_fences)
+            if (f) f->PollBackdropChange();
+        UpdateBackdropDemand();
         // 空闲时回收工作集（任务管理器「内存」列会明显降下来）
+        bool busy = false;
+        for (auto& f : g_fences)
+            if (f && f->IsGeometryBusy()) busy = true;
         if (!busy) TrimWorkingSetIfIdle();
     };
 
