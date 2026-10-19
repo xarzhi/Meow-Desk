@@ -1543,6 +1543,24 @@ DesktopIconView* DesktopSurface::ItemAtScreen(POINT screenPt) const {
     return HitTest(POINT{screenPt.x - origin_.x, screenPt.y - origin_.y});
 }
 
+// 图标标题区的屏幕矩形（原位改名用）。
+// 几何和 DrawOneLayered / DrawOneGdi 里画标签那一段完全一致：
+//   textTop = 格子顶 + kIconTopPad + 图标高 + kTextGap
+//   宽度   = 格子宽 - kLabelInset（标签左右各缩进一半，和资源管理器折行宽度对齐）
+bool DesktopSurface::IconLabelScreenRect(const DesktopIconView* e, RECT& out) const {
+    if (!e || !e->OnDesktop()) return false;
+    const int ih = e->bmp.valid() ? e->bmp.height : iconPx_;
+    const int lineH = IconLabelLineHeight();
+    const int textTop = e->pos.y + kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap;
+    int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);
+    if (textH > lineH * 2) textH = lineH * 2;
+    if (textH < 14) textH = 14;
+    const int left = e->pos.x + kLabelInset / 2;
+    const int w = cellW_ - kLabelInset;
+    out = RECT{left, textTop, left + w, textTop + textH};
+    return true;
+}
+
 DesktopIconView* DesktopSurface::HitTestScreen(POINT screenPt) const {
     if (!icons_ || !hwnd_) return nullptr;
     if (mode_ != Mode::None) return nullptr;   // 拖拽/框选过程中不显示悬停

@@ -6,6 +6,7 @@
 #include <gdiplus.h>
 
 #include "icon_render.h"
+#include "app_icon.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -23,8 +24,11 @@ enum : UINT {
     ID_EXIT = 1004,
 };
 
-// 托盘图标：青色圆角方块 + 2x2 白点（像一个收纳格）
+// 托盘图标：优先用 exe 资源里的 app 图标（res/meow-desk.ico）；
+// 资源没编进去时退回「青色圆角方块 + 2x2 白点」——宁可样子朴素，也不要一个空白方块。
 HICON MakeTrayIcon(int size) {
+    if (HICON ico = LoadAppIcon(size)) return ico;
+
     EnsureGdiplus();
     using namespace Gdiplus;
 

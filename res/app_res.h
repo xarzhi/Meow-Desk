@@ -1,0 +1,19 @@
+// Resource IDs. This header is included by BOTH the resource compiler
+// (res/resources.rc) and C++ code, so it must stay pure ASCII: rc.exe reads
+// files in the system ANSI code page and chokes on UTF-8 comment bytes.
+//
+// Classic include guard instead of #pragma once -- that is the only form the
+// RC preprocessor is guaranteed to support.
+#ifndef MEOW_APP_RES_H
+#define MEOW_APP_RES_H
+
+// exe / tray / window icon (res/meow-desk.ico, 9 sizes)
+#define IDI_APP 101
+
+// About page logo (res/logo-128.png, RCDATA)
+#define IDR_LOGO_PNG 201
+
+// Icon font used by the settings nav (src/iconfont/iconfont.ttf, RCDATA)
+#define IDR_ICONFONT 202
+
+#endif  // MEOW_APP_RES_H

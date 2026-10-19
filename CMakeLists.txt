@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # 需要 C：third_party/sqlite 是 .c 文件（只声明 CXX 的话 CMake 会直接不收它）
-project(meow-desk-core LANGUAGES C CXX)
+# 需要 RC：res/resources.rc 把 exe 图标、关于页 logo、图标字体编进 exe
+project(meow-desk-core LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,6 +34,10 @@ add_executable(meow-desk WIN32
     src/file_drop.cpp
     src/rename_box.cpp
     src/shell_drag.cpp
+    src/app_icon.cpp
+    src/icon_font.cpp
+    # exe 图标 / 关于页 logo / 设置页图标字体（见 res/app_res.h）
+    res/resources.rc
     # 本地存储用 SQLite 3 的 amalgamation（单文件，无外部依赖）。
     # 比 *.ini 整份重写可靠：事务保证原子性，加字段走 user_version 迁移。
     # 内存代价实测为零 —— 代码页是 file-backed，不占 private。
@@ -41,6 +46,7 @@ add_executable(meow-desk WIN32
 
 target_include_directories(meow-desk PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/res"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite"
 )
 
@@ -80,7 +86,10 @@ endif()
 # 并决定数据放 %APPDATA% 还是 exe 同目录（便携模式）。
 # 它从自己所在目录读 meow-desk.exe，所以两者要放在一起分发（见 package.sh）。
 # ---------------------------------------------------------------------------
-add_executable(meow-setup WIN32 setup/setup.cpp)
+add_executable(meow-setup WIN32 setup/setup.cpp res/setup_res.rc)
+
+# 安装程序也要能找到 res/app_res.h（setup_res.rc 里 include 它）
+target_include_directories(meow-setup PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/res")
 
 set_property(TARGET meow-setup PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")

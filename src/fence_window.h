@@ -71,6 +71,11 @@ public:
     // 盒子内容区（去掉头部）的屏幕矩形，用来判断"松手时算不算放进了盒子"
     RECT bodyRect() const;
 
+    // 外部弹窗（改名输入框 / 原生菜单）开着时占住盒子：
+    // 那些窗口一盖上来鼠标就「离开」了盒子，悬停展开的盒子会当场缩回去。
+    // 和 menuOpen_ 分开记：菜单是自己知道自己开着的，改名要主程序通知。
+    void SetInteractionHold(bool on) { holdOpen_ = on; }
+
     // ---- 布局尺寸（右键菜单的「查看」会改这些）----
     int headerH() const { return headerH_; }
     int cellH() const;
@@ -138,6 +143,14 @@ public:
     std::vector<RECT> TabRects() const;
     // 命中哪个标签，-1 = 没命中
     int HitTab(POINT clientPt) const;
+
+    // ---- 原位改名要用的两块屏幕矩形 ----
+    // 有分组时「盒子标题」就是第 0 个标签；没有分组时标题单独画在头部左侧。
+    // 两者几何不同，所以统一走这个函数，调用方不用自己判断。
+    RECT RenameRectScreen(int gi) const;
+    // 盒内某个图标「标题区」的屏幕矩形。不在当前分组 / 滚出视野 / 盒子收起 → false。
+    // 几何和 Paint 里画标签那一段一致（图标下方那一行，或列表模式里图标右边）。
+    bool ItemLabelScreenRect(const DesktopIconView* e, RECT& out) const;
 
     // 屏幕坐标下压着哪个图标（-1 之外的空白/头部 → nullptr）。
     // 拖放落点判定用：松手时要知道「放到哪个图标上了」。
@@ -385,5 +398,7 @@ private:
     POINT dragLastCursor_{0, 0};
     // 系统原生右键菜单正开着：这时鼠标「离开」盒子是正常的，不能自动收起
     bool menuOpen_ = false;
+    // 改名输入框正贴着这个盒子：同理不能自动收起（由主程序置位/清位）
+    bool holdOpen_ = false;
     RECT dragStartRect_{};
 };

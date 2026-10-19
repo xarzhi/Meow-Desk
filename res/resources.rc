@@ -1,0 +1,20 @@
+// Program resources: exe icon + About page logo + settings icon font.
+//
+// Everything lives inside the exe instead of being read from disk at runtime:
+//   - the icon must exist even without any data files (taskbar / Alt-Tab / tray
+//     ask the exe for it directly);
+//   - loading the logo or the font from disk would have to cope with installed
+//     vs. portable layouts and a possibly-changed working directory.
+//
+// NOTE: keep this file ASCII-only. rc.exe reads it in the system ANSI code
+// page; UTF-8 comments make it emit C4819 and then fail with "unexpected #endif".
+//
+// Also: do NOT #include <windows.h> here. CMake does not hand the Windows SDK
+// include paths to rc.exe (only to cl.exe), so that include fails with C1083.
+// ICON / RCDATA statements need no Windows types at all.
+#include "app_res.h"
+
+// relative paths are resolved against the directory of this .rc file (res/)
+IDI_APP      ICON   "meow-desk.ico"
+IDR_LOGO_PNG RCDATA "logo-128.png"
+IDR_ICONFONT RCDATA "../src/iconfont/iconfont.ttf"

@@ -12,6 +12,8 @@
 #include <cstdio>
 
 #include "config.h"
+#include "app_icon.h"
+#include "icon_font.h"
 #include "icon_render.h"
 
 #pragma comment(lib, "dwmapi.lib")
@@ -77,10 +79,14 @@ const wchar_t* kNavNames[5] = {
     L"\u5173\u4e8e",        // 关于
 };
 
-// 导航项图标（用几何图形自绘，避免依赖图标字体）
+// 导航项图标：优先用 iconfont（src/iconfont/iconfont.ttf，编在 exe 资源里）。
+// 下面那套几何自绘只在字体加载失败时兜底 —— 它的线条粗细得跟着尺寸手调，
+// 加一项就得再写一段画法，图标字体换图标只要换码位。
 enum class NavGlyph { Sliders, Palette, Cursor, Rules, Info };
 const NavGlyph kNavGlyphs[5] = {NavGlyph::Sliders, NavGlyph::Palette, NavGlyph::Cursor,
                                 NavGlyph::Rules, NavGlyph::Info};
+const wchar_t kNavIcons[5] = {IconCode::kGeneral, IconCode::kAppearance, IconCode::kInteract,
+                              IconCode::kRules, IconCode::kAbout};
 
 bool AppsUseLightTheme() {
     HKEY k = nullptr;
@@ -356,6 +362,10 @@ void SettingsWindow::PaintNav(Graphics& g, const SettingsTheme& t) {
         // 图标
         const float cx = (float)r.left + 26.0f;
         const float cy = (float)(r.top + r.bottom) * 0.5f;
+        const ARGB iconColor = (sel || hov ? C(t.accent) : C(t.sub)).GetValue();
+        if (IconFont::Ready()) {
+            IconFont::Draw(g, kNavIcons[i], cx, cy, 16.0f, iconColor);
+        } else {
         Pen gp(sel || hov ? C(t.accent) : C(t.sub), 1.5f);
         gp.SetStartCap(LineCapRound);
         gp.SetEndCap(LineCapRound);
@@ -401,6 +411,7 @@ void SettingsWindow::PaintNav(Graphics& g, const SettingsTheme& t) {
             g.FillEllipse(&gb, cx - 1.5f, cy - 4.5f, 3.0f, 3.0f);
             g.FillRectangle(&gb, cx - 1.5f, cy - 0.5f, 3.0f, 5.0f);
             break;
+        }
         }
         }
 
@@ -748,9 +759,23 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
 
         const int c1 = 100;
         drawCard(c1, 220);
+
+        // app 图标 + 右侧说明文字（logo 取自 exe 资源里的 128px PNG，失败就只显示文字）
+        const int logoPx = 64;
+        const int textX = kContentX + 20 + logoPx + 16;
+        if (Bitmap* logo = AppLogoBitmap()) {
+            // 用 HighQualityBicubic 缩到 64px：直接 DrawImage 走的是最近邻似的
+            // 默认插值，边缘一圈会发毛。
+            InterpolationMode old = g.GetInterpolationMode();
+            g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+            g.DrawImage(logo, RectF((float)kContentX + 20, (float)c1 + 16.0f, (float)logoPx,
+                                    (float)logoPx));
+            g.SetInterpolationMode(old);
+        }
+
         g.DrawString(L"meow-desk", -1, &fSection,
-                     RectF((float)kContentX + 20, (float)c1 + 16.0f, 300.0f, 24.0f), &sf,
-                     &brText);
+                     RectF((float)textX, (float)c1 + 18.0f, 300.0f, 24.0f), &sf, &brText);
 
         Font fAbout(&family, 12.5f, FontStyleRegular, UnitPixel);
         const wchar_t* lines[] = {
@@ -759,11 +784,11 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
             L"\u6587\u4ef6\u59cb\u7ec8\u7559\u5728\u684c\u9762\u4e0a",
             L"\u9000\u51fa\u540e\u771f\u5b9e\u684c\u9762\u81ea\u52a8\u6062\u590d\u539f\u6837",
         };
-        float ly = (float)c1 + 50.0f;
+        // 三行说明和 logo 挤在同一块高度里（logo 16..80），所以起点从 c1+46 起
+        float ly = (float)c1 + 46.0f;
         for (const wchar_t* s : lines) {
-            g.DrawString(s, -1, &fAbout, RectF((float)kContentX + 20, ly, 560.0f, 20.0f),
-                         &sf, &brSub);
-            ly += 22.0f;
+            g.DrawString(s, -1, &fAbout, RectF((float)textX, ly, 460.0f, 20.0f), &sf, &brSub);
+            ly += 20.0f;
         }
 
         g.DrawString(L"\u6570\u636e\u6587\u4ef6", -1, &fBody,
@@ -1413,6 +1438,20 @@ bool SettingsWindow::Create(HWND owner) {
                             kStyle,
                             sx, sy, w, h, owner, nullptr, inst, this);
     if (!hwnd_) return false;
+
+    // 窗口图标（标题栏 + Alt-Tab）：和 exe / 托盘同一份资源。
+    // 变量名别叫 small / big —— rpcndr.h 里有 `#define small char`，
+    // `HICON small` 会被替换成 `HICON char`，报错还只指向这一行。
+    {
+        const int cx = GetSystemMetrics(SM_CXSMICON);
+        const int cy = GetSystemMetrics(SM_CYICON);
+        if (HICON icBig = LoadAppIcon(cy)) {
+            SendMessageW(hwnd_, WM_SETICON, ICON_BIG, (LPARAM)icBig);
+        }
+        if (HICON icSmall = LoadAppIcon(cx)) {
+            SendMessageW(hwnd_, WM_SETICON, ICON_SMALL, (LPARAM)icSmall);
+        }
+    }
 
     // Win11：圆角 + 跟随系统的深浅色标题栏
     DWORD corner = 2;  // DWMWCP_ROUND

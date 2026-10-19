@@ -1027,7 +1027,16 @@ static void CommitRename(const std::wstring& oldPath, const std::wstring& newNam
     }
 }
 
-// 菜单点了「重命名」→ 在图标所属的盒子正中弹命名弹窗（桌面图标就居中于屏幕）
+// 改名期间占住盒子（fi < 0 = 桌面图标，不用占）。
+// 悬停展开的盒子只要光标一离开就收起 —— 输入框是另一个顶层窗口，
+// 光标一挪进去就算「离开」，不占住的话正在改的那个名字底下会直接缩没。
+static void HoldFence(int fi, bool on) {
+    if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi])
+        g_fences[fi]->SetInteractionHold(on);
+}
+
+// 菜单点了「重命名」→ 在图标标题那一行上就地开输入框
+// （和资源管理器一样：不弹窗、不挪位置）
 static bool BeginRenameIcon(HWND /*owner*/, const std::wstring& path) {
     // 回收站 / 此电脑 这类虚拟项没有文件系统路径，改不了名 —— 与其弹个必然失败的
     // 输入框，不如直接不响应（菜单项是 shell 给的，我们拦在这里）。
@@ -1048,20 +1057,32 @@ static bool BeginRenameIcon(HWND /*owner*/, const std::wstring& path) {
         return false;
     }
 
-    // 锚点 = 这个图标所在的盒子；图标在桌面上就没有锚点（居中于屏幕）
-    HWND anchor = nullptr;
+    // 输入框要贴在这个图标「标题区」上：盒子里问盒子，桌面上问桌面层。
+    // 两边的几何都由各自模块算（和画标签用的是同一段代码），这里不做二次推导。
+    RECT lr{};
+    bool have = false;
     if (e->owner >= 0 && e->owner < (int)g_fences.size() && g_fences[e->owner])
-        anchor = g_fences[e->owner]->hwnd();
+        have = g_fences[e->owner]->ItemLabelScreenRect(e, lr);
+    else
+        have = g_surface.IconLabelScreenRect(e, lr);
+    if (!have) {
+        // 只可能是「这一帧它不参与布局」（滚出视野 / 盒子收起）。宁可不动，
+        // 也不要退回屏幕正中弹一个和图标毫无关系的输入框。
+        LogStep("rename: no label rect for " + Narrow(path));
+        return false;
+    }
 
     // 预填「真实文件名」（带扩展名），让用户改的是磁盘上的名字。
-    // 弹窗里只选中主文件名（不带扩展名），所以直接打字不会把 .lnk 打掉。
+    // 输入框里只选中主文件名（不带扩展名），所以直接打字不会把 .lnk 打掉。
     const size_t slash = path.find_last_of(L'\\');
     const std::wstring fileName = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
     const std::wstring oldPath = path;
-    RenameBox::Show(anchor, L"重命名", fileName,
-                    [oldPath](const std::wstring& name) { CommitRename(oldPath, name); },
-                    RenameBox::Sel::Stem);
-    LogStep("rename box open for " + Narrow(fileName));
+    const int fi = e->owner;   // 图标在盒子里 → 改名期间占住那个盒子
+    HoldFence(fi, true);
+    RenameBox::ShowInPlace(
+        lr, fileName, [oldPath](const std::wstring& name) { CommitRename(oldPath, name); },
+        RenameBox::Sel::Stem, [fi]() { HoldFence(fi, false); });
+    LogStep("rename field open for " + Narrow(fileName));
     return true;
 }
 
@@ -1470,19 +1491,35 @@ static void NewDesktopFolder() {
 
 // ---- 重命名分区 / 分组 ----
 // 盒子是 WS_EX_NOACTIVATE 的分层窗口，拿不到键盘焦点，所以改名走 RenameBox 那个
-// 能激活的小弹窗，摆在盒子正中间。
-// 以前是「贴着头部/标签原地弹一个输入框」：盒子靠屏幕边缘时输入框会被挤出去，
-// 改分组名时还会压住下面一排图标 —— 现在统一成居中的卡片。
+// 能激活的顶层输入格 —— 位置上就贴着「被改的那行字」，和改图标名是同一套。
+//
+// 标签块有 30px 高、字只占其中一行，所以先把矩形压成一行再交给输入框，
+// 否则输入框会横跨整个标签高度，看着像多出来一条横杠。
+static RECT OneLineRect(RECT r) {
+    const int lh = IconLabelLineHeight();
+    const int cy = (r.top + r.bottom) / 2;
+    r.top = cy - lh / 2;
+    r.bottom = r.top + lh;
+    return r;
+}
+
 static void BeginRenameFence(int fi) {
     if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
     FenceWindow* f = g_fences[fi].get();
+    RECT r = f->RenameRectScreen(0);   // 有分组 = 第 0 个标签；没分组 = 头部标题那一行
+    if (r.right <= r.left) {
+        LogStep("rename fence: no title rect");
+        return;
+    }
     const int idx = fi;
-    RenameBox::Show(f->hwnd(), L"重命名分区", f->title(),
-                    [idx](const std::wstring& n) {
-                        // SetTitle 内部会存盘并重画（有分组时第一个标签跟着改）
-                        if (idx >= 0 && idx < (int)g_fences.size() && g_fences[idx])
-                            g_fences[idx]->SetTitle(n);
-                    });
+    HoldFence(idx, true);
+    RenameBox::ShowInPlace(OneLineRect(r), f->title(),
+                           [idx](const std::wstring& n) {
+                               // SetTitle 内部会存盘并重画（有分组时第一个标签跟着改）
+                               if (idx >= 0 && idx < (int)g_fences.size() && g_fences[idx])
+                                   g_fences[idx]->SetTitle(n);
+                           },
+                           RenameBox::Sel::All, [idx]() { HoldFence(idx, false); });
 }
 
 // gi == 0 时 SetGroupName 内部会转成 SetTitle（第一个标签就是盒子标题）
@@ -1490,13 +1527,20 @@ static void BeginRenameGroup(int fi, int gi) {
     if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
     FenceWindow* f = g_fences[fi].get();
     if (gi < 0 || gi >= f->groupCount()) return;
+    RECT r = f->RenameRectScreen(gi);
+    if (r.right <= r.left) {
+        LogStep("rename group: no tab rect");
+        return;
+    }
     const int idx = fi;
     const int g = gi;
-    RenameBox::Show(f->hwnd(), L"重命名分组", f->GroupName(gi),
-                    [idx, g](const std::wstring& n) {
-                        if (idx >= 0 && idx < (int)g_fences.size() && g_fences[idx])
-                            g_fences[idx]->SetGroupName(g, n);
-                    });
+    HoldFence(idx, true);
+    RenameBox::ShowInPlace(OneLineRect(r), f->GroupName(gi),
+                           [idx, g](const std::wstring& n) {
+                               if (idx >= 0 && idx < (int)g_fences.size() && g_fences[idx])
+                                   g_fences[idx]->SetGroupName(g, n);
+                           },
+                           RenameBox::Sel::All, [idx]() { HoldFence(idx, false); });
 }
 
 static void ShowFenceMenu(int fi, POINT sp, int item) {

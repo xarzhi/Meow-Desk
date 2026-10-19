@@ -988,6 +988,84 @@ int FenceWindow::HitTab(POINT clientPt) const {
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+// 原位改名用的矩形
+// ---------------------------------------------------------------------------
+RECT FenceWindow::RenameRectScreen(int gi) const {
+    RECT none{0, 0, 0, 0};
+    if (!hwnd_ || !showTitle_) return none;
+    const int hh = HeadH();
+    if (hh < 16) return none;
+
+    RECT r{};
+    if (hasTabs()) {
+        const auto tabs = TabRects();
+        if (gi < 0 || gi >= (int)tabs.size()) return none;
+        r = tabs[gi];
+    } else {
+        if (gi > 0) return none;
+        // 和 Paint 里「没有分组 → 标题单独画一行」那一支对齐：
+        //   RectF(16, 0, width_ - 56, headH)，纵向居中
+        const int th = std::min(hh - 8, 30);
+        const int top = (hh - th) / 2;
+        r = RECT{16, top, width_ - 56, top + th};
+    }
+    MapWindowPoints(hwnd_, nullptr, reinterpret_cast<LPPOINT>(&r), 2);
+    return r;
+}
+
+bool FenceWindow::ItemLabelScreenRect(const DesktopIconView* e, RECT& out) const {
+    if (!e || !hwnd_ || collapsed_) return false;
+    // 下标必须按「实际参与布局的那批」算 —— 和 Paint / HitItem 用一个口径
+    std::vector<DesktopIconView*> mine;
+    CollectVisible(mine);
+    int idx = -1;
+    for (size_t i = 0; i < mine.size(); ++i) {
+        if (mine[i] == e) {
+            idx = (int)i;
+            break;
+        }
+    }
+    if (idx < 0) return false;
+
+    int ix = 0, iy = 0;
+    if (!ItemOrigin(idx, ix, iy)) return false;   // 滚出视野 / 放不下
+
+    const int ch = cellH();
+    const int lineH = LabelTextHeight();
+    const int iconW = e->bmp.valid() ? e->bmp.width : 32;
+    const int iconH = e->bmp.valid() ? e->bmp.height : 32;
+    const int twoLine = lineH * 2;
+
+    RECT r{};
+    if (viewMode() == 5) {
+        // 详情模式：名称是表格里的一列（左对齐、单行），不是图标下方那块标签
+        const DetailCols dl = DetailLayoutFor(kPad, width_ - kPad * 2);
+        if (dl.nameW <= 0) return false;
+        const int top = iy + (ch - lineH) / 2;
+        r = RECT{dl.nameX, top, dl.nameX + dl.nameW, top + lineH};
+    } else if (IsListView()) {
+        // 列表：图标靠左 8px，标签在它右边（几何取自 Paint 的 listMode 分支）
+        const int iconX = ix + 8;
+        const int labW = std::max(24, (width_ - kPad * 2) - (iconX - ix) - iconW - 8);
+        int th = iconH;
+        if (th < twoLine) th = std::min(twoLine, ch - 2);
+        const int left = iconX + iconW + 8;
+        r = RECT{left, iy, left + labW, iy + th};
+    } else {
+        const int textTop = iy + 4 + iconH + 2;
+        int th = ch - (textTop - iy);
+        if (th > twoLine) th = twoLine;
+        if (th < 14) th = 14;
+        int labLeft = 0, labW = 0;
+        ItemLabelBox(idx, labLeft, labW);
+        r = RECT{labLeft, textTop, labLeft + labW, textTop + th};
+    }
+    MapWindowPoints(hwnd_, nullptr, reinterpret_cast<LPPOINT>(&r), 2);
+    out = r;
+    return true;
+}
+
 // 重排本盒子图标在全局表里的相对顺序。
 // 只动 owner == index_ 的那些槽位，盒子里第 k 个图标因此变成第 k 个排序结果 ——
 // 布局完全由「表里的相对顺序」决定，所以排完不用通知任何人。
@@ -1669,9 +1747,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         trackingLeave_ = false;
         suppressAutoExpand_ = false;   // 离开过一次，下次悬停又能展开了
         if (hot_ != -1) { hot_ = -1; Redraw(); }
-        // 原生菜单是模态的，它一盖上来鼠标就「离开」了盒子；
-        // 这时候不能把盒子收起来，否则菜单底下的盒子直接缩没。
-        if (autoExpanded_ && !menuOpen_) {
+        // 原生菜单 / 改名输入框是模态的（或至少盖在盒子上），它们一出现鼠标就「离开」了
+        // 盒子；这时候不能把盒子收起来，否则菜单或正在改的名字底下直接缩没了。
+        if (autoExpanded_ && !menuOpen_ && !holdOpen_) {
             if (itemDragging_ || dragging_) {
                 autoExpanded_ = false;   // 正在操作，别收
             } else {

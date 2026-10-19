@@ -1,0 +1,11 @@
+// Icon-only resource set for meow-setup.exe: the installer is a separate
+// executable, and a windowed app with no ICON resource shows the generic
+// Windows placeholder in its title bar.
+//
+// Kept separate from resources.rc so the installer does not also carry the
+// About-page PNG and the icon font (they are only used by the main app).
+//
+// NOTE: ASCII only -- see resources.rc.
+#include "app_res.h"
+
+IDI_APP ICON "meow-desk.ico"
