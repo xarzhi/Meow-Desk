@@ -159,19 +159,8 @@ ARGB WithAlpha(ARGB c, BYTE a) { return ((ARGB)a << 24) | (c & 0x00FFFFFFu); }
 
 // 标签字体的行高：LabelDib 里 DrawTextW 是 DT_TOP，所以盒子高度给到行高、
 // 再按 (行高 - 行高)/2 自然就垂直居中了。量一次缓存起来。
-int LabelTextHeight() {
-    static int cached = 0;
-    if (cached > 0) return cached;
-    HDC dc = CreateCompatibleDC(nullptr);
-    if (!dc) return 16;
-    HGDIOBJ of = SelectObject(dc, IconLabelFont());
-    TEXTMETRICW tm{};
-    GetTextMetricsW(dc, &tm);
-    SelectObject(dc, of);
-    DeleteDC(dc);
-    cached = tm.tmHeight > 0 ? (int)tm.tmHeight : 16;
-    return cached;
-}
+// 现在交给 icon_render 统一缓存 —— 桌面层算「两行标题」也用同一个值。
+int LabelTextHeight() { return IconLabelLineHeight(); }
 
 // 「类型」列：和资源管理器一样「PNG 图片」这种写法，靠扩展名 + 注册表里的类型描述。
 // 注册表查询很贵（每项一次 RegQueryValue），所以只在部分常见扩展名上下探，
@@ -555,13 +544,17 @@ void FenceWindow::ApplyResize(POINT screenPt) {
 // 查看 / 排序（右键菜单驱动）
 // ---------------------------------------------------------------------------
 int FenceWindow::cellH() const {
+    // 标题区固定按「两行」预留：平时只画一行（超出省略），单击选中后展开成两行。
+    // 这样展开时不用改格子高度，图标不会因为「点了一下」就重新排位。
+    // 行高从标题字体量出来，不能写死 —— 换系统字号 / 高 DPI 会露半个字。
+    const int twoLineH = 4 + iconPx() + 2 + LabelTextHeight() * 2;
     switch (viewMode()) {
-    case 0: return showLabels_ ? 64 : 50;     // 小图标
-    case 2: return showLabels_ ? 102 : 82;    // 大图标
-    case 3: return showLabels_ ? 126 : 102;   // 超大图标
+    case 0: return showLabels_ ? std::max(64, twoLineH) : 50;     // 小图标
+    case 2: return showLabels_ ? std::max(102, twoLineH) : 82;    // 大图标
+    case 3: return showLabels_ ? std::max(126, twoLineH) : 102;   // 超大图标
     case 4: return showLabels_ ? 52 : 44;     // 列表（图标 32px，一行一个）
     case 5: return 44;                        // 详情：固定行高，名称在右侧列里
-    default: return showLabels_ ? 84 : kCellHCompact;   // 中等图标
+    default: return showLabels_ ? std::max(84, twoLineH) : kCellHCompact;   // 中等图标
     }
 }
 
@@ -2300,12 +2293,18 @@ void FenceWindow::Paint() {
                                  gaLabel, gd);
                 }
             } else if (showLabels_) {
+                // 平时一行（超出省略），单击选中后展开成两行 —— 和桌面图标一致
+                const int maxLines = e->selected ? 2 : 1;
                 if (listMode) {
                     const int labW = std::max(24, (width_ - kPad * 2) - (iconX - ix) - iconW - 8);
-                    LabelDib* lab = LabelOf(e, labW, iconH, glow);
+                    // 列表行的标签盒给到「两行」的高度（图标本身就有 32px，够两行）
+                    int labH = iconH;
+                    const int twoLine = LabelTextHeight() * 2;
+                    if (labH < twoLine) labH = std::min(twoLine, ch - 2);
+                    LabelDib* lab = LabelOf(e, labW, labH, glow, maxLines);
                     if (lab && lab->valid()) {
                         const int left = iconX + iconW + 8 - lab->pad;
-                        const int top = iy + (ch - lab->h) / 2;
+                        const int top = iy + (ch - textH) / 2 - lab->pad;
                         BlendIntoDim(dst, bufW_, bufH_,
                                      reinterpret_cast<const BYTE*>(lab->bits), lab->w, lab->h,
                                      left, top, gaLabel, gd);
@@ -2314,11 +2313,15 @@ void FenceWindow::Paint() {
                     const int iconBottom = iy + 4 + iconH;
                     const int textTop = iconBottom + 2;
                     int th = ch - (textTop - iy);
+                    // 标题区最多两行：格子高度就是按两行预留的，
+                    // 这里再夹一次，免得「不显示标题再打开」之类的老配置把第三行画出来
+                    const int twoLine = LabelTextHeight() * 2;
+                    if (th > twoLine) th = twoLine;
                     if (th < 14) th = 14;
                     int labLeft = 0, labW = 0;
                     ItemLabelBox((int)i, labLeft, labW);
                     labLeft += dxOf[i];   // 排序过渡中文字跟着图标一起滑
-                    LabelDib* lab = LabelOf(e, labW, th, glow);
+                    LabelDib* lab = LabelOf(e, labW, th, glow, maxLines);
                     if (lab && lab->valid()) {
                         int contentW = lab->w - lab->pad * 2;
                         int left = labLeft + (labW - contentW) / 2 - lab->pad;
@@ -2404,17 +2407,20 @@ void FenceWindow::Paint() {
     }
 }
 
-LabelDib* FenceWindow::LabelOf(DesktopIconView* e, int boxW, int boxH, int glow) {
+LabelDib* FenceWindow::LabelOf(DesktopIconView* e, int boxW, int boxH, int glow, int maxLines) {
+    if (maxLines < 1) maxLines = 1;
+    // maxLines 必须进 key：选中/取消选中会切换单行↔两行，不进 key 就会一直用旧的
     std::wstring key = e->name + L"\x1|" + std::to_wstring(boxW) + L"x" +
-                       std::to_wstring(boxH) + L"g" + std::to_wstring(glow);
+                       std::to_wstring(boxH) + L"g" + std::to_wstring(glow) + L"m" +
+                       std::to_wstring(maxLines);
     auto k = labelKeys_.find(e);
     if (k != labelKeys_.end() && k->second == key) {
         auto it = labels_.find(e);
         if (it != labels_.end()) return &it->second;
     }
     LabelDib d;
-    // 与桌面同一套参数：白色 + 光晕，盒子内只允许一行
-    if (!d.Build(e->name, IconLabelFont(), boxW, boxH, glow, RGB(255, 255, 255), 1)) {
+    // 与桌面同一套参数：白色 + 光晕
+    if (!d.Build(e->name, IconLabelFont(), boxW, boxH, glow, RGB(255, 255, 255), maxLines)) {
         labelKeys_[e] = key;
         labels_[e] = LabelDib{};
         return nullptr;

@@ -281,7 +281,7 @@ private:
     // 返回是否真的移动了。
     bool SnapOutOfOverlap();
 
-    LabelDib* LabelOf(DesktopIconView* e, int boxW, int boxH, int glow);
+    LabelDib* LabelOf(DesktopIconView* e, int boxW, int boxH, int glow, int maxLines);
     HWND hwnd_ = nullptr;
     int index_ = 0;
     FenceConfig* cfg_ = nullptr;

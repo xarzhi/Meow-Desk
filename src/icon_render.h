@@ -59,6 +59,11 @@ void FillRectAlpha(BYTE* dst, int dstW, int dstH, const RECT& r, int a, COLORREF
 // 系统桌面图标标题字体（SPI_GETICONTITLELOGFONT，灰度抗锯齿）
 HFONT IconLabelFont();
 
+// 标题字体的行高（tmHeight，已缓存）。
+// 「标题区按两行预留 / 单击展开成两行」的几何全从这里推，
+// 不能写死像素值 —— 换系统字号或高 DPI 之后会露半个字。
+int IconLabelLineHeight();
+
 // ---------------------------------------------------------------------------
 // 一张图标位图对应的 DIB（缓存起来，每帧只做一次拷贝合成）
 // ---------------------------------------------------------------------------

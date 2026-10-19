@@ -382,6 +382,22 @@ HFONT IconLabelFont() {
     return cached;
 }
 
+// 标题字体的行高（tmHeight）。「标题区留两行」的一切几何都从它推出来 ——
+// 写死 16 之类的数字在换了系统字号 / 高 DPI 之后就会露半个字。
+int IconLabelLineHeight() {
+    static int cached = 0;
+    if (cached > 0) return cached;
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return 16;
+    HGDIOBJ of = SelectObject(dc, IconLabelFont());
+    TEXTMETRICW tm{};
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, of);
+    DeleteDC(dc);
+    cached = tm.tmHeight > 0 ? (int)tm.tmHeight : 16;
+    return cached;
+}
+
 // ---------------------------------------------------------------------------
 // IconDib
 // ---------------------------------------------------------------------------

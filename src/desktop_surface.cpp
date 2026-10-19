@@ -309,17 +309,20 @@ struct DesktopSurface::Impl {
         return &r.first->second;
     }
 
-    LabelDib* Label(DesktopIconView* e, int boxW, int boxH, int glow) {
+    // maxLines：平时 1 行（超出省略），选中（单击）后展开到 2 行。
+    // 它必须进缓存 key —— 否则点一下图标，拿到的还是那张单行的旧 DIB。
+    LabelDib* Label(DesktopIconView* e, int boxW, int boxH, int glow, int maxLines) {
         if (noCache) return nullptr;
         std::wstring key = e->name + L"\x1|" + std::to_wstring(boxW) + L"x" +
-                           std::to_wstring(boxH) + L"g" + std::to_wstring(glow);
+                           std::to_wstring(boxH) + L"g" + std::to_wstring(glow) + L"m" +
+                           std::to_wstring(maxLines);
         auto k = labelKeys.find(e);
         if (k != labelKeys.end() && k->second == key) {
             auto l = labels.find(e);
             if (l != labels.end()) return &l->second;
         }
         LabelDib d;
-        if (!d.Build(e->name, IconLabelFont(), boxW, boxH, glow)) {
+        if (!d.Build(e->name, IconLabelFont(), boxW, boxH, glow, RGB(255, 255, 255), maxLines)) {
             labelKeys[e] = key;
             labels[e] = LabelDib{};
             return nullptr;
@@ -981,12 +984,17 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging) {
 
     if (e->name.empty() || !showLabels_) return;
 
+    // 标题区按「两行」预留：平时只画一行（超出用省略号），单击选中后展开成两行。
+    // 两行是硬上限 —— 再长的名字也只是两行 + 省略号，不会顶到下一排图标上去。
+    const int lineH = IconLabelLineHeight();
     int textTop = y + kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap;
     int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);
+    if (textH > lineH * 2) textH = lineH * 2;
     if (textH < 14) textH = 14;
+    const int maxLines = e->selected ? 2 : 1;
 
     if (!impl_) return;
-    LabelDib* lab = impl_->Label(e, cellW_ - kLabelInset, textH, textShadow_ ? 2 : 0);
+    LabelDib* lab = impl_->Label(e, cellW_ - kLabelInset, textH, textShadow_ ? 2 : 0, maxLines);
     if (lab && lab->valid()) {
         int contentW = lab->w - lab->pad * 2;   // DIB 已按实际文字宽度收窄，按内容居中
         int left = x + (cellW_ - contentW) / 2 - lab->pad;
@@ -1231,11 +1239,16 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging) {
 
     if (e->name.empty() || !showLabels_) return;
 
+    // 同上：标题区两行预留，单行省略 / 选中展开
+    const int lineH = IconLabelLineHeight();
     int textTop = y + kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap;
     int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);
+    if (textH > lineH * 2) textH = lineH * 2;
     if (textH < 14) textH = 14;
+    const int maxLines = e->selected ? 2 : 1;
 
-    if (LabelDib* lab = impl_->Label(e, cellW_ - kLabelInset, textH, textShadow_ ? 2 : 0)) {
+    if (LabelDib* lab = impl_->Label(e, cellW_ - kLabelInset, textH, textShadow_ ? 2 : 0,
+                                     maxLines)) {
         if (lab->valid()) {
             int contentW = lab->w - lab->pad * 2;
             int left = x + (cellW_ - contentW) / 2 - lab->pad;
