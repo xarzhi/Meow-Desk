@@ -41,6 +41,104 @@ void FenceWindow::SetCaptureExcluder(std::function<void(const RECT&, bool)> fn) 
 
 namespace {
 
+// 抓回来的底图降采样到 1/kBackdropScale 边（每 2x2 取平均）。
+// w/h 是**屏幕坐标**下的尺寸，输出像素数是 ceil(w/2) × ceil(h/2)。
+// 一次约 0.5ms，只在「抓到新底图」时发生，不在拖动路径上。
+void DownsampleBackdrop(const std::vector<uint8_t>& in, int w, int h,
+                       std::vector<uint8_t>& out) {
+    const int ow = (w + 1) / 2;
+    const int oh = (h + 1) / 2;
+    out.resize((size_t)ow * (size_t)oh * 4);
+    if (in.size() < (size_t)w * (size_t)h * 4) {
+        out.clear();
+        return;
+    }
+    for (int y = 0; y < oh; ++y) {
+        const uint8_t* r0 = in.data() + (size_t)(y * 2) * (size_t)w * 4;
+        const uint8_t* r1 = (y * 2 + 1 < h) ? r0 + (size_t)w * 4 : r0;
+        uint8_t* d = out.data() + (size_t)y * (size_t)ow * 4;
+        for (int x = 0; x < ow; ++x) {
+            const int x0 = x * 2;
+            const int x1 = (x * 2 + 1 < w) ? x * 2 + 1 : x0;
+            const uint8_t* a = r0 + (size_t)x0 * 4;
+            const uint8_t* b = r0 + (size_t)x1 * 4;
+            const uint8_t* c = r1 + (size_t)x0 * 4;
+            const uint8_t* e = r1 + (size_t)x1 * 4;
+            uint8_t* o = d + (size_t)x * 4;
+            o[0] = (uint8_t)((a[0] + b[0] + c[0] + e[0] + 2) >> 2);
+            o[1] = (uint8_t)((a[1] + b[1] + c[1] + e[1] + 2) >> 2);
+            o[2] = (uint8_t)((a[2] + b[2] + c[2] + e[2] + 2) >> 2);
+            o[3] = (uint8_t)((a[3] + b[3] + c[3] + e[3] + 2) >> 2);
+        }
+    }
+}
+
+// 把一张 1/kBackdropScale 的底图放大铺满整个缓冲（最近邻）。
+//
+// 越界按边缘列/行夹取 —— 原来「底图比缓冲小」时是 5 次 DrawImage 分区拉伸，
+// 现在这一套夹取天然就覆盖了那种情况（改尺寸把盒子拉出抓取余量时）。
+// 手感：1116×969 实测 0.74ms，和原来 1:1 贴图的 0.69ms 一个量级。
+void UpscaleBackdrop(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW,
+                     int srcH, int sx0, int sy0, int scale) {
+    if (!dst || !src || srcW <= 0 || srcH <= 0) return;
+    const int spanW = (srcW - 1) * scale;   // 最后一个源像素覆盖到的屏幕坐标
+    const int spanH = (srcH - 1) * scale;
+    for (int y = 0; y < dstH; ++y) {
+        int qy = sy0 + y;
+        if (qy < 0) qy = 0;
+        else if (qy > spanH) qy = spanH;
+        const BYTE* srow = src + (size_t)(qy / scale) * (size_t)srcW * 4;
+        BYTE* drow = dst + (size_t)y * (size_t)dstW * 4;
+        int qx = sx0;
+        for (int x = 0; x < dstW; ++x, ++qx) {
+            int c = qx;
+            if (c < 0) c = 0;
+            else if (c > spanW) c = spanW;
+            std::memcpy(drow + (size_t)x * 4, srow + (size_t)(c / scale) * 4, 4);
+        }
+    }
+}
+
+// 放大出来的是整块矩形，但卡片是圆角的：把四个圆角外侧那几小块清成透明。
+// 只有 4 × r × r 个像素（r ≤ 20），代价可忽略。
+// 判断用「像素中心在圆内」，硬边界 —— 和原来 GDI+ 的矩形裁剪完全一致
+// （圆角那点抗锯齿一直是由上面的着色 FillPath / 描边 DrawPath 负责的）。
+void ClearOutsideRoundCorners(BYTE* dst, int w, int h, double rad) {
+    if (!dst || w <= 0 || h <= 0) return;
+    // 半径必须和 AddRoundRect 完全一致：直径不能超过短边，
+    // 且 d <= 1 时那边画的是直角矩形（收起态那种 4px 高的把手就会走到这儿）。
+    // 不一致的话：收起的盒子会被清出一个豁口，或者直角处留一块方角。
+    double d = rad * 2.0;
+    if (d > (double)w) d = (double)w;
+    if (d > (double)h) d = (double)h;
+    if (d <= 1.0) return;
+    const double r = d * 0.5;
+    const int box = (int)std::ceil(r);
+    const double rr = r * r;
+    for (int cy = 0; cy < 2; ++cy) {
+        for (int cx = 0; cx < 2; ++cx) {
+            const int x0 = cx ? w - box : 0;
+            const int y0 = cy ? h - box : 0;
+            const double ox = cx ? (double)w - r : r;
+            const double oy = cy ? (double)h - r : r;
+            for (int y = y0; y < y0 + box && y < h; ++y) {
+                if (y < 0) continue;
+                BYTE* row = dst + (size_t)y * (size_t)w * 4;
+                for (int x = x0; x < x0 + box && x < w; ++x) {
+                    if (x < 0) continue;
+                    const double dx = (double)x + 0.5 - ox;
+                    const double dy = (double)y + 0.5 - oy;
+                    if (dx * dx + dy * dy > rr) std::memset(row + (size_t)x * 4, 0, 4);
+                }
+            }
+        }
+    }
+}
+
+}  // namespace
+
+namespace {
+
 const wchar_t* kClass = L"MeowDeskFence";
 
 const int kPad = 14;
@@ -2313,6 +2411,17 @@ void FenceWindow::RefreshBackdrop(int pad, bool defer) {
         if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, false);
     }
     if (!ok || px.empty()) return;   // 抓不到：留着旧图
+
+    // 降到 1/kBackdropScale 边再收下：模糊过的图看不出差别，内存只剩 1/4。
+    // 注意 w/h 仍然按屏幕坐标记（见 kBackdropScale 的注释），只有像素被缩小。
+    {
+        // 注意变量名别叫 small：Windows 头文件里 #define small char（遗留宏）
+        std::vector<uint8_t> tiny;
+        DownsampleBackdrop(px, w, h, tiny);
+        if (tiny.empty()) return;
+        px.swap(tiny);
+    }
+
     if (defer) {
         // 只暂存。注意这里不能用 swap：backdrop_ 还在显示，换了等于当场变背景
         bdPre_ = std::move(px);
@@ -2395,7 +2504,13 @@ void FenceWindow::EnsureBackdropCover() {
         if (bdJob_->ok && (!bdJob_->uniform || bdPlainArea_ || backdrop_.empty())) {
             // 用上了。uniform 的两种含义见 CaptureBlurredBackdropFast 的注释：
             // 已知这块地方就是纯色（bdPlainArea_）、或者现在压根没有底图时，照用。
-            backdrop_ = std::move(bdJob_->px);
+            std::vector<uint8_t> tiny;   // 别叫 small，那是 Windows 的遗留宏
+            DownsampleBackdrop(bdJob_->px, bdJob_->w, bdJob_->h, tiny);
+            if (tiny.empty()) {   // 尺寸对不上（理论上不该发生）：丢掉这一单
+                bdJob_.reset();
+                return;
+            }
+            backdrop_.swap(tiny);
             backdropW_ = bdJob_->w;
             backdropH_ = bdJob_->h;
             backdropX_ = bdJob_->x;
@@ -2413,8 +2528,8 @@ void FenceWindow::EnsureBackdropCover() {
         if (wasUniform && nowT - backdropCoverT_ >= 500) {
             backdropCoverT_ = nowT;
             RefreshBackdrop(0);
-            bdPlainArea_ = !backdrop_.empty() && NearlyUniform(backdrop_, backdropW_,
-                                                              backdropH_);
+            bdPlainArea_ = !backdrop_.empty() && NearlyUniform(backdrop_, BdPixW(),
+                                                              BdPixH());
             return;
         }
         // 其它情况（抓屏直接失败）：慢路径兜底，限频 300ms
@@ -2475,7 +2590,8 @@ void FenceWindow::Paint() {
     const int bsy = (int)cur.top - backdropY_;
     const bool hasBackdrop = cfg_->acrylic && !backdrop_.empty() && backdropW_ > 0 &&
                              backdropH_ > 0 &&
-                             backdrop_.size() >= (size_t)backdropW_ * (size_t)backdropH_ * 4;
+                             backdrop_.size() >=
+                                 (size_t)BdPixW() * (size_t)BdPixH() * 4;
 
     {
         Bitmap target(bufW_, bufH_, bufW_ * 4, PixelFormat32bppPARGB,
@@ -2499,52 +2615,17 @@ void FenceWindow::Paint() {
         if (hasBackdrop) {
             // 亚克力：模糊壁纸打底 + 半透明着色，整体不透明。
             //
-            // 拖动 / 改尺寸期间不抓屏（见 EnsureBackdropCover 的说明），所以底图
-            // 常常「盖不住」当前窗口。这时候把**取样原点夹回底图内部**就够了：
-            // 整块磨砂相对盒子平移几个像素，模糊过的画面完全看不出来，
-            // 而且仍然是一次 1:1 的整块拷贝，不额外花时间。
-            //
-            // 别在这儿加「把越界的边用拉伸补上」那种处理：那要 4 次带缩放的
-            // DrawImage，拖动时每帧多好几毫秒，正是之前「更卡了」的原因之一。
-            Bitmap blur(backdropW_, backdropH_, backdropW_ * 4, PixelFormat32bppPARGB,
-                        backdrop_.data());
-            if (backdropW_ >= bufW_ && backdropH_ >= bufH_) {
-                const int cx = std::clamp(bsx, 0, backdropW_ - bufW_);
-                const int cy = std::clamp(bsy, 0, backdropH_ - bufH_);
-                gfx.SetClip(&shape);
-                gfx.DrawImage(&blur, Rect(0, 0, bufW_, bufH_), cx, cy, bufW_, bufH_,
-                              UnitPixel);
-                gfx.ResetClip();
-            } else {
-                // 底图比缓冲还小：主要是「改尺寸」把盒子拉得超出了开始那一刻抓的余量，
-                // 也可能是贴着屏幕边缘抓不全。这里按交集画，再用**最近的一列/一行撑开**
-                // 缺的那一条 —— 模糊过的画面没有细节，拉伸看不出来；不然那一侧会变成
-                // 只有半透明着色，看起来就是「拉大之后盒子变透明了」（以前的老毛病）。
-                //
-                // 注意：这条分支只在底图比缓冲**小**时才会走到，正常的拖动（底图比
-                // 缓冲大）走上面那条 1:1 夹取，一次 DrawImage 就完事，别把拉伸挪上去。
-                const int dx = std::max(0, -bsx);
-                const int dy = std::max(0, -bsy);
-                const int cx = std::max(0, bsx);
-                const int cy = std::max(0, bsy);
-                const int cw = std::min(bufW_ - dx, backdropW_ - cx);
-                const int chh = std::min(bufH_ - dy, backdropH_ - cy);
-                if (cw > 0 && chh > 0) {
-                    gfx.SetClip(&shape);
-                    gfx.DrawImage(&blur, Rect(dx, dy, cw, chh), cx, cy, cw, chh, UnitPixel);
-                    if (dx > 0)
-                        gfx.DrawImage(&blur, Rect(0, dy, dx, chh), cx, cy, 1, chh, UnitPixel);
-                    if (dx + cw < bufW_)
-                        gfx.DrawImage(&blur, Rect(dx + cw, dy, bufW_ - dx - cw, chh),
-                                      cx + cw - 1, cy, 1, chh, UnitPixel);
-                    if (dy > 0)
-                        gfx.DrawImage(&blur, Rect(0, 0, bufW_, dy), cx, cy, cw, 1, UnitPixel);
-                    if (dy + chh < bufH_)
-                        gfx.DrawImage(&blur, Rect(0, dy + chh, bufW_, bufH_ - dy - chh), cx,
-                                      cy + chh - 1, cw, 1, UnitPixel);
-                    gfx.ResetClip();
-                }
-            }
+            // 底图存的是 1/kBackdropScale 分辨率（省 3/4 内存，见 kBackdropScale），
+            // 这里手写最近邻放大铺满缓冲：
+            //   · 比 GDI+ 的 1:1 DrawImage 只慢 0.05ms（0.74 vs 0.69），可以忽略；
+            //   · GDI+ 自己那条缩放路径要 26ms，绝对不能用，拖动会当场卡死。
+            // 越界（拖动/改尺寸时底图盖不住当前窗口）按边缘列/行夹取：
+            // 整块磨砂相对盒子平移几个像素，模糊过的画面看不出来，
+            // 也不会像以前那样在拉大后退回「只有半透明着色」。
+            UpscaleBackdrop(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, backdrop_.data(),
+                            BdPixW(), BdPixH(), bsx, bsy, kBackdropScale);
+            // 放大铺的是矩形，四个圆角外面那点得清掉，否则卡片变成直角
+            ClearOutsideRoundCorners(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, rad);
             SolidBrush tint{Color((BYTE)std::min(255, (int)(alpha * 0.58)), r, g, b)};
             gfx.FillPath(&tint, &shape);
         } else {

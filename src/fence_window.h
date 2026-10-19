@@ -445,6 +445,19 @@ private:
     // 亚克力底图
     std::vector<uint8_t> backdrop_;
     int backdropW_ = 0, backdropH_ = 0;   // 抓取时的尺寸（总是展开尺寸）
+    // 底图按 1/kBackdropScale 分辨率存。
+    //
+    // 磨砂底图先被模糊过（半径 20），本身几乎没有高频细节，降到 1/2 边
+    // （内存 1/4）再放大回来肉眼分辨不出，但七个盒子合计能省 8MB 上下。
+    // 放大是 Paint 里手写的最近邻循环：实测 0.74ms，和原来 1:1 贴图的 0.69ms
+    // 基本一样 —— **千万别改成 GDI+ 的 DrawImage 缩放**，同一张图它要 26ms
+    // （GDI+ 的插值缩放走的是慢路径），拖动会当场卡成 PPT。
+    //
+    // backdropW_/H_ 仍然是**屏幕坐标下的覆盖范围**，除以 kBackdropScale 才是
+    // 像素尺寸，所以取样、覆盖判断这些几何代码一行都不用改。
+    static constexpr int kBackdropScale = 2;
+    int BdPixW() const { return (backdropW_ + kBackdropScale - 1) / kBackdropScale; }
+    int BdPixH() const { return (backdropH_ + kBackdropScale - 1) / kBackdropScale; }
     int backdropX_ = 0, backdropY_ = 0;
     // 上一次提交后台补抓的时刻（限频用）
     DWORD backdropCoverT_ = 0;
