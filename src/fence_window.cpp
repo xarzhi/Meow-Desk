@@ -533,6 +533,7 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     const Edge e = HitEdge(pt);
     if (e != Edge::None) {
         resizing_ = true;
+        resizeCaptured_ = false;   // 第一次真正拉动时才抓底图（见 ApplyResize）
         resizeEdge_ = e;
         resizeStartRect_ = dragStartRect_;
         resizeStartW_ = width_;
@@ -561,6 +562,13 @@ void FenceWindow::ApplyResize(POINT screenPt) {
     if (!resizing_ || !hwnd_) return;
     const int dx = screenPt.x - pressScreenPt_.x;
     const int dy = screenPt.y - pressScreenPt_.y;
+
+    // 第一次真的开始改尺寸：趁盒子还没变，同步抓一圈带余量的底图。
+    // 之后整个拉伸过程都不再抓屏（抓屏会抢 GDI 锁，边拉边抓必卡）。
+    if (!resizeCaptured_) {
+        resizeCaptured_ = true;
+        if (cfg_ && cfg_->acrylic) RefreshBackdrop(128);
+    }
 
     int l = resizeStartRect_.left, t = resizeStartRect_.top;
     int r = resizeStartRect_.right, b = resizeStartRect_.bottom;
@@ -1657,9 +1665,10 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     // 未吸附的「原始位置」从当前实际位置起算
                     dragRawX_ = dragLastX_;
                     dragRawY_ = dragLastY_;
-                    // 先把「四周多抓一圈」的磨砂底图丢给工作线程：这样接下来
-                    // 一两百个像素的移动都不用再补抓，也就不会有任何卡顿。
-                    if (cfg_ && cfg_->acrylic) RequestBackdropAsync(128);
+                    // 先把「四周多抓一圈」的磨砂底图抓出来。必须**同步**抓完再开始动：
+                    // 异步的话抓屏会和拖动的前几帧抢 win32k 的 GDI 锁，反而卡。
+                    // 这一刻盒子还没动，多花 18ms 用户看不见。
+                    if (cfg_ && cfg_->acrylic) RefreshBackdrop(128);
                 }
                 if (dragging_) {
                     const int mdx = cur.x - dragLastCursor_.x;
@@ -1887,6 +1896,8 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         if (wasResizing) {
+            // 拉完了：现在盒子不动了，可以补抓一张真正对得上的底图
+            if (cfg_ && cfg_->acrylic) RequestBackdropAsync(0);
             if (onGeometryChanged) onGeometryChanged();
             Redraw();
             return 0;
@@ -1895,6 +1906,10 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             // 松手不再「把重叠的盒子推开」：以前那一步会让盒子在松开的一瞬间
             // 跳一下（用户以为卡了）。现在拖动过程只吸附不阻挡，想叠就叠着，
             // 位置完全由用户决定。
+            //
+            // 拖完补一张贴合的底图：拖动全程用的是开局那一圈（为了不卡），
+            // 挪得远的话画面和真实壁纸已经对不上了，这里一次性校正。
+            if (cfg_ && cfg_->acrylic) RequestBackdropAsync(0);
             if (onGeometryChanged) onGeometryChanged();
             Redraw();
             return 0;
@@ -1956,6 +1971,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER: {
         if (wp != kAnimTimer) break;
         bool busy = false;
+        bool waiting = false;   // 后台补抓还没回来：保住定时器，但这一帧不重画
 
         // 收起/展开的高度补间
         const int diff = targetH_ - curH_;
@@ -1983,15 +1999,18 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         // 亚克力底图补抓（在工作线程里跑）：回来了就在这里换上并重画一帧。
-        // 鼠标停住不动时没有鼠标消息，只能靠这个定时器把结果收进来。
+        // 还在等的时候**不重画** —— 拖动时每 16ms 多画一帧就是白白和鼠标抢时间。
         if (bdJob_) {
-            EnsureBackdropCover();
-            // 要么还在等（继续转），要么刚换上（这一帧要重画）
-            busy = true;
+            if (bdJob_->finished.load(std::memory_order_acquire)) {
+                EnsureBackdropCover();
+                busy = true;
+            } else {
+                waiting = true;
+            }
         }
 
         if (!busy) {
-            KillTimer(h, kAnimTimer);
+            if (!waiting) KillTimer(h, kAnimTimer);
             return 0;
         }
         Redraw();
@@ -2041,6 +2060,8 @@ void FenceWindow::EnsureBackbuffer(int w, int h) {
 // 之后盒子在这个圈里怎么挪，绘制时按偏移「取子窗口」就行 —— 不用每帧重新
 // 抓屏 + 模糊（那一步是几十毫秒的量级，拖动时每帧做必然卡）。
 void FenceWindow::RefreshBackdrop(int pad) {
+    // 同步抓的这一张比在途的后台那一单更新，作废掉，免得过两帧被旧的顶回去
+    bdJob_.reset();
     backdrop_.clear();
     backdropW_ = backdropH_ = 0;
     if (!cfg_ || !cfg_->acrylic || !hwnd_) return;
@@ -2132,14 +2153,20 @@ void FenceWindow::RequestBackdropAsync(int pad) {
     if (bdJob_ && hwnd_) SetTimer(hwnd_, kAnimTimer, 16, nullptr);
 }
 
-// 拖动 / 改尺寸期间：底图盖不住当前矩形了就把「抓一块新的」丢给工作线程。
+// 补磨砂底图。
 //
-// 以前这里是同步抓（抓屏 8~11ms + 模糊 35ms），拖动时每挪 128px 就停下来 40 多毫秒，
-// 看到的就是「磨砂一卡一卡」。现在 UI 线程只提交矩形，不等结果：这一帧照旧
-// 用旧底图（Paint 会按偏移取样，越界的那一条用最近的一列/一行撑开，不会露出色带），
-// 下一帧或下下帧再换上新的。
+// 【这一版最重要的约束】拖动 / 改尺寸期间**一次都不许抓屏**。
 //
-// **别改回同步抓。** 抓屏那 8~11ms 是 GPU 回读，压不下去；模糊已经从 35ms 压到 7ms。
+// 为什么：BitBlt 抓屏要拿 win32k 的全局 GDI 锁，还会把 DWM 合成好的桌面读回来。
+// 换到工作线程也没用 —— UI 线程下一帧的 UpdateLayeredWindow / SetWindowPos 一样要排
+// 那把锁；而且「拖到一半突然换一张底图」本身就让背景一跳一跳的，比卡还难看。
+// 上一版就是边拖边在后台抓，用户反馈「背景变的更卡了」。
+//
+// 所以只在真正安全的时候抓：
+//   · 拖动 / 改尺寸**开始**那一刻（盒子还没动，同步抓一圈带余量的，用户看不见）
+//   · 松手之后（WM_LBUTTONUP）、改设置、换壁纸（都是静止状态）
+// 移动过程中底图不够用时，Paint 会把取样原点夹回底图内（整块磨砂跟着盒子平移几像素，
+// 模糊过的画面看不出来），绝不为了「跟准」去抓屏。
 void FenceWindow::EnsureBackdropCover() {
     if (!cfg_ || !cfg_->acrylic || !hwnd_) return;
 
@@ -2166,15 +2193,15 @@ void FenceWindow::EnsureBackdropCover() {
         const DWORD nowT = GetTickCount();
         if (wasUniform && nowT - backdropCoverT_ >= 500) {
             backdropCoverT_ = nowT;
-            RefreshBackdrop(dragging_ || resizing_ ? 128 : 0);
+            RefreshBackdrop(0);
             bdPlainArea_ = !backdrop_.empty() && NearlyUniform(backdrop_, backdropW_,
                                                               backdropH_);
             return;
         }
-        // 其它情况（抓屏直接失败）：慢路径兜底，限频 300ms 别把拖动拖垮
+        // 其它情况（抓屏直接失败）：慢路径兜底，限频 300ms
         if (nowT - backdropCoverT_ >= 300) {
             backdropCoverT_ = nowT;
-            RefreshBackdrop(dragging_ || resizing_ ? 128 : 0);
+            RefreshBackdrop(0);
         }
         return;
     }
@@ -2196,11 +2223,15 @@ void FenceWindow::EnsureBackdropCover() {
     const bool covered = sx >= 0 && sy >= 0 && sx + needW <= backdropW_ &&
                          sy + needH <= backdropH_;
     if (covered) return;
-    // 限频：一次 18ms（在别的线程），别每帧都往队列里塞
-    const DWORD now = GetTickCount();
-    if (now - backdropCoverT_ < 60) return;
-    backdropCoverT_ = now;
-    RequestBackdropAsync(128);
+
+    if (dragging_ || resizing_) {
+        // 移动中：什么都不做。底图不够用就让它将就着（Paint 会把取样原点夹回来），
+        // 等松手那一刻再补一张贴合的（见 WM_LBUTTONUP）。
+        return;
+    }
+    // 静止状态（刚拖完 / 改完设置 / 换壁纸）：交给后台线程，别阻塞界面。
+    // pad = 0：静止时不用留余量，下次开始拖动那一瞬间会重抓一圈大的。
+    RequestBackdropAsync(0);
 }
 
 void FenceWindow::Paint() {
@@ -2251,34 +2282,51 @@ void FenceWindow::Paint() {
         if (hasBackdrop) {
             // 亚克力：模糊壁纸打底 + 半透明着色，整体不透明。
             //
-            // 底图只覆盖「抓取时那一圈」，窗口挪到圈外时超出部分以前就只剩着色，
-            // 看起来是盒子里突然多出一条没有磨砂的色带。现在补抓是异步的
-            // （见 EnsureBackdropCover），必然有几帧还没换上新底图 ——
-            // 所以这里把越界的部分用「最近的边」撑开：模糊过的画面本来就没有细节，
-            // 拉伸一列/一行几乎看不出来，总比露一条纯色带好。
+            // 拖动 / 改尺寸期间不抓屏（见 EnsureBackdropCover 的说明），所以底图
+            // 常常「盖不住」当前窗口。这时候把**取样原点夹回底图内部**就够了：
+            // 整块磨砂相对盒子平移几个像素，模糊过的画面完全看不出来，
+            // 而且仍然是一次 1:1 的整块拷贝，不额外花时间。
+            //
+            // 别在这儿加「把越界的边用拉伸补上」那种处理：那要 4 次带缩放的
+            // DrawImage，拖动时每帧多好几毫秒，正是之前「更卡了」的原因之一。
             Bitmap blur(backdropW_, backdropH_, backdropW_ * 4, PixelFormat32bppPARGB,
                         backdrop_.data());
-            const int dx = std::max(0, -bsx);          // 目标里第一块有效像素
-            const int dy = std::max(0, -bsy);
-            const int cx = std::max(0, bsx);           // 底图里对应的起点
-            const int cy = std::max(0, bsy);
-            const int cw = std::min(bufW_ - dx, backdropW_ - cx);
-            const int chh = std::min(bufH_ - dy, backdropH_ - cy);
-            if (cw > 0 && chh > 0) {
+            if (backdropW_ >= bufW_ && backdropH_ >= bufH_) {
+                const int cx = std::clamp(bsx, 0, backdropW_ - bufW_);
+                const int cy = std::clamp(bsy, 0, backdropH_ - bufH_);
                 gfx.SetClip(&shape);
-                gfx.DrawImage(&blur, Rect(dx, dy, cw, chh), cx, cy, cw, chh, UnitPixel);
-                // 左右越界：把最近的一列撑开；上下越界：把最近的一行撑开
-                if (dx > 0)
-                    gfx.DrawImage(&blur, Rect(0, dy, dx, chh), cx, cy, 1, chh, UnitPixel);
-                if (dx + cw < bufW_)
-                    gfx.DrawImage(&blur, Rect(dx + cw, dy, bufW_ - dx - cw, chh),
-                                  cx + cw - 1, cy, 1, chh, UnitPixel);
-                if (dy > 0)
-                    gfx.DrawImage(&blur, Rect(0, 0, bufW_, dy), cx, cy, cw, 1, UnitPixel);
-                if (dy + chh < bufH_)
-                    gfx.DrawImage(&blur, Rect(0, dy + chh, bufW_, bufH_ - dy - chh), cx,
-                                  cy + chh - 1, cw, 1, UnitPixel);
+                gfx.DrawImage(&blur, Rect(0, 0, bufW_, bufH_), cx, cy, bufW_, bufH_,
+                              UnitPixel);
                 gfx.ResetClip();
+            } else {
+                // 底图比缓冲还小：主要是「改尺寸」把盒子拉得超出了开始那一刻抓的余量，
+                // 也可能是贴着屏幕边缘抓不全。这里按交集画，再用**最近的一列/一行撑开**
+                // 缺的那一条 —— 模糊过的画面没有细节，拉伸看不出来；不然那一侧会变成
+                // 只有半透明着色，看起来就是「拉大之后盒子变透明了」（以前的老毛病）。
+                //
+                // 注意：这条分支只在底图比缓冲**小**时才会走到，正常的拖动（底图比
+                // 缓冲大）走上面那条 1:1 夹取，一次 DrawImage 就完事，别把拉伸挪上去。
+                const int dx = std::max(0, -bsx);
+                const int dy = std::max(0, -bsy);
+                const int cx = std::max(0, bsx);
+                const int cy = std::max(0, bsy);
+                const int cw = std::min(bufW_ - dx, backdropW_ - cx);
+                const int chh = std::min(bufH_ - dy, backdropH_ - cy);
+                if (cw > 0 && chh > 0) {
+                    gfx.SetClip(&shape);
+                    gfx.DrawImage(&blur, Rect(dx, dy, cw, chh), cx, cy, cw, chh, UnitPixel);
+                    if (dx > 0)
+                        gfx.DrawImage(&blur, Rect(0, dy, dx, chh), cx, cy, 1, chh, UnitPixel);
+                    if (dx + cw < bufW_)
+                        gfx.DrawImage(&blur, Rect(dx + cw, dy, bufW_ - dx - cw, chh),
+                                      cx + cw - 1, cy, 1, chh, UnitPixel);
+                    if (dy > 0)
+                        gfx.DrawImage(&blur, Rect(0, 0, bufW_, dy), cx, cy, cw, 1, UnitPixel);
+                    if (dy + chh < bufH_)
+                        gfx.DrawImage(&blur, Rect(0, dy + chh, bufW_, bufH_ - dy - chh), cx,
+                                      cy + chh - 1, cw, 1, UnitPixel);
+                    gfx.ResetClip();
+                }
             }
             SolidBrush tint{Color((BYTE)std::min(255, (int)(alpha * 0.58)), r, g, b)};
             gfx.FillPath(&tint, &shape);

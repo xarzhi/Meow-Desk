@@ -417,6 +417,8 @@ private:
     bool dragging_ = false;
     bool itemDragging_ = false;
     bool resizing_ = false;
+    // 这次拉伸已经抓过带余量的底图了（第一次真正拉动时才抓，光按下边缘不抓）
+    bool resizeCaptured_ = false;
     Edge resizeEdge_ = Edge::None;
     RECT resizeStartRect_{};
     int resizeStartW_ = 0;
