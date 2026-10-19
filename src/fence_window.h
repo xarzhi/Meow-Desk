@@ -416,6 +416,10 @@ private:
     bool pressBody_ = false;
     bool dragging_ = false;
     bool itemDragging_ = false;
+    // 按下的那一刻已经抓过带余量的底图了（按在头部/箭头上才抓）。
+    // 放到「按下」而不是「第一次移动」抓，是因为拖动起点那一下的十几毫秒停顿
+    // 就是「拖起来有点黏」的来源；按下时盒子还没动，这点时间完全看不出来。
+    bool pressCaptured_ = false;
     bool resizing_ = false;
     // 这次拉伸已经抓过带余量的底图了（第一次真正拉动时才抓，光按下边缘不抓）
     bool resizeCaptured_ = false;

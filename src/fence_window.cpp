@@ -503,6 +503,7 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     dragRawY_ = dragLastY_;
     dragging_ = false;
     itemDragging_ = false;
+    pressCaptured_ = false;
     resizing_ = false;
     resizeEdge_ = Edge::None;
     pressItem_ = -1;
@@ -555,6 +556,18 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
         // 空白处拖 = 框选；按住 Ctrl 拖框是「追加选中」
         marqueeAdditive_ = pressCtrl_;
     }
+
+    // 按在「能拖起盒子」的位置上：趁盒子还没动，同步抓一圈带余量的磨砂底图。
+    //
+    // 放在这里而不是「第一次移动」时抓，是为了让拖动的第一帧就跟手：
+    // 抓屏 + 模糊是十几毫秒，压在移动的第一帧上就是一次可见的启动停顿
+    // （用户说的「拖起来黏」）。按下时盒子纹丝不动，这点时间根本看不出来。
+    // 单击头部（只是想切焦点）也照样会抓一次，十几毫秒，感觉不到。
+    if ((pressHeader_ || pressArrow_) && cfg_ && cfg_->acrylic) {
+        RefreshBackdrop(128);
+        pressCaptured_ = true;
+    }
+
     SetCapture(h);
 }
 
@@ -1665,10 +1678,13 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     // 未吸附的「原始位置」从当前实际位置起算
                     dragRawX_ = dragLastX_;
                     dragRawY_ = dragLastY_;
-                    // 先把「四周多抓一圈」的磨砂底图抓出来。必须**同步**抓完再开始动：
-                    // 异步的话抓屏会和拖动的前几帧抢 win32k 的 GDI 锁，反而卡。
-                    // 这一刻盒子还没动，多花 18ms 用户看不见。
-                    if (cfg_ && cfg_->acrylic) RefreshBackdrop(128);
+                    // 底图在「按下」那一刻就抓好了（见 BeginPress），这里通常什么都不做。
+                    // 兜底：按下之后才打开磨砂 / 那次抓失败了，这里补一次；
+                    // 同步抓完再动，异步会和前几帧抢 win32k 的 GDI 锁反而更卡。
+                    if (!pressCaptured_ && cfg_ && cfg_->acrylic) {
+                        pressCaptured_ = true;
+                        RefreshBackdrop(128);
+                    }
                 }
                 if (dragging_) {
                     const int mdx = cur.x - dragLastCursor_.x;
