@@ -1,6 +1,7 @@
 #include "desktop_surface.h"
 
 #include "icon_render.h"
+#include "file_drop.h"
 #include "shell_icons.h"
 
 #include <objidl.h>
@@ -1507,6 +1508,7 @@ void DesktopSurface::Destroy() {
     hover_ = nullptr;
     mouseTracking_ = false;
     if (hwnd_) {
+        FileDrop::Detach(hwnd_);   // OLE 那边还挂着这个 HWND，先摘掉再销毁
         KillTimer(hwnd_, 1);
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;

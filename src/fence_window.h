@@ -256,8 +256,18 @@ private:
     int minW() const;
     int minH() const;
 
-    // 拖动位置夹取：不出屏幕、不压到别的盒子
-    void ResolveDragPos(RECT want, int& outX, int& outY) const;
+    // 拖动位置夹取：把盒子从 from 往 (wantX,wantY) 推，遇到屏幕边 / 别的盒子就停。
+    //
+    // 这里必须是「扫掠」而不是「先算出目标再推开」：
+    // 一帧跳几百像素时，目标点已经在障碍另一侧，「最低穿透量的方向」恰好是穿出去，
+    // 于是看起来只有屏幕边挡得住。扫掠只认「前进方向上、起点还没越过的那条边」，
+    // 物理上不可能跨过去。
+    void ResolveDragMove(RECT from, int wantX, int wantY, int& outX, int& outY) const;
+
+    // 松手后收尾：只处理「起点就重叠」的老配置，推出去的距离超过
+    // kSnapOutMax 就不动（宁可留着重叠，也不能让盒子在松手瞬间瞬移）。
+    // 返回是否真的移动了。
+    bool SnapOutOfOverlap();
 
     LabelDib* LabelOf(DesktopIconView* e, int boxW, int boxH, int glow);
     HWND hwnd_ = nullptr;
@@ -354,5 +364,7 @@ private:
     POINT pressScreenPt_{0, 0};
     int dragLastX_ = 0;
     int dragLastY_ = 0;
+    // 上一帧的鼠标屏幕坐标（拖动按每帧位移累计，被挡住的距离不留账）
+    POINT dragLastCursor_{0, 0};
     RECT dragStartRect_{};
 };

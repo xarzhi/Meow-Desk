@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "backdrop.h"
+#include "file_drop.h"
 #include "icon_render.h"
 
 #pragma comment(lib, "gdiplus.lib")
@@ -1087,69 +1088,154 @@ bool FenceWindow::HitTest(POINT screenPt) const {
 }
 
 // ---------------------------------------------------------------------------
-// 拖动夹取：先夹进显示器工作区，再沿「穿透最浅」的方向推出其他盒子
+// 拖动夹取：分轴「扫掠」
+//
+// 以前是「先算出这一帧想去哪，再按最小穿透量把他推回来」。那种写法有个致命问题：
+// 一帧跳几百像素时（机器忙，WM_MOUSEMOVE 会被合并），目标点已经在障碍另一侧，
+// 此时「最低穿透量的方向」恰好就是「从另一侧穿出去」，于是表现为盒子能穿过别的盒子、
+// 只有屏幕边这种硬夹取挡得住。
+//
+// 扫掠的思路：只认「前进方向上、起点还没越过的那条边」，最多贴到那条边上。
+// 起点都已经越过的障碍一律不管 —— 那属于「本来就连在一起」的情况，强行推开会让
+// 盒子寸步难行，也会把「从重叠里拖出去」这个动作锁死。
 // ---------------------------------------------------------------------------
-void FenceWindow::ResolveDragPos(RECT want, int& outX, int& outY) const {
-    const int w = want.right - want.left;
-    const int h = want.bottom - want.top;
-    dbgWant_ = want;
+namespace {
+// 松手收尾时允许「推出去」的最大距离。超过这个值说明盒子跟别人本来就深度重叠
+// （老配置 / 手工改过数据库），硬推会让它在松手瞬间瞬移，不如原地不动。
+constexpr int kSnapOutMax = 48;
+}  // namespace
 
-    // 1) 屏幕四边（用所在显示器的工作区，避开任务栏）
-    POINT probe{want.left, want.top};
+void FenceWindow::ResolveDragMove(RECT from, int wantX, int wantY,
+                                  int& outX, int& outY) const {
+    const int w = (int)(from.right - from.left);
+    const int h = (int)(from.bottom - from.top);
+    const int fx = (int)from.left;
+    const int fy = (int)from.top;
+    dbgWant_ = RECT{wantX, wantY, wantX + w, wantY + h};
+
+    // 1) 屏幕：用目标点所在显示器的工作区（避开任务栏）
+    POINT probe{wantX, wantY};
     HMONITOR mon = MonitorFromPoint(probe, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
-    RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-    if (mon && GetMonitorInfoW(mon, &mi)) lim = mi.rcWork;
-    if (lim.right - lim.left < w) lim.right = lim.left + w;
-    if (lim.bottom - lim.top < h) lim.bottom = lim.top + h;
+    RECT wa{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    if (mon && GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
+    const int limL = (int)wa.left;
+    const int limT = (int)wa.top;
+    const int limR = std::max(limL + w, (int)wa.right);
+    const int limB = std::max(limT + h, (int)wa.bottom);
+    wantX = std::clamp(wantX, limL, limR - w);
+    wantY = std::clamp(wantY, limT, limB - h);
 
-    if (want.left < lim.left) want.left = lim.left;
-    if (want.top < lim.top) want.top = lim.top;
-    if (want.left + w > lim.right) want.left = lim.right - w;
-    if (want.top + h > lim.bottom) want.top = lim.bottom - h;
+    // 2) 障碍：其他盒子的实时窗口矩形（统一转成 int，别让 LONG 混进来）
+    std::vector<RECT> others;
+    if (s_obstacleProvider) others = s_obstacleProvider(this);
+    dbgObstacles_ = s_obstacleProvider ? (int)others.size() : -1;
 
-    // 2) 其他盒子：按最小穿透量推开，3 遍足够处理夹缝
-    if (s_obstacleProvider) {
-        std::vector<RECT> others = s_obstacleProvider(this);
-        dbgObstacles_ = (int)others.size();
-        for (int pass = 0; pass < 3; ++pass) {
-            bool hitAny = false;
-            for (const RECT& o : others) {
-                RECT r{want.left, want.top, want.left + w, want.top + h};
-                if (r.right <= o.left + 1 || o.right <= r.left + 1) continue;
-                if (r.bottom <= o.top + 1 || o.bottom <= r.top + 1) continue;
-                hitAny = true;
-
-                const int pushLeft = o.left - r.right;      // 负值
-                const int pushRight = o.right - r.left;     // 正值
-                const int pushUp = o.top - r.bottom;
-                const int pushDown = o.bottom - r.top;
-
-                int best = pushLeft;
-                if (std::abs(pushRight) < std::abs(best)) best = pushRight;
-                if (std::abs(pushUp) < std::abs(best)) best = pushUp;
-                if (std::abs(pushDown) < std::abs(best)) best = pushDown;
-
-                if (best == pushLeft || best == pushRight) {
-                    want.left += best;
-                } else {
-                    want.top += best;
-                }
-            }
-            if (!hitAny) break;
-            // 推开后可能出界，再夹一次
-            if (want.left < lim.left) want.left = lim.left;
-            if (want.top < lim.top) want.top = lim.top;
-            if (want.left + w > lim.right) want.left = lim.right - w;
-            if (want.top + h > lim.bottom) want.top = lim.bottom - h;
-        }
+    if (others.empty()) {
+        outX = wantX;
+        outY = wantY;
+        dbgGot_ = POINT{outX, outY};
+        return;
     }
 
-    outX = want.left;
-    outY = want.top;
+    // 3) 横向能走到哪：curY 是这一趟假定的纵向位置（判断「纵向挨不挨着」用）
+    auto resolveX = [&](int curY) -> int {
+        if (wantX == fx) return fx;
+        int ox = wantX;
+        for (const RECT& o : others) {
+            const int ol = (int)o.left, orr = (int)o.right;
+            const int ot = (int)o.top, ob = (int)o.bottom;
+            if (curY + h <= ot || ob <= curY) continue;
+            if (wantX > fx) {                   // 往右：最多贴到障碍左边缘
+                if (ol >= fx + w) ox = std::min(ox, ol - w);
+            } else {                            // 往左：最多贴到障碍右边缘
+                if (orr <= fx) ox = std::max(ox, orr);
+            }
+        }
+        return std::clamp(ox, limL, limR - w);
+    };
+    // 4) 纵向同理，curX 是这一趟假定的横向位置
+    auto resolveY = [&](int curX) -> int {
+        if (wantY == fy) return fy;
+        int oy = wantY;
+        for (const RECT& o : others) {
+            const int ol = (int)o.left, orr = (int)o.right;
+            const int ot = (int)o.top, ob = (int)o.bottom;
+            if (curX + w <= ol || orr <= curX) continue;
+            if (wantY > fy) {                   // 往下：最多贴到障碍上边缘
+                if (ot >= fy + h) oy = std::min(oy, ot - h);
+            } else {                            // 往上：最多贴到障碍下边缘
+                if (ob <= fy) oy = std::max(oy, ob);
+            }
+        }
+        return std::clamp(oy, limT, limB - h);
+    };
+
+    // 两趟顺序各算一遍，取离目标更近的结果。
+    // 斜着沿障碍边缘拖时，先算哪一轴会决定「能不能拐过去」，只固定一种顺序会出现
+    // 「明明有路却卡住」的手感。两趟都很便宜，直接都算。
+    const int ax = resolveX(fy);
+    const int ay = resolveY(ax);
+    const int by = resolveY(fx);
+    const int bx = resolveX(by);
+    const long long dA = (long long)std::abs(ax - wantX) + std::abs(ay - wantY);
+    const long long dB = (long long)std::abs(bx - wantX) + std::abs(by - wantY);
+
+    outX = (dA <= dB) ? ax : bx;
+    outY = (dA <= dB) ? ay : by;
     dbgGot_ = POINT{outX, outY};
 }
+
+bool FenceWindow::SnapOutOfOverlap() {
+    if (!hwnd_ || !s_obstacleProvider) return false;
+    RECT r{};
+    GetWindowRect(hwnd_, &r);
+    const int w = r.right - r.left;
+    const int h = r.bottom - r.top;
+    const std::vector<RECT> others = s_obstacleProvider(this);
+    if (others.empty()) return false;
+
+    bool any = false;
+    for (int pass = 0; pass < 3; ++pass) {
+        bool hit = false;
+        for (const RECT& o : others) {
+            const RECT c{r.left, r.top, r.left + w, r.top + h};
+            if (c.right <= o.left || o.right <= c.left) continue;
+            if (c.bottom <= o.top || o.bottom <= c.top) continue;
+
+            const int pl = o.left - c.right;    // <= 0
+            const int pr = o.right - c.left;    // >= 0
+            const int pu = o.top - c.bottom;    // <= 0
+            const int pd = o.bottom - c.top;    // >= 0
+            int best = pl;
+            if (std::abs(pr) < std::abs(best)) best = pr;
+            if (std::abs(pu) < std::abs(best)) best = pu;
+            if (std::abs(pd) < std::abs(best)) best = pd;
+            if (std::abs(best) > kSnapOutMax) continue;   // 深重叠，不动
+            if (best == pl || best == pr) r.left += best;
+            else r.top += best;
+            hit = any = true;
+        }
+        if (!hit) break;
+    }
+    if (!any) return false;
+
+    // 推出去之后别再顶到屏幕外（一个 20px 的横向推挤就可能把贴着左边的盒子推到负坐标）
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) lim = mi.rcWork;
+    r.left = std::max((int)lim.left, std::min((int)r.left, (int)lim.right - w));
+    r.top = std::max((int)lim.top, std::min((int)r.top, (int)lim.bottom - h));
+
+    dragLastX_ = (int)r.left;
+    dragLastY_ = (int)r.top;
+    SetWindowPos(hwnd_, nullptr, (int)r.left, (int)r.top, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    return true;
+}
+
 
 std::wstring FenceWindow::DragDebug() const {
     return L"obstacles=" + std::to_wstring(dbgObstacles_) + L" want=(" +
@@ -1381,41 +1467,32 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             if ((pressHeader_ || pressArrow_) && !itemDragging_) {
-                if (!dragging_ && (std::abs(dx) > 2 || std::abs(dy) > 2)) dragging_ = true;
+                if (!dragging_ && (std::abs(dx) > 2 || std::abs(dy) > 2)) {
+                    dragging_ = true;
+                    // 从这一刻起按「每帧鼠标位移」跟手，而不是「按下点 + 总位移」。
+                    // 用总位移的话，被障碍挡掉的那段距离会一直欠着 —— 鼠标得原路
+                    // 退回被挡掉的距离盒子才重新动，拖到边上就像卡死了。
+                    dragLastCursor_ = cur;
+                }
                 if (dragging_) {
-                    RECT want = dragStartRect_;
-                    want.left += dx;
-                    want.top += dy;
-                    want.right = want.left + (dragStartRect_.right - dragStartRect_.left);
-                    want.bottom = want.top + (dragStartRect_.bottom - dragStartRect_.top);
-
-                    // 从「现在的位置」朝目标位置一小步一小步地走，每步 8px，每步都夹一次。
-                    // 不能拿整帧的目标位置一次性判：高速拖动时一帧能跳上百像素
-                    // （尤其机器忙的时候 WM_MOUSEMOVE 会被合并），目标点早就跑到
-                    // 障碍物另一侧了，「穿透最浅的方向」于是变成「从另一侧穿出去」——
-                    // 表现就是盒子能穿过别的盒子、只有屏幕边挡得住。
-                    const int tw = want.right - want.left;
-                    const int th = want.bottom - want.top;
-                    int px = dragLastX_;
-                    int py = dragLastY_;
-                    for (int guard = 0; guard < 512; ++guard) {
-                        const int remX = want.left - px;
-                        const int remY = want.top - py;
-                        if (remX == 0 && remY == 0) break;
-                        const int nxTry = px + std::clamp(remX, -8, 8);
-                        const int nyTry = py + std::clamp(remY, -8, 8);
-                        RECT stepRect{nxTry, nyTry, nxTry + tw, nyTry + th};
-                        int rx = nxTry, ry = nyTry;
-                        ResolveDragPos(stepRect, rx, ry);
-                        if (rx == px && ry == py) break;   // 已经被挡住了，别空转
-                        px = rx;
-                        py = ry;
-                    }
-                    if (px != dragLastX_ || py != dragLastY_) {
-                        dragLastX_ = px;
-                        dragLastY_ = py;
-                        SetWindowPos(h, nullptr, px, py, 0, 0,
-                                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    const int mdx = cur.x - dragLastCursor_.x;
+                    const int mdy = cur.y - dragLastCursor_.y;
+                    if (mdx || mdy) {
+                        dragLastCursor_ = cur;
+                        const int fw = (int)(dragStartRect_.right - dragStartRect_.left);
+                        const int fh2 = (int)(dragStartRect_.bottom - dragStartRect_.top);
+                        // 起点是「现在的位置」：每帧都以当前实际位置为起点扫掠，
+                        // 才保证越不过任何障碍（目标直连的话，一帧跳几百像素就会穿过去）。
+                        const RECT now{dragLastX_, dragLastY_, dragLastX_ + fw,
+                                       dragLastY_ + fh2};
+                        int nx = dragLastX_, ny = dragLastY_;
+                        ResolveDragMove(now, dragLastX_ + mdx, dragLastY_ + mdy, nx, ny);
+                        if (nx != dragLastX_ || ny != dragLastY_) {
+                            dragLastX_ = nx;
+                            dragLastY_ = ny;
+                            SetWindowPos(h, nullptr, nx, ny, 0, 0,
+                                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                        }
                     }
                     return 0;
                 }
@@ -1568,19 +1645,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wasDragging) {
-            // 松手兜底：把最终位置再夹一次。
-            // 拖动过程中每帧都夹过了，正常不会有重叠；但失焦 / 丢 capture / 帧被合并
-            // 这些情况下最后一帧可能没走完夹取，落到别的盒子里。这里补一次，代价极小，
-            // 而且「盒子绝不重叠」这个约束只在这一个点收口，别处不用再操心。
-            RECT cur2{};
-            GetWindowRect(h, &cur2);
-            int fx = cur2.left, fy = cur2.top;
-            ResolveDragPos(cur2, fx, fy);
-            if (fx != cur2.left || fy != cur2.top)
-                SetWindowPos(h, nullptr, fx, fy, 0, 0,
-                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            dragLastX_ = fx;
-            dragLastY_ = fy;
+            // 松手收尾只处理「本来就深度重叠」的老配置，而且只推很小的距离 ——
+            // 扫掠已经保证拖动过程不会产生新的重叠，这里再做大范围搬运只会让盒子瞬移。
+            SnapOutOfOverlap();
             if (onGeometryChanged) onGeometryChanged();
             Redraw();
             return 0;
@@ -2362,6 +2429,7 @@ void FenceWindow::SetCollapsed(bool collapsed) {
 
 void FenceWindow::Destroy() {
     if (hwnd_) {
+        FileDrop::Detach(hwnd_);   // OLE 那边还挂着这个 HWND，先摘掉再销毁
         KillTimer(hwnd_, kAnimTimer);
         SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
         DestroyWindow(hwnd_);

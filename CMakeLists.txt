@@ -30,6 +30,7 @@ add_executable(meow-desk WIN32
     src/confirm_dialog.cpp
     src/pinyin.cpp
     src/layout_store.cpp
+    src/file_drop.cpp
     # 本地存储用 SQLite 3 的 amalgamation（单文件，无外部依赖）。
     # 比 *.ini 整份重写可靠：事务保证原子性，加字段走 user_version 迁移。
     # 内存代价实测为零 —— 代码页是 file-backed，不占 private。

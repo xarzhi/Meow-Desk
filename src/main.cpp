@@ -17,6 +17,7 @@
 #include "desktop_surface.h"
 #include "drag_layer.h"
 #include "fence_window.h"
+#include "file_drop.h"
 #include "layout_store.h"
 #include "popup_menu.h"
 #include "search_window.h"
@@ -502,7 +503,10 @@ static void ApplyIconAppearance() {
 }
 
 // 重新枚举真实桌面（位置可能被用户在外部改了）
-static void ReloadDesktopIcons() {
+// keepPositions：重新枚举时**不要**用 shell 里的坐标覆盖我们已有的坐标。
+// 文件系统监听会频繁触发重载，而我们自己的坐标（布局库里的）可能比 shell 里的新 ——
+// 不挡住的话，一下载文件桌面上所有图标就会集体跳回旧位置。
+static void ReloadDesktopIcons(bool keepPositions = false) {
     auto items = EnumerateDesktopIcons();
     LogStep("reload icons: " + std::to_string(items.size()) + " diag: " + LastEnumDiag());
 
@@ -519,7 +523,7 @@ static void ReloadDesktopIcons() {
             if (found->pidl) FreeDesktopPidl(found->pidl);
             found->pidl = it.pidl;
             found->name = it.name;
-            if (found->OnDesktop()) {
+            if (!keepPositions && found->OnDesktop()) {
                 found->pos = it.pos;
                 found->dragPos = it.pos;
             }
@@ -556,6 +560,175 @@ static void ReloadDesktopIcons() {
     DumpIconPositions();
     if (g_surfaceVisible) g_surface.Redraw();
     for (auto& f : g_fences) if (f) f->Redraw();
+}
+
+// ---------------------------------------------------------------------------
+// 从资源管理器 / 浏览器把文件拖进来
+//
+// 最关键的一点：文件必须先落进**真实的桌面文件夹**。我们的桌面只是这个文件夹的
+// 一个视图（图标全是 shell 枚举出来的），所以不存在「只出现在我们视图里」这种做法 ——
+// 落进文件夹之后，原生桌面自然也有，我们重新枚举一遍就能看到新图标。
+// ---------------------------------------------------------------------------
+static std::wstring DesktopFolderPath() {
+    static std::wstring cached;
+    if (!cached.empty()) return cached;
+    PWSTR p = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &p)) && p) {
+        cached = p;
+        CoTaskMemFree(p);
+    }
+    return cached;
+}
+
+// ---------------------------------------------------------------------------
+// 真实桌面文件夹的变更监听
+//
+// 浏览器下载、资源管理器拖到真实桌面、别的程序往桌面写文件 —— 这些都不经过我们的
+// 窗口，只能靠文件系统通知。以前只有「自动整理」里那个 4 秒扫描，而它在自动整理
+// 关掉时整段直接 return，于是新文件永远不会出现在我们桌面上。
+//
+// 用 FindFirstChangeNotification + 主心跳里 0 超时 Wait 轮询：不额外开线程，
+// 也不用每次把目录 walk 一遍。
+// ---------------------------------------------------------------------------
+static HANDLE g_deskWatch = nullptr;
+
+static void InitDesktopWatch() {
+    if (g_deskWatch) return;
+    const std::wstring dir = DesktopFolderPath();
+    if (dir.empty()) return;
+    HANDLE h = FindFirstChangeNotificationW(
+        dir.c_str(), FALSE,
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+    if (h == INVALID_HANDLE_VALUE || !h) {
+        LogStep("desktop watch FAILED");
+        return;
+    }
+    g_deskWatch = h;
+    LogStep("desktop watch ok");
+}
+
+// 把「还没处理的变化通知」丢掉：我们自己刚写过盘，那次变化不需要再触发重载
+static void DrainDesktopWatch() {
+    if (!g_deskWatch) return;
+    if (WaitForSingleObject(g_deskWatch, 0) == WAIT_OBJECT_0)
+        FindNextChangeNotification(g_deskWatch);
+}
+
+static void PollDesktopWatch() {
+    if (!g_deskWatch) return;
+    if (WaitForSingleObject(g_deskWatch, 0) != WAIT_OBJECT_0) return;
+    FindNextChangeNotification(g_deskWatch);   // 先重新武装，别漏掉紧随其后的变化
+    ReloadDesktopIcons(true);
+    LogStep("desktop folder changed -> reload icons");
+}
+
+// 把一批路径搬进 dir。同盘用移动（拖到桌面本来就是「搬过去」），跨盘用复制。
+// 重名自动改名，全程不弹窗、不报错框。
+// 返回值是**实际做了什么**：DROPEFFECT_MOVE / DROPEFFECT_COPY / DROPEFFECT_NONE。
+// 这个值要原样回报给拖放源 —— 明明只复制却报 MOVE，源程序会把原文件删掉。
+static DWORD MoveFilesInto(const std::vector<std::wstring>& paths, const std::wstring& dir) {
+    if (paths.empty() || dir.empty()) return DROPEFFECT_NONE;
+
+    // SHFileOperation 要的是「双 null 结尾」的路径串，不是普通 wstring
+    std::wstring from;
+    for (const auto& p : paths) {
+        if (p.empty()) continue;
+        from += p;
+        from.push_back(L'\0');
+    }
+    if (from.empty()) return DROPEFFECT_NONE;
+    from.push_back(L'\0');
+    std::wstring to = dir;
+    to.push_back(L'\0');
+    to.push_back(L'\0');
+
+    // 同卷 → FO_MOVE；跨卷 → FO_COPY（跨卷移动会退化成「复制 + 删源」，
+    // 碰到只读介质或者没权限删源就整单失败，不如干脆复制）
+    auto volumeOf = [](const std::wstring& p) {
+        wchar_t buf[MAX_PATH]{};
+        if (!GetVolumePathNameW(p.c_str(), buf, MAX_PATH)) return std::wstring();
+        return std::wstring(buf);
+    };
+    const std::wstring dstVol = volumeOf(dir);
+    bool sameDrive = !dstVol.empty();
+    for (const auto& p : paths) {
+        if (p.empty()) continue;
+        if (volumeOf(p) != dstVol) sameDrive = false;
+    }
+
+    SHFILEOPSTRUCTW op{};
+    op.hwnd = nullptr;
+    op.wFunc = sameDrive ? FO_MOVE : FO_COPY;
+    op.pFrom = from.c_str();
+    op.pTo = to.c_str();
+    op.fFlags = FOF_NOCONFIRMATION | FOF_NOCONFIRMMKDIR | FOF_NOERRORUI | FOF_SILENT |
+                FOF_RENAMEONCOLLISION;
+
+    if (SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted)
+        return op.wFunc == FO_MOVE ? DROPEFFECT_MOVE : DROPEFFECT_COPY;
+
+    // 移动失败（文件被别的程序占着 / 权限）退回复制，至少把文件放进来
+    if (op.wFunc == FO_MOVE) {
+        SHFILEOPSTRUCTW op2 = op;
+        op2.wFunc = FO_COPY;
+        if (SHFileOperationW(&op2) == 0 && !op2.fAnyOperationsAborted) return DROPEFFECT_COPY;
+    }
+    return DROPEFFECT_NONE;
+}
+
+static void NoteKnownDesktopPaths();   // 定义在自动整理那一段
+
+// 一批文件落进我们的桌面（fenceIndex < 0）或者某个盒子
+static DWORD AcceptDroppedFiles(const std::vector<std::wstring>& paths, POINT screenPt,
+                                int fenceIndex) {
+    if (paths.empty()) return DROPEFFECT_NONE;
+
+    std::unordered_set<std::wstring> before;
+    for (auto* e : g_icons)
+        if (e) before.insert(e->path);
+
+    LogStep("file drop: " + std::to_string(paths.size()) + " item(s) -> fence " +
+            std::to_string(fenceIndex));
+    const DWORD done = MoveFilesInto(paths, DesktopFolderPath());
+    if (done == DROPEFFECT_NONE) {
+        LogStep("file drop: move/copy FAILED");
+        return DROPEFFECT_NONE;
+    }
+
+    ReloadDesktopIcons(true);
+    DrainDesktopWatch();   // 这次变化是我们自己写盘造成的，别再触发一轮重载
+
+    std::vector<DesktopIconView*> fresh;
+    for (auto* e : g_icons) {
+        if (!e || e->path.empty()) continue;
+        if (before.count(e->path)) continue;
+        fresh.push_back(e);
+    }
+    if (fresh.empty()) {
+        // 文件已经进桌面文件夹了（原生桌面会有），只是枚举没跟上：不算失败
+        LogStep("file drop: no new icon enumerated");
+        return done;
+    }
+
+    if (fenceIndex >= 0 && fenceIndex < (int)g_fences.size() && g_fences[fenceIndex]) {
+        InsertIntoFenceMulti(fresh, fenceIndex, -1);
+    } else {
+        std::vector<DesktopIconView*> pending;
+        int k = 0;
+        for (auto* e : fresh) {
+            // 一批文件落在同一个点上会互相抢同一格：按列往下错开一格，
+            // 和「一次拖好几个图标到桌面」的观感一致。
+            POINT pt{screenPt.x, screenPt.y + k * g_cellH};
+            PlaceOnDesktop(e, pt, pending);
+            ++k;
+        }
+    }
+    RedrawAll();
+    // 用户亲手放到这儿的，别让「自动整理」过几秒又给搬走
+    NoteKnownDesktopPaths();
+    LogStep("file drop: placed " + std::to_string(fresh.size()) + " icon(s)");
+    return done;
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,6 +1576,19 @@ static void AddFenceWindow(int i) {
     if (g_fences[i] && g_fences[i]->hwnd()) {
         InstallKeepAbove(g_fences[i]->hwnd(), [i] { return FenceAnchor(i); });
         PlaceAbove(g_fences[i]->hwnd(), FenceAnchor(i));
+        // 从资源管理器拖文件到盒子上 → 收进这个盒子（和拖我们自己的图标一致）。
+        // 捕获 hwnd 而不是下标：盒子增删都会让下标变，拿 hwnd 反查永远是对的。
+        const HWND fh = g_fences[i]->hwnd();
+        FileDrop::Attach(fh, [fh](const std::vector<std::wstring>& paths, POINT pt) -> DWORD {
+            int fi = -1;
+            for (size_t k = 0; k < g_fences.size(); ++k) {
+                if (g_fences[k] && g_fences[k]->hwnd() == fh) {
+                    fi = (int)k;
+                    break;
+                }
+            }
+            return AcceptDroppedFiles(paths, pt, fi);
+        });
     }
 }
 
@@ -1478,6 +1664,10 @@ static void RebuildFences() {
 // ---------------------------------------------------------------------------
 static void Cleanup() {
     UnregisterHotKey(nullptr, kHotkeyId);
+    if (g_deskWatch) {
+        FindCloseChangeNotification(g_deskWatch);
+        g_deskWatch = nullptr;
+    }
 
     // 退出前收尾：布局写盘 + 把桌面图标的最终坐标同步回资源管理器，
     // 否则我们隐藏了真实图标又摆在自己的位置，一退出图标会整体跳一下。
@@ -1592,7 +1782,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         g_procStartFt = FileTimeToU64(ft);
     }
 
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // 用 OleInitialize 而不是 CoInitializeEx：它内部就是 CoInitializeEx(STA)，
+    // 额外把 OLE 那半边（拖放 / 剪贴板）也初始化掉。
+    // 只调 CoInitializeEx 的话 OLE 那半是关着的，RegisterDragDrop 会失败 ——
+    // 表现就是从资源管理器拖文件过来只有「禁止」光标。
+    OleInitialize(nullptr);
+    FileDrop::Init();
     LogStep("--- start ---");
 
     // 上一次异常退出可能把系统桌面图标留在隐藏状态，先自愈
@@ -1712,8 +1907,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     } else {
         InstallKeepAbove(g_surface.hwnd(), [] { return SurfaceAnchor(); });
         PlaceAbove(g_surface.hwnd(), SurfaceAnchor());
+        // 接受从资源管理器 / 浏览器拖过来的文件（落点是桌面 → 收进桌面）
+        FileDrop::Attach(g_surface.hwnd(),
+                         [](const std::vector<std::wstring>& paths, POINT pt) -> DWORD {
+                             return AcceptDroppedFiles(paths, pt, -1);
+                         });
         LogStep("surface created");
     }
+    // 真实桌面文件夹的变更监听：下载 / 别的程序写文件也要能反映到我们的桌面上
+    InitDesktopWatch();
 
     // 6. 盒子
     // 拖动避让的数据源：除了自己之外所有盒子的实时窗口矩形。
@@ -1780,10 +1982,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!g_tray.Create(nullptr)) LogStep("tray create FAILED");
     g_tray.SetDesktopIconsVisible(false);
 
-    // 8. 心跳：把层级摆回来（Win+D、Explorer 重启等）+ 自动整理巡检
+    // 8. 心跳：把层级摆回来（Win+D、Explorer 重启等）+ 自动整理巡检 + 桌面文件夹变化
     g_surface.onTick = [] {
         RestoreZOrder();
         CheckAutoOrganize();
+        PollDesktopWatch();
     };
 
     RestoreZOrder();
@@ -1805,6 +2008,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     LogStep("message loop exited");
 
     Cleanup();
-    CoUninitialize();
+    OleUninitialize();
     return 0;
 }
