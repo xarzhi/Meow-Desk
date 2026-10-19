@@ -10,7 +10,7 @@
     --version 1.2.0   指定版本号（写回 version.txt，下次打包继续用它）
     --no-build    不编译，直接拿 build/ 里现成的 exe 打包
     --no-zip      只出目录，不压 zip
-    --no-verify   跳过图标自检
+    --no-verify   跳过资源自检（exe 图标 / 版本信息）
 
 版本号：仓库根的 version.txt（一行，默认 0.1.0）。不带参数就用它，
 产物名字会带上：dist/MeowDesk_v<版本>.zip，包内根目录 MeowDesk_v<版本>/。
@@ -154,14 +154,20 @@ def main(argv):
 
     if do_verify:
         print("")
-        print("== 2/4 图标自检 ==")
+        print("== 2/4 资源自检 ==")
         if run([os.path.join(HERE, "verify_icon.py")]) != 0:
             print("自检没过：exe 里的图标与 res/meow-desk.ico 不一致，"
                   "先跑 set-icon 重做图标")
             return 1
+        # 版本资源同样是「看不见摸不着」：缺了编译器不会报错，
+        # 只有用户右键属性时才发现全是空的，所以打包前必须读回来验一遍
+        if run([os.path.join(HERE, "verify_version.py")]) != 0:
+            print("自检没过：exe 缺少版本信息，或版本号与 version.txt 不一致。"
+                  "删掉 build/ 重新 configure 编译一次")
+            return 1
     else:
         print("")
-        print("== 2/4 图标自检（跳过）==")
+        print("== 2/4 资源自检（跳过）==")
 
     # 命名全用一套：MeowDesk_v<版本>（zip / 包内目录 / 安装器）+ MeowDesk.exe（主程序）
     zip_path = os.path.join(DIST, "MeowDesk_v%s.zip" % ver)
