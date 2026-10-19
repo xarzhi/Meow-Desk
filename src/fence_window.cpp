@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "backdrop.h"
+#include "desktop_surface.h"
 #include "file_drop.h"
 #include "icon_render.h"
 
@@ -1386,6 +1387,12 @@ void FenceWindow::UpdateDropHint(POINT screenPt) {
 }
 
 LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    // 系统原生右键菜单弹出期间，带图标的项（打开方式 / 发送到 …）是 shell 自绘的，
+    // 必须把这三条消息转给它，否则那些项会塌成 0 高度看不见。
+    if (msg == WM_INITMENUPOPUP || msg == WM_MEASUREITEM || msg == WM_DRAWITEM) {
+        if (ForwardShellMenuMessage(h, msg, wp, lp)) return TRUE;
+    }
+
     switch (msg) {
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
@@ -1587,7 +1594,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         trackingLeave_ = false;
         suppressAutoExpand_ = false;   // 离开过一次，下次悬停又能展开了
         if (hot_ != -1) { hot_ = -1; Redraw(); }
-        if (autoExpanded_) {
+        // 原生菜单是模态的，它一盖上来鼠标就「离开」了盒子；
+        // 这时候不能把盒子收起来，否则菜单底下的盒子直接缩没。
+        if (autoExpanded_ && !menuOpen_) {
             if (itemDragging_ || dragging_) {
                 autoExpanded_ = false;   // 正在操作，别收
             } else {
@@ -1598,12 +1607,35 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_RBUTTONUP: {
-        // 右键菜单：盒子内是自绘菜单（不是系统菜单）
+        // 右键图标 → 系统原生菜单（资源管理器那套）；右键空白/头部 → 我们自己的盒子菜单
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         POINT sp = pt;
         ClientToScreen(h, &sp);
         const int it = (pt.y >= HeadH() && !collapsed_) ? HitItem(pt) : -1;
+        // 右键那个图标没被选中 → 先切成「只选它」，和桌面层右键的手感一致
+        if (it >= 0) {
+            std::vector<DesktopIconView*> mine;
+            Collect(mine);
+            if (it < (int)mine.size() && !mine[it]->selected) {
+                ClearSelection();
+                mine[it]->selected = true;
+                selAnchor_ = it;
+                Redraw();
+            }
+        }
+        const bool nativeMenu = (it >= 0);
+        menuOpen_ = nativeMenu;
         if (onContextMenu) onContextMenu(it, sp);
+        menuOpen_ = false;
+        // 菜单关掉之后鼠标多半还停在外面：该收就收，别留一个开着却没人操作的盒子
+        if (nativeMenu && autoExpanded_) {
+            POINT cur{};
+            GetCursorPos(&cur);
+            if (!HitTest(cur)) {
+                autoExpanded_ = false;
+                SetCollapsed(true);
+            }
+        }
         return 0;
     }
 

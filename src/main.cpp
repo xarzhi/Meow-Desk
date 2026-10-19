@@ -1485,7 +1485,24 @@ static void AddFenceWindow(int i) {
         }
         g_fences[i]->ApplyConfig(true);   // 亚克力底图要跟着新位置重抓
     };
-    f->onContextMenu = [i](int item, POINT sp) { ShowFenceMenu(i, sp, item); };
+    f->onContextMenu = [i](int item, POINT sp) {
+        // 右键点在某张图标上 → 走**系统原生菜单**（和资源管理器里右键同一个文件一致）。
+        // 我们自己的盒子菜单只在空白处 / 头部弹出：它管的是盒子本身
+        // （新建盒子、排序、查看、分组、锁定、删除…），和文件的菜单是两件事。
+        if (item >= 0) {
+            DesktopIconView* e = FenceItemAt(i, item, nullptr);
+            if (e && !e->path.empty()) {
+                HWND owner = (i < (int)g_fences.size() && g_fences[i]) ? g_fences[i]->hwnd() : nullptr;
+                ShowShellItemMenu(owner, e->path, sp);
+                // 菜单里可能改名 / 删除了文件：回来重新枚举一次（和桌面层同一套收尾）。
+                // 这里 e 可能已经被 Reload 销毁，后面不要再碰它。
+                ReloadDesktopIcons(true);
+                RedrawAll();
+                return;
+            }
+        }
+        ShowFenceMenu(i, sp, item);
+    };
     // 「查看 / 排序 / 重命名」改完之后存盘：配置（viewMode 等）+ 图标顺序
     f->onStateChanged = [i] {
         EnsureFenceIconSize(i);

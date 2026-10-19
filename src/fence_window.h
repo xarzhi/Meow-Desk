@@ -366,5 +366,7 @@ private:
     int dragLastY_ = 0;
     // 上一帧的鼠标屏幕坐标（拖动按每帧位移累计，被挡住的距离不留账）
     POINT dragLastCursor_{0, 0};
+    // 系统原生右键菜单正开着：这时鼠标「离开」盒子是正常的，不能自动收起
+    bool menuOpen_ = false;
     RECT dragStartRect_{};
 };

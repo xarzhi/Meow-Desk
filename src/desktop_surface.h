@@ -246,3 +246,18 @@ private:
     struct Impl;
     Impl* impl_ = nullptr;
 };
+
+// ---------------------------------------------------------------------------
+// 系统原生右键菜单（资源管理器那套 IContextMenu）
+//
+// 桌面层的右键菜单本来就走的这条路，盒子里右键图标也复用它 —— 用户在盒子里
+// 右键一个文件，看到的应该和资源管理器里右键同一个文件完全一致
+// （打开 / 打开方式 / 发送到 / 剪切 / 复制 / 删除 / 属性…），而不是我们自绘的菜单。
+//
+// owner 必须是「菜单的宿主窗口」。弹出期间带图标的项是 shell 自绘的，
+// 宿主窗口要把 WM_INITMENUPOPUP / WM_MEASUREITEM / WM_DRAWITEM 转给
+// ForwardShellMenuMessage，否则那几项会塌成 0 高度看不见。
+void ShowShellItemMenu(HWND owner, const std::wstring& path, POINT screenPt);
+
+// 返回 true = 这条消息已经被菜单处理掉了，宿主窗口直接 return TRUE / 0
+bool ForwardShellMenuMessage(HWND owner, UINT msg, WPARAM wp, LPARAM lp);

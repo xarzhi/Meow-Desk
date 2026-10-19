@@ -276,6 +276,19 @@ void ShowItemMenu(HWND hwnd, const std::wstring& path, POINT pt) {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// 对外暴露的系统原生菜单（盒子里右键图标也走这里，见 desktop_surface.h）
+// ---------------------------------------------------------------------------
+void ShowShellItemMenu(HWND owner, const std::wstring& path, POINT screenPt) {
+    ShowItemMenu(owner, path, screenPt);
+}
+
+bool ForwardShellMenuMessage(HWND /*owner*/, UINT msg, WPARAM wp, LPARAM lp) {
+    if (!g_menuOwner) return false;
+    if (msg != WM_INITMENUPOPUP && msg != WM_MEASUREITEM && msg != WM_DRAWITEM) return false;
+    return SUCCEEDED(g_menuOwner->HandleMenuMsg(msg, wp, lp));
+}
+
 struct DesktopSurface::Impl {
     std::unordered_map<DesktopIconView*, IconDib> icons;
     std::unordered_map<DesktopIconView*, LabelDib> labels;
@@ -847,10 +860,7 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DRAWITEM:
     case WM_INITMENUPOPUP:
         // 右键菜单里的自绘项（带图标的那几个）交给 shell 自己画
-        if (g_menuOwner) {
-            const HRESULT r = g_menuOwner->HandleMenuMsg(msg, wp, lp);
-            if (SUCCEEDED(r)) return TRUE;
-        }
+        if (ForwardShellMenuMessage(h, msg, wp, lp)) return TRUE;
         break;
 
     case WM_RBUTTONUP: {
