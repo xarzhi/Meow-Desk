@@ -13,6 +13,7 @@
 
 #include <gdiplus.h>
 
+#include "app_icon.h"
 #include "icon_render.h"
 #include "pinyin.h"
 
@@ -30,8 +31,16 @@ const int kRowH = 46;
 const int kMaxRows = 8;
 const int kPad = 16;
 const int kSearchH = 46;
-const int kListTop = kPad + kSearchH + 10;
+// 顶部「logo + 标题」那一行。搜索框整体下移这么多 —— 用户在面板左上角要求有品牌标识，
+// 参考的是浏览器地址栏/命令面板那种「上方一行小标题」的排版。
+const int kHeaderH = 40;
+const int kSearchTop = kPad + kHeaderH;          // 搜索框的 y
+const int kListTop = kSearchTop + kSearchH + 10;
 const int kFooterH = 30;
+
+// 左上角 logo 的边长，以及它和标题文字的间距
+const int kLogoPx = 22;
+const int kLogoGap = 8;
 
 const int kEditId = 1001;
 
@@ -276,12 +285,12 @@ void SearchWindow::Layout() {
     if (!edit_) {
         edit_ = CreateWindowExW(0, L"EDIT", L"",
                                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT, kPad + 40,
-                                kPad + 8, kWidth - kPad * 2 - 52, kSearchH - 16, hwnd_,
+                                kSearchTop + 8, kWidth - kPad * 2 - 52, kSearchH - 16, hwnd_,
                                 (HMENU)(INT_PTR)kEditId, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(edit_, WM_SETFONT, (WPARAM)font_, TRUE);
         SetWindowSubclass(edit_, EditProc, 1, (DWORD_PTR)this);
     }
-    MoveWindow(edit_, kPad + 44, kPad + 9, kWidth - kPad * 2 - 56, kSearchH - 18, TRUE);
+    MoveWindow(edit_, kPad + 44, kSearchTop + 9, kWidth - kPad * 2 - 56, kSearchH - 18, TRUE);
 
     if (editBrush_) DeleteObject(editBrush_);
     editBrush_ = CreateSolidBrush((dark_ ? DarkTheme() : LightTheme()).search);
@@ -442,7 +451,8 @@ void SearchWindow::Repaint() {
     // ---- 搜索行 ----
     {
         GraphicsPath p;
-        AddRound(p, RectF((float)kPad, (float)kPad, (float)(w - kPad * 2), (float)kSearchH),
+        AddRound(p, RectF((float)kPad, (float)kSearchTop, (float)(w - kPad * 2),
+                          (float)kSearchH),
                  10.0f);
         SolidBrush fill(C(t.search));
         g.FillPath(&fill, &p);
@@ -451,7 +461,7 @@ void SearchWindow::Repaint() {
 
         // 放大镜
         const float cx = (float)kPad + 24.0f;
-        const float cy = (float)kPad + (float)kSearchH * 0.5f;
+        const float cy = (float)kSearchTop + (float)kSearchH * 0.5f;
         Pen mag(C(t.sub), 1.8f);
         g.DrawEllipse(&mag, cx - 6.5f, cy - 6.5f, 11.0f, 11.0f);
         g.DrawLine(&mag, cx + 3.5f, cy + 3.5f, cx + 8.0f, cy + 8.0f);
@@ -468,6 +478,31 @@ void SearchWindow::Repaint() {
 
     SolidBrush brText(C(t.text));
     SolidBrush brSub(C(t.sub));
+
+    // ---- 顶部：程序 logo + 标题（在搜索框左上方）----
+    //
+    // logo 用 AppLogoBitmap()，也就是 exe 里那张 logo-128.png。**整张原样等比缩放**，
+    // 不裁剪、不挑其中一块 —— 这条是用户明确要求过的（见 make_icon.py 里的 TILE）。
+    {
+        const int logoX = kPad + 2;
+        // 和四周一致的上边距：标题行在 kPad..kSearchTop 之间，logo 在里面垂直居中
+        const int logoY = kPad + (kHeaderH - kLogoPx) / 2;
+        if (Bitmap* logo = AppLogoBitmap()) {
+            g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            g.DrawImage(logo, Rect(logoX, logoY, kLogoPx, kLogoPx));
+            g.SetInterpolationMode(InterpolationModeDefault);
+        }
+        Font fTitle(&family, 13.0f, FontStyleRegular, UnitPixel);
+        StringFormat tf;
+        tf.SetLineAlignment(StringAlignmentCenter);
+        tf.SetFormatFlags(StringFormatFlagsNoWrap);
+        tf.SetTrimming(StringTrimmingEllipsisCharacter);
+        const int tx = logoX + kLogoPx + kLogoGap;
+        g.DrawString(L"Meow Desk", -1, &fTitle,
+                     RectF((float)tx, (float)logoY, (float)(w - tx - kPad),
+                           (float)kLogoPx),
+                     &tf, &brSub);
+    }
 
     // ---- 结果列表 ----
     const int rows = RowsVisible();
