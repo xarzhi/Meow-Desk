@@ -42,6 +42,8 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <initializer_list>
+#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -64,14 +66,43 @@ static std::vector<std::unique_ptr<FenceWindow>> g_fences;
 // 抓磨砂背景的那几毫秒里，被临时排除出抓屏的自家窗口（抓完立刻还原）。
 // 见盒子创建处注册的 SetCaptureExcluder。
 static std::vector<HWND> g_captureExcluded;
-// 本进程可见窗口的缓存（窗口 + 矩形）。排除钩子每抓一次屏就要算「谁跟抓取区域相交」，
-// 每次都 EnumWindows 太浪费 —— 缓 2 秒，只有新建/删除盒子才会变。
-struct OwnWin {
-    HWND hwnd;
-    RECT rc;
-};
-static std::vector<OwnWin> g_ownWins;
-static DWORD g_ownWinsT = 0;
+
+// 【只排除「画布窗口」：桌面图标层 / 盒子 / 拖动层】
+//
+// 以前这里是「EnumWindows 扫本进程所有可见窗口」，结果把搜索面板、设置面板、
+// 重命名框也扫了进去。这两个面板都居中在盒子并集区域里，帧泵提到 33Hz 之后就变成
+// 每秒被 SetWindowDisplayAffinity 开关 33 次；而 WDA 一变，DWM 必须重建这个窗口的
+// 呈现表面 —— 于是出现「窗口关不掉 / 变成透明只剩阴影」「设置面板变白」。
+// 瞬时窗口本来也不该参与：它们在最上层，模糊底图里混进一点它们的内容无所谓。
+//
+// 泵线程要读，UI 线程要写（新建/删除盒子），所以是一份「快照 + 原子计数」，
+// 不用锁：写满槽位再 release 发布计数，读侧 acquire 之后才敢取 HWND。
+static HWND g_canvasWins[16]{};
+static std::atomic<int> g_canvasCount{0};
+
+// 画布窗口名单：桌面图标层 + 所有盒子 + 拖动层。
+// 每次新建/删除盒子，或者窗口重建，都要重发一次（只在 UI 线程调用）。
+//
+// 注意这三个都是**分层窗口**（per-pixel alpha / UpdateLayeredWindow）。这一点很关键：
+// WDA 变化时 DWM 只会重建「重定向表面」（普通窗口才有），分层窗口没有那个表面，
+// 所以对它们反复开关 WDA 是无害的；而普通窗口（搜索面板、设置面板、重命名框）
+// 一旦被反复开关，就会留下「透明只剩阴影 / 整片白」的残影。
+static void RefreshCanvasWindows() {
+    std::vector<HWND> v;
+    v.reserve(g_fences.size() + 2);
+    if (g_surface.hwnd()) v.push_back(g_surface.hwnd());
+    for (auto& f : g_fences)
+        if (f && f->hwnd()) v.push_back(f->hwnd());
+    if (g_drag.hwnd()) v.push_back(g_drag.hwnd());
+
+    int n = 0;
+    for (HWND h : v) {
+        if (!h || !IsWindow(h)) continue;
+        if (n >= (int)(sizeof(g_canvasWins) / sizeof(g_canvasWins[0]))) break;
+        g_canvasWins[n++] = h;
+    }
+    g_canvasCount.store(n, std::memory_order_release);
+}
 
 static TrayIcon g_tray;
 static SettingsWindow g_settings;
@@ -2224,6 +2255,8 @@ static void AddFenceWindow(int i, bool startCollapsed) {
         LogStep("fence create FAILED " + std::to_string(i));
     // 即使创建失败也占位，保证 g_fences 下标 == 配置下标
     g_fences.push_back(std::move(f));
+    // 画布窗口多了一个：重发抓屏排除名单（否则新盒子不会被排除，磨砂会兜进它自己）
+    RefreshCanvasWindows();
 
     if (g_fences[i] && g_fences[i]->hwnd()) {
         InstallKeepAbove(g_fences[i]->hwnd(), [i] { return FenceAnchor(i); });
@@ -2314,6 +2347,7 @@ static void RebuildFences() {
     for (auto& f : g_fences)
         if (f) f->Destroy();
     g_fences.clear();
+    RefreshCanvasWindows();   // 旧句柄全部作废，先把名单清空（只剩桌面层/拖动层）
     for (int i = 0; i < (int)g_config.fences.size(); ++i) AddFenceWindow(i);
     RestoreZOrder();
 }
@@ -2656,6 +2690,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                          });
         LogStep("surface created");
     }
+    // 桌面层建好 = 画布窗口名单可以发布了（盒子稍后 AddFenceWindow 会继续追加）
+    RefreshCanvasWindows();
     // 真实桌面文件夹的变更监听：下载 / 别的程序写文件也要能反映到我们的桌面上
     InitDesktopWatch();
 
@@ -2681,8 +2717,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     //
     // 这个函数会被**后台抓图线程**调用（不是 UI 线程），所以：
     //   · 用不带捕获的裸函数指针（SetCaptureExcluder 的参数类型），不能拿 std::function；
-    //   · g_captureExcluded / g_ownWins 只能在这里面读写，序列化由 backdrop.cpp
-    //     里那把锁保证（所有调用都必须经过它的 ExclGuard）。
+    //   · g_captureExcluded 只能在这里面读写，序列化由 backdrop.cpp
+    //     里那把锁保证（所有调用都必须经过它的 ExclGuard）；
+    //   · 窗口名单只能读 g_canvasWins 快照 —— 绝不能碰 g_fences（UI 线程在改）。
     FenceWindow::SetCaptureExcluder([](const RECT& rc, bool exclude) {
         if (!exclude) {
             for (HWND h : g_captureExcluded) SetWindowDisplayAffinity(h, WDA_NONE);
@@ -2691,35 +2728,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         g_captureExcluded.clear();
 
-        // 自家窗口列表缓存 2 秒：每次抓屏都 EnumWindows + 每个窗口一次 GetWindowRect，
-        // 七个盒子每两秒各抓一次，全扫一遍是白花钱。窗口增删本来就只有「新建/删除
-        // 盒子 → 主线程会重建」这一种情况，2 秒的滞后完全够。
-        const DWORD now = GetTickCount();
-        if (g_ownWins.empty() || now - g_ownWinsT > 2000) {
-            g_ownWins.clear();
-            g_ownWinsT = now;
-            const DWORD me = GetCurrentProcessId();
-            struct Ctx {
-                DWORD pid;
-            } ctx{me};
-            EnumWindows(
-                [](HWND h, LPARAM lp) -> BOOL {
-                    auto* c = reinterpret_cast<Ctx*>(lp);
-                    DWORD pid = 0;
-                    GetWindowThreadProcessId(h, &pid);
-                    if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
-                    RECT r{};
-                    if (!GetWindowRect(h, &r)) return TRUE;
-                    g_ownWins.push_back(OwnWin{h, r});
-                    return TRUE;
-                },
-                reinterpret_cast<LPARAM>(&ctx));
-        }
-        for (const OwnWin& w : g_ownWins) {
-            if (w.rc.right <= rc.left || rc.right <= w.rc.left) continue;
-            if (w.rc.bottom <= rc.top || rc.bottom <= w.rc.top) continue;
-            if (SetWindowDisplayAffinity(w.hwnd, WDA_EXCLUDEFROMCAPTURE))
-                g_captureExcluded.push_back(w.hwnd);
+        const int n = g_canvasCount.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            HWND h = g_canvasWins[i];
+            if (!h || !IsWindow(h) || !IsWindowVisible(h)) continue;
+            RECT r{};
+            if (!GetWindowRect(h, &r)) continue;
+            if (r.right <= rc.left || rc.right <= r.left) continue;
+            if (r.bottom <= rc.top || rc.bottom <= r.top) continue;
+            if (SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE))
+                g_captureExcluded.push_back(h);
         }
     });
     // 抓屏诊断：写进日志，下次「磨砂不对」时先看这一行。
