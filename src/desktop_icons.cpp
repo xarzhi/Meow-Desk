@@ -9,6 +9,9 @@
 #include <exdisp.h>
 
 #include <cstdio>
+#include <cstring>
+#include <algorithm>
+#include <unordered_set>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -122,6 +125,117 @@ const char* LastEnumDiag() { return g_diag; }
 
 POINT LastEnumSpacing() { return g_spacing; }
 
+// ---------------------------------------------------------------------------
+// 和真实文件夹对账
+//
+// 桌面视图被我们隐藏之后，它对文件系统变化的同步是不可靠的：卸载掉的程序、
+// 从浏览器下载的文件，视图里的列表都可能还是旧的。所以枚举完视图之后，
+// 再用「文件夹里到底有什么」校正一遍：
+//   · 视图里有、磁盘上没有 → 丢掉（否则卸载掉的程序图标会一直挂在桌面上）
+//   · 磁盘上有、视图里没有 → 补进来（位置用哨兵 (-1,-1)，上层自己找空位摆）
+// 只处理文件系统项；公共桌面的项在另一个目录里，一并算进去。
+// ---------------------------------------------------------------------------
+namespace {
+
+std::wstring LowerPath(std::wstring s) {
+    if (!s.empty()) CharLowerBuffW(s.data(), (DWORD)s.size());
+    return s;
+}
+
+std::wstring DirOf(int csidl) {
+    wchar_t buf[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, csidl, nullptr, 0, buf))) return {};
+    return std::wstring(buf);
+}
+
+void ReconcileWithDisk(std::vector<DesktopIcon>& items) {
+    const std::wstring dirs[2] = {DirOf(CSIDL_DESKTOPDIRECTORY),
+                                  DirOf(CSIDL_COMMON_DESKTOPDIRECTORY)};
+    if (dirs[0].empty() && dirs[1].empty()) return;
+
+    std::unordered_set<std::wstring> onDisk;   // 磁盘上真实存在（含隐藏）
+    std::vector<std::wstring> addable;         // 可以摆到桌面上的
+    bool allOk = true;                         // 每个目录都读到了？读不到就别删
+    for (const auto& d : dirs) {
+        if (d.empty()) continue;
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((d + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) {
+            allOk = false;
+            continue;
+        }
+        do {
+            if (fd.cFileName[0] == L'.' &&
+                (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0)))
+                continue;
+            const std::wstring full = d + L"\\" + fd.cFileName;
+            onDisk.insert(LowerPath(full));
+            // desktop.ini 是文件夹的元数据，不是图标。一般都是隐藏+系统属性，
+            // 但被改过属性的机器上它会露出来，这里显式挡一道。
+            if (_wcsicmp(fd.cFileName, L"desktop.ini") == 0) continue;
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+            addable.push_back(full);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    // 一个都没读到（权限 / 路径异常）：这时候「删」太危险，直接放弃校正
+    if (onDisk.empty()) return;
+
+    // 1) 磁盘上已经没了的
+    //    只在每个目录都成功枚举时才删 —— 某个目录读失败时，它里面的图标会被
+    //    误判成「磁盘上没有」，那样会把一整屏图标全抹掉。
+    const size_t had = items.size();
+    if (allOk) {
+        items.erase(std::remove_if(items.begin(), items.end(),
+                                   [&](const DesktopIcon& it) {
+                                       if (!it.isFileSystem) return false;
+                                       return onDisk.count(LowerPath(it.path)) == 0;
+                                   }),
+                    items.end());
+    }
+    const size_t removed = had - items.size();
+
+    // 2) 磁盘上有、视图里没有的
+    std::unordered_set<std::wstring> known;
+    for (const auto& it : items)
+        if (it.isFileSystem) known.insert(LowerPath(it.path));
+
+    size_t added = 0;
+    for (const auto& p : addable) {
+        if (known.count(LowerPath(p))) continue;
+
+        DesktopIcon icon;
+        icon.path = p;
+        const size_t slash = p.find_last_of(L'\\');
+        icon.name = (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+        icon.pos = POINT{-1, -1};   // 哨兵：让上层找个空位摆，别都堆在左上角
+        icon.isFileSystem = true;
+        const DWORD attr = GetFileAttributesW(p.c_str());
+        icon.isFolder = attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+
+        // 位置写回用的是「桌面文件夹的子 PIDL」，从完整 PIDL 里复制最后一段
+        PIDLIST_ABSOLUTE full = nullptr;
+        if (SUCCEEDED(SHParseDisplayName(p.c_str(), nullptr, &full, 0, nullptr)) && full) {
+            PCUITEMID_CHILD child = ILFindLastID(full);
+            const UINT cb = (UINT)((const BYTE*)ILGetNext(child) - (const BYTE*)child);
+            auto* copy = (LPITEMIDLIST)CoTaskMemAlloc(cb);
+            if (copy) {
+                memcpy(copy, child, cb);
+                icon.pidl = copy;
+            }
+            ILFree(full);
+        }
+        items.push_back(std::move(icon));
+        ++added;
+    }
+
+    if (removed || added) {
+        SetDiag("ok reconcile -%d +%d (total %d)", (int)removed, (int)added, (int)items.size());
+    }
+}
+
+}  // namespace
+
 std::vector<DesktopIcon> EnumerateDesktopIcons() {
     std::vector<DesktopIcon> result;
 
@@ -185,6 +299,8 @@ std::vector<DesktopIcon> EnumerateDesktopIcons() {
     SetDiag("ok count=%d spacing=%dx%d iconSize=%d", count, spacing.x, spacing.y, iconSize);
     view->Release();
     desktop->Release();
+
+    ReconcileWithDisk(result);
     return result;
 }
 

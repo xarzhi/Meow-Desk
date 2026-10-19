@@ -136,6 +136,10 @@ public:
     // 命中哪个标签，-1 = 没命中
     int HitTab(POINT clientPt) const;
 
+    // 屏幕坐标下压着哪个图标（-1 之外的空白/头部 → nullptr）。
+    // 拖放落点判定用：松手时要知道「放到哪个图标上了」。
+    DesktopIconView* ItemAtScreen(POINT screenPt) const;
+
     // 调试：最近一次拖动夹取的实况（障碍数量 / 期望位置 / 实际位置）。
     // 不参与任何逻辑，只往日志里写 —— 盒子互相避让出问题时，这一行能直接区分
     // 「一个障碍都没拿到」和「拿到了但没挡住」。
@@ -167,6 +171,14 @@ private:
     void Collect(std::vector<DesktopIconView*>& out) const;
     // 实际参与布局/绘制的图标（排除正在被拖出的那个）
     void CollectVisible(std::vector<DesktopIconView*>& out) const;
+
+    // ---- 内容纵向滚动（图标多到超出盒子高度时）----
+    // 只做「整行滚动」：滚半行会让上下两排都只显示一半，那需要裁剪；
+    // 整行对齐之后「整行放得下才画」，不用任何裁剪，也不会漏到头部和圆角外面。
+    int scrollY_ = 0;
+    int MaxScroll() const;
+    void ClampScroll();
+    void ScrollBy(int deltaPx);
     int HitItem(POINT clientPt) const;
     // 当前宽度下能放几列（拖拽改宽度后要跟着变）。列表/详情恒为 1 列。
     int CellCols() const;

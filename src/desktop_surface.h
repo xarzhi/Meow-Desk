@@ -102,6 +102,11 @@ public:
     // 光标在 (x,y) 松手时图标会落到哪个格子（用于落点预览和盒子 → 桌面的落位）
     POINT CellForCursor(POINT cursor, const IconBitmap* icon) const;
 
+    // 屏幕点上有没有图标（**不带**拖拽/层级那两条约束）。
+    // 拖放的落点判定要用这个：松手那一刻还在 drag 模式里，
+    // HitTestScreen 会因为 mode_ != None 一律返回 nullptr。
+    DesktopIconView* ItemAtScreen(POINT screenPt) const;
+
     // 桌面左上角起、按列（先从上到下扫完一列，再往右）的第一个空闲格子。
     // 删除盒子 / 删除分组把图标倒回桌面时用：图标会从左上角开始一个挨一个往下排，
     // 一列排满再换右边一列，而不是各自「就近抢一个」格子撒得满屏都是。

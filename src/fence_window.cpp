@@ -320,7 +320,7 @@ void FenceWindow::ItemRect(int index, RECT& r) const {
     const int c = index % cols;
     const int row = index / cols;
     const int ch = cellH();
-    const int top = HeadH() + kPad + row * ch;
+    const int top = HeadH() + kPad + row * ch - scrollY_;
 
     if (IsListView()) {
         r = RECT{kPad, top, width_ - kPad, top + ch};
@@ -348,7 +348,7 @@ RECT FenceWindow::ItemHighlightRect(int index) const {
     }
     const int row = index / cols;
     const int c = index % cols;
-    const int top = HeadH() + kPad + row * ch;
+    const int top = HeadH() + kPad + row * ch - scrollY_;
     const int cx = ColCenterX(c, cols);
     const int half = cellW_ / 2;
     int l = cx - half;
@@ -843,6 +843,7 @@ void FenceWindow::SetActiveGroup(int g) {
     pressTab_ = -1;
     marquee_ = false;
     drop_ = DropHint{};
+    scrollY_ = 0;   // 换了一批图标，滚动位置从头开始
     // 拖拽过程中（把图标划过标签栏）也会走到这里：这时只能作废「下标」，
     // 绝不能清 itemDragging_ / dragItems_ —— 否则一次拖动会被打断成「松手什么都不发生」。
     if (!itemDragging_) dragged_ = nullptr;
@@ -1065,8 +1066,42 @@ bool FenceWindow::ItemOrigin(int index, int& x, int& y) const {
     } else {
         x = ColCenterX(c, cols) - iconPx() / 2;   // 图标以列中心居中对齐
     }
-    y = HeadH() + kPad + r * ch;
-    return y + ch <= curH_ - kPad;
+    y = HeadH() + kPad + r * ch - scrollY_;
+    // 只有「整行都落在内容区里」才算可见：滚动按整行对齐，所以不会出现半行，
+    // 也就不需要裁剪 —— 上半行不会漏到头部，下半行不会漏到卡片圆角外。
+    return y >= HeadH() + kPad && y + ch <= curH_ - kPad;
+}
+
+// ---- 内容纵向滚动 ----
+
+// 最多能往下滚多少（一定是 cellH 的整数倍）
+int FenceWindow::MaxScroll() const {
+    if (collapsed_ || !all_) return 0;
+    std::vector<DesktopIconView*> mine;
+    CollectVisible(mine);
+    const int cols = std::max(1, CellCols());
+    const int rows = ((int)mine.size() + cols - 1) / cols;
+    const int ch = cellH();
+    if (ch <= 0) return 0;
+    const int top = HeadH() + kPad;
+    const int viewRows = std::max(0, (curH_ - kPad - top) / ch);
+    if (rows <= viewRows) return 0;
+    return (rows - viewRows) * ch;
+}
+
+void FenceWindow::ClampScroll() {
+    const int ch = cellH();
+    if (scrollY_ < 0) scrollY_ = 0;
+    const int maxS = MaxScroll();
+    if (scrollY_ > maxS) scrollY_ = maxS;
+    if (ch > 0) scrollY_ = (scrollY_ / ch) * ch;   // 对齐到整行
+}
+
+void FenceWindow::ScrollBy(int deltaPx) {
+    const int old = scrollY_;
+    scrollY_ += deltaPx;
+    ClampScroll();
+    if (scrollY_ != old) Redraw();
 }
 
 RECT FenceWindow::rect() const {
@@ -1244,7 +1279,22 @@ std::wstring FenceWindow::DragDebug() const {
            std::to_wstring(dbgGot_.x) + L"," + std::to_wstring(dbgGot_.y) + L")";
 }
 
+DesktopIconView* FenceWindow::ItemAtScreen(POINT screenPt) const {
+    if (!hwnd_ || collapsed_) return nullptr;
+    POINT c = screenPt;
+    ScreenToClient(hwnd_, &c);
+    const int i = HitItem(c);
+    if (i < 0) return nullptr;
+    // 必须用和 HitItem 同一份列表取下标，否则以后 Collect 和 CollectVisible
+    // 的口径一旦分叉，这里就会取到隔壁那个图标
+    std::vector<DesktopIconView*> mine;
+    CollectVisible(mine);
+    return (i < (int)mine.size()) ? mine[i] : nullptr;
+}
+
 int FenceWindow::HitItem(POINT clientPt) const {
+    // 头部 / 卡片内边距里不该命中任何图标（滚动之后第一排的格子可能伸到上面去）
+    if (clientPt.y < HeadH() + kPad || clientPt.y >= curH_ - kPad) return -1;
     std::vector<DesktopIconView*> mine;
     CollectVisible(mine);
     for (size_t i = 0; i < mine.size(); ++i) {
@@ -1605,6 +1655,16 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
+
+    case WM_MOUSEWHEEL: {
+        // 图标多到超出盒子高度时，滚轮往里滚。一次 3 行，按整行对齐。
+        const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        if (delta != 0) {
+            const int step = std::max(1, 3) * cellH();
+            ScrollBy(delta > 0 ? -step : step);
+        }
+        return 0;
+    }
 
     case WM_RBUTTONUP: {
         // 右键图标 → 系统原生菜单（资源管理器那套）；右键空白/头部 → 我们自己的盒子菜单
@@ -2063,6 +2123,30 @@ void FenceWindow::Paint() {
             }
         }
 
+        // ---- 滚动指示条 ----
+        // 内容超出可视区域时，右边缘画一根细条，告诉用户「下面还有」。
+        // 只在真的能滚的时候出现，平时不占地方、也不抢视线。
+        if (!collapsed_) {
+            const int maxS = MaxScroll();
+            if (maxS > 0) {
+                const int top = HeadH() + kPad;
+                const int viewH = (curH_ - kPad) - top;
+                if (viewH > 20) {
+                    const int totalH = viewH + maxS;
+                    int thumbH = (int)((long long)viewH * viewH / totalH);
+                    if (thumbH < 18) thumbH = 18;
+                    if (thumbH > viewH) thumbH = viewH;
+                    const int span = viewH - thumbH;
+                    const int thumbTop = top + (span > 0 ? (int)((long long)span * scrollY_ / maxS) : 0);
+                    const float barW = 3.0f;
+                    const float x = (float)width_ - kPad - barW;
+                    const RectF rc(x, (float)thumbTop, barW, (float)thumbH);
+                    SolidBrush sb{light ? Color(56, 0, 0, 0) : Color(72, 255, 255, 255)};
+                    gfx.FillRectangle(&sb, rc);
+                }
+            }
+        }
+
         // ---- 选中高亮（支持多选；双击才打开，所以要有可见的选中态）----
         if (!collapsed_ && !itemDragging_) {
             std::vector<DesktopIconView*> mineSel;
@@ -2294,7 +2378,7 @@ void FenceWindow::Paint() {
         const int c = drop_.item % cols;
         const int row = drop_.item / cols;
         const int ch = cellH();
-        const int top = HeadH() + kPad + row * ch;
+        const int top = HeadH() + kPad + row * ch - scrollY_;
         const int iw = iconPx();
         const int cxi = ColCenterX(c, cols);
         // 线落在两个图标之间的空隙中线：图标边缘往外半个空隙
@@ -2359,6 +2443,8 @@ void FenceWindow::Present() {
 
 void FenceWindow::Redraw() {
     if (!hwnd_) return;
+    // 图标数量 / 尺寸 / 盒子高度都可能刚变过，滚动位置可能已经越界
+    ClampScroll();
     EnsureBackbuffer(width_, curH_);
     Paint();
     Present();

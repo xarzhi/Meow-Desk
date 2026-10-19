@@ -1441,6 +1441,11 @@ void DesktopSurface::RepaintCells(const RECT& rect) {
     UploadLayered();
 }
 
+DesktopIconView* DesktopSurface::ItemAtScreen(POINT screenPt) const {
+    if (!icons_ || !hwnd_) return nullptr;
+    return HitTest(POINT{screenPt.x - origin_.x, screenPt.y - origin_.y});
+}
+
 DesktopIconView* DesktopSurface::HitTestScreen(POINT screenPt) const {
     if (!icons_ || !hwnd_) return nullptr;
     if (mode_ != Mode::None) return nullptr;   // 拖拽/框选过程中不显示悬停

@@ -29,10 +29,12 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <shobjidl.h>   // IShellLinkW：拖到 .lnk 上时要先解析出真实程序
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
@@ -457,13 +459,6 @@ static DesktopIconView* FenceItemAt(int fi, int idx, DesktopIconView* skip) {
     return nullptr;
 }
 
-// 落在目标图标的「中间」区域松手：把拖拽的文件交给目标图标的程序打开
-static void OpenWithDragged(DesktopIconView* src, DesktopIconView* tgt) {
-    if (!src || !tgt || src == tgt) return;
-    ShellExecuteW(nullptr, L"open", tgt->path.c_str(), src->path.c_str(), nullptr,
-                  SW_SHOWNORMAL);
-}
-
 static void ClearAllDropHints() {
     for (auto& f : g_fences)
         if (f) f->ClearDropHint();
@@ -510,6 +505,15 @@ static void ReloadDesktopIcons(bool keepPositions = false) {
     auto items = EnumerateDesktopIcons();
     LogStep("reload icons: " + std::to_string(items.size()) + " diag: " + LastEnumDiag());
 
+    // 枚举失败（拿不到桌面视图 / ItemCount 失败）时也会返回空列表。
+    // 那种情况绝不能当成「桌面空了」—— 否则一次瞬时失败就把一屏图标全删掉。
+    // 只有成功枚举（diag 以 "ok " 开头）才允许往下走「删掉没有的图标」。
+    if (items.empty() && !g_icons.empty() &&
+        std::strncmp(LastEnumDiag(), "ok ", 3) != 0) {
+        LogStep("reload icons: enum FAILED, skipped");
+        return;
+    }
+
     std::vector<DesktopIconView*> seen;
     for (auto& it : items) {
         DesktopIconView* found = nullptr;
@@ -523,7 +527,7 @@ static void ReloadDesktopIcons(bool keepPositions = false) {
             if (found->pidl) FreeDesktopPidl(found->pidl);
             found->pidl = it.pidl;
             found->name = it.name;
-            if (!keepPositions && found->OnDesktop()) {
+            if (!keepPositions && found->OnDesktop() && it.pos.x >= 0 && it.pos.y >= 0) {
                 found->pos = it.pos;
                 found->dragPos = it.pos;
             }
@@ -533,8 +537,10 @@ static void ReloadDesktopIcons(bool keepPositions = false) {
         auto e = std::make_unique<DesktopIconView>();
         e->path = it.path;
         e->name = it.name;
-        e->pos = it.pos;
-        e->dragPos = it.pos;
+        // 磁盘对账补进来的项没有 shell 坐标（哨兵 -1）：丢到桌面第一个空位，
+        // 不能都堆在左上角压着别的图标
+        e->pos = (it.pos.x >= 0 && it.pos.y >= 0) ? it.pos : g_surface.FirstFreeCell({});
+        e->dragPos = e->pos;
         LoadShellIcon(e->path, kIconPx, e->bmp, g_config.shortcutArrow != 0);
         e->pidl = it.pidl;
         seen.push_back(e.get());
@@ -679,10 +685,26 @@ static DWORD MoveFilesInto(const std::vector<std::wstring>& paths, const std::ws
 
 static void NoteKnownDesktopPaths();   // 定义在自动整理那一段
 
+// 定义在后面（「拖到图标上」那一段）
+static void RequestIconReload();
+static DesktopIconView* IconAtScreen(POINT pt);
+static DWORD DropFilesOntoIcon(const std::vector<std::wstring>& paths, DesktopIconView* tgt);
+static bool IsContainerTarget(const DesktopIconView* e);
+
 // 一批文件落进我们的桌面（fenceIndex < 0）或者某个盒子
 static DWORD AcceptDroppedFiles(const std::vector<std::wstring>& paths, POINT screenPt,
                                 int fenceIndex) {
     if (paths.empty()) return DROPEFFECT_NONE;
+
+    // 落点正压在某个图标上 → 按「放到它上面」处理，别搬进桌面：
+    // 文件夹移进去、回收站删除、可执行/快捷方式用它打开（拖 .md 到 Typora）。
+    if (DesktopIconView* tgt = IconAtScreen(screenPt)) {
+        const DWORD eff = DropFilesOntoIcon(paths, tgt);
+        if (eff != DROPEFFECT_NONE) {
+            RequestIconReload();
+            return eff;
+        }
+    }
 
     std::unordered_set<std::wstring> before;
     for (auto* e : g_icons)
@@ -729,6 +751,173 @@ static DWORD AcceptDroppedFiles(const std::vector<std::wstring>& paths, POINT sc
     NoteKnownDesktopPaths();
     LogStep("file drop: placed " + std::to_string(fresh.size()) + " icon(s)");
     return done;
+}
+
+// ---------------------------------------------------------------------------
+// 拖到「某个图标」上
+//
+// 三种语义，和资源管理器一致：
+//   · 回收站   → 删除（进回收站）
+//   · 文件夹   → 移进去
+//   · 其它文件 → 交给它的默认程序打开（拖 .md 到 Typora 图标上就是这条路）
+//
+// 以前这三种都没有：松手只会「把图标摆到桌面上」，所以拖到图标上看起来没反应
+// （回收站那种还会把文件挪到回收站图标旁边）。
+// ---------------------------------------------------------------------------
+
+// 落点可能把文件移走了（进文件夹 / 进回收站），图标列表要跟着重新枚举。
+// 不能当场枚举：拖放回调返回之后调用方还要收尾，这时候把图标对象析构掉会用到悬空指针。
+static const UINT kMsgReloadIcons = WM_APP + 9;
+static void RequestIconReload() { PostMessageW(nullptr, kMsgReloadIcons, 0, 0); }
+
+// 松手点下面的图标：先看盒子（盒子盖在桌面层上面），再看桌面层
+static DesktopIconView* IconAtScreen(POINT pt) {
+    for (auto& f : g_fences) {
+        if (!f || !f->hwnd()) continue;
+        if (!f->HitTest(pt)) continue;
+        return f->ItemAtScreen(pt);   // 落在盒子空白处 → 没命中
+    }
+    return g_surface.ItemAtScreen(pt);
+}
+
+// 回收站是虚拟项（解析名是 ::{645FF040-…}），没有文件系统路径，只能比解析名
+static bool IsRecycleBinPath(const std::wstring& p) {
+    PWSTR rb = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_RecycleBinFolder, 0, nullptr, &rb)) || !rb) return false;
+    const bool same = CompareStringOrdinal(p.c_str(), -1, rb, -1, TRUE) == CSTR_EQUAL;
+    CoTaskMemFree(rb);
+    return same;
+}
+
+static DWORD DeleteFilesToRecycleBin(const std::vector<std::wstring>& paths) {
+    std::wstring from;
+    for (const auto& p : paths) {
+        if (p.empty()) continue;
+        from += p;
+        from.push_back(L'\0');
+    }
+    if (from.empty()) return DROPEFFECT_NONE;
+    from.push_back(L'\0');
+
+    SHFILEOPSTRUCTW op{};
+    op.wFunc = FO_DELETE;
+    op.pFrom = from.c_str();
+    // FOF_ALLOWUNDO = 进回收站（和桌面拖到回收站一样，还能还原）
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    const bool ok = SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
+    LogStep(std::string("drop -> recycle bin: ") + (ok ? "ok" : "FAILED"));
+    return ok ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
+}
+
+// 解析快捷方式：拿到真实程序路径 + 快捷方式自带的参数。
+// 直接把 .lnk 的路径丢给 ShellExecute 时，我们附加的参数在部分 shell 版本上会被
+// 快捷方式自己的参数顶掉 —— 表现就是「拖个 md 到 Typora 图标上毫无反应」。
+static bool ResolveShortcut(const std::wstring& lnk, std::wstring& outExe, std::wstring& outArgs) {
+    IShellLinkW* link = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_IShellLinkW, (void**)&link)) ||
+        !link)
+        return false;
+
+    bool ok = false;
+    IPersistFile* pf = nullptr;
+    if (SUCCEEDED(link->QueryInterface(IID_IPersistFile, (void**)&pf)) && pf) {
+        if (SUCCEEDED(pf->Load(lnk.c_str(), STGM_READ))) {
+            wchar_t exe[MAX_PATH]{};
+            if (SUCCEEDED(link->GetPath(exe, MAX_PATH, nullptr, SLGP_RAWPATH)) && exe[0]) {
+                wchar_t args[1024]{};
+                link->GetArguments(args, 1024);
+                outExe = exe;
+                outArgs = args;
+                ok = true;
+            }
+        }
+        pf->Release();
+    }
+    link->Release();
+    return ok;
+}
+
+// 用「目标图标」的程序打开被拖的文件。
+// lpFile 是目标（快捷方式会先被解析成真实程序），lpParameters 是被拖的文件 ——
+// 效果等同于在资源管理器里把文件拖到那个程序图标上。
+static DWORD OpenFilesWithIcon(const std::vector<std::wstring>& paths,
+                              const std::wstring& target) {
+    std::wstring exe = target;
+    std::wstring args;
+
+    std::wstring ext;
+    const size_t dot = target.find_last_of(L'.');
+    if (dot != std::wstring::npos) ext = target.substr(dot);
+    if (!ext.empty()) CharLowerBuffW(ext.data(), (DWORD)ext.size());
+    if (ext == L".lnk") {
+        std::wstring real, linkArgs;
+        if (ResolveShortcut(target, real, linkArgs)) {
+            exe = real;
+            args = linkArgs;
+        }
+    }
+
+    for (const auto& p : paths) {
+        if (p.empty()) continue;
+        if (!args.empty()) args.push_back(L' ');
+        args.push_back(L'"');
+        args += p;
+        args.push_back(L'"');
+    }
+    const HINSTANCE r = ShellExecuteW(nullptr, L"open", exe.c_str(),
+                                      args.empty() ? nullptr : args.c_str(), nullptr,
+                                      SW_SHOWNORMAL);
+    LogStep("drop -> open with " + Narrow(exe) + " ret=" +
+            std::to_string((long long)(INT_PTR)r));
+    // 文件没被搬走：报 COPY，让拖放源别删自己的原件
+    return ((INT_PTR)r > 32) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+}
+
+// 「落到它上面有特殊含义」的图标：文件夹（移进去）、回收站（删除）。
+static bool IsContainerTarget(const DesktopIconView* e) {
+    if (!e) return false;
+    if (IsRecycleBinPath(e->path)) return true;
+    const DWORD a = GetFileAttributesW(e->path.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// 「用它的程序打开被我拖来的文件」——只认可执行 / 快捷方式。
+// 拖到一张图片、一个 txt 上如果也去调 ShellExecute，会弹出系统的「打开方式」框，
+// 那显然不是用户想要的；这种情况按「不认识」处理，调用方自己决定怎么摆放。
+static bool IsProgramTarget(const DesktopIconView* e) {
+    if (!e || e->path.empty()) return false;
+    const size_t dot = e->path.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    std::wstring ext = e->path.substr(dot);
+    CharLowerBuffW(ext.data(), (DWORD)ext.size());
+    static const wchar_t* const kOk[] = {L".exe", L".lnk", L".com", L".url", L".msc", L".cpl"};
+    for (const wchar_t* k : kOk)
+        if (ext == k) return true;
+    return false;
+}
+
+static DWORD DropFilesOntoIcon(const std::vector<std::wstring>& paths, DesktopIconView* tgt) {
+    if (!tgt || paths.empty()) return DROPEFFECT_NONE;
+
+    if (IsRecycleBinPath(tgt->path)) return DeleteFilesToRecycleBin(paths);
+
+    if (IsContainerTarget(tgt)) {
+        const DWORD eff = MoveFilesInto(paths, tgt->path);
+        LogStep("drop -> folder " + Narrow(tgt->path) + (eff != DROPEFFECT_NONE ? " ok" : " FAILED"));
+        return eff;
+    }
+    if (IsProgramTarget(tgt)) return OpenFilesWithIcon(paths, tgt->path);
+
+    // 不认识的目标（普通文件图标）：让调用方按普通落点处理
+    return DROPEFFECT_NONE;
+}
+
+// 我们自己的图标拖到另一个图标上（内部拖拽）的语义，和上面完全一致。
+// 返回 DROPEFFECT_NONE = 「这个目标不认」，调用方照原来的「摆到这儿」处理。
+static DWORD DropIconOntoIcon(DesktopIconView* src, DesktopIconView* tgt) {
+    if (!src || !tgt || src == tgt || src->path.empty()) return DROPEFFECT_NONE;
+    return DropFilesOntoIcon({src->path}, tgt);
 }
 
 // ---------------------------------------------------------------------------
@@ -1570,16 +1759,30 @@ static void AddFenceWindow(int i) {
         ClearAllDropHints();
 
         if (fi >= 0) {
-            // 「拖到图标中间 → 用目标程序打开」只对单张有意义
-            if (batch.size() == 1 && h.openWith()) {
-                OpenWithDragged(batch[0], FenceItemAt(fi, h.item, batch[0]));
+            // 「拖到某个图标的正中间」只对单张有意义：目标是文件夹/回收站就
+            // 移进去/删掉，是程序就用它打开；目标不认才当插入位置处理。
+            DesktopIconView* tgt =
+                (h.openWith() && !batch.empty()) ? FenceItemAt(fi, h.item, batch[0]) : nullptr;
+            DWORD eff = DROPEFFECT_NONE;
+            if (batch.size() == 1) eff = DropIconOntoIcon(batch[0], tgt);
+            if (eff != DROPEFFECT_NONE) {
+                // MOVE = 文件被搬走了（进文件夹 / 进回收站），图标要跟着消失
+                if (eff == DROPEFFECT_MOVE) RequestIconReload();
             } else {
                 InsertIntoFenceMulti(batch, fi, h.active() ? h.insert : -1);
             }
         } else {
-            // 盒子 → 桌面：第一张落到光标处，其余会顺着空位依次散开
-            std::vector<DesktopIconView*> pending;
-            for (auto* e : batch) PlaceOnDesktop(e, pt, pending);
+            // 盒子 → 桌面：先看落点有没有压在桌面图标上（文件夹 / 回收站 / 程序），
+            // 是的话交给它处理，而不是把图标摆到那个图标旁边。
+            DWORD eff = DROPEFFECT_NONE;
+            if (batch.size() == 1) eff = DropIconOntoIcon(batch[0], IconAtScreen(pt));
+            if (eff != DROPEFFECT_NONE) {
+                if (eff == DROPEFFECT_MOVE) RequestIconReload();
+            } else {
+                // 第一张落到光标处，其余会顺着空位依次散开
+                std::vector<DesktopIconView*> pending;
+                for (auto* e : batch) PlaceOnDesktop(e, pt, pending);
+            }
         }
         SaveIconLayout();
         RedrawAll();
@@ -1879,16 +2082,35 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_surface.onDragHover = [](POINT pt) { UpdateAllDropHints(pt); };
     g_surface.onDrop = [](const std::vector<DesktopIconView*>& list, POINT pt) -> bool {
         const int fi = FenceIndexAt(pt);
+
+        // 落在桌面上的某个图标上（文件夹移进去 / 回收站删除 / 程序用它打开）：
+        // 交给它处理，而不是「摆到它旁边」。以前只有文件夹/回收站这条，程序图标
+        // 会被当成普通落点，于是「拖 md 到 Typora 图标上」看起来毫无反应。
+        if (fi < 0 && list.size() == 1 && list[0]) {
+            const DWORD eff = DropIconOntoIcon(list[0], g_surface.ItemAtScreen(pt));
+            if (eff != DROPEFFECT_NONE) {
+                if (eff == DROPEFFECT_MOVE) RequestIconReload();
+                SaveIconLayout();
+                RedrawAll();
+                return true;
+            }
+        }
+
         if (fi < 0) return false;
 
         FenceWindow::DropHint h;
         if (g_fences[fi]) h = g_fences[fi]->dropHint();
         ClearAllDropHints();
 
-        // 中间区域 + 单个文件 → 用目标图标的程序打开它
+        // 中间区域 + 单个文件 → 交给目标图标（文件夹移进去 / 回收站删 / 程序打开）
         if (h.openWith() && list.size() == 1) {
-            OpenWithDragged(list[0], FenceItemAt(fi, h.item, nullptr));
-            return true;
+            const DWORD eff = DropIconOntoIcon(list[0], FenceItemAt(fi, h.item, nullptr));
+            if (eff != DROPEFFECT_NONE) {
+                if (eff == DROPEFFECT_MOVE) RequestIconReload();
+                SaveIconLayout();
+                RedrawAll();
+                return true;
+            }
         }
         int k = 0;
         for (auto* e : list) {
@@ -2017,6 +2239,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         // 全局快捷键：RegisterHotKey(nullptr, ...) 投递到线程队列，hwnd == nullptr
         if (msg.message == WM_HOTKEY && msg.hwnd == nullptr) {
             if ((int)msg.wParam == kHotkeyId) g_search.Toggle();
+            continue;
+        }
+        // 拖放把文件搬走了（移进文件夹 / 进回收站）：现在才安全地重新枚举图标 ——
+        // 在拖放回调里就枚举会把调用方还握着的图标对象析构掉。
+        if (msg.message == kMsgReloadIcons) {
+            ReloadDesktopIcons(true);
+            RedrawAll();
             continue;
         }
         TranslateMessage(&msg);
