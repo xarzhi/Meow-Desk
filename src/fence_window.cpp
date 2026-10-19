@@ -599,7 +599,8 @@ void FenceWindow::ApplyResize(POINT screenPt) {
 
     // 边缘吸附：改尺寸时也要能贴上别的盒子 / 屏幕边。
     // 只吸「正在拖的那条边」，固定不动的那几条边不参与。
-    {
+    // 「自动吸附」关掉就整段跳过 —— 用户拖到哪就是哪，绝不偷偷挪坐标。
+    if (g_config.autoSnap) {
         std::vector<RECT> others;
         if (s_obstacleProvider) others = s_obstacleProvider(this);
         std::vector<int> xs, ys;
@@ -875,7 +876,10 @@ void FenceWindow::SetSort(int key, bool asc) {
 void FenceWindow::StartFlip(const std::unordered_map<DesktopIconView*, int>& fromSlot,
                             const std::vector<DesktopIconView*>& after) {
     StopFlip();
-    if (!g_config.sortAnim || collapsed_) return;
+    // 两个开关都得关才算「不要动画」：sortAnim 管排序过渡，flipAnim 管拖放插入。
+    // 设置页里它们是一个开关，但配置分开存（见 config.h）。
+    if (!g_config.sortAnim && !g_config.flipAnim) return;
+    if (collapsed_) return;
     if (after.size() < 2) return;
 
     bool moved = false;
@@ -1372,11 +1376,14 @@ void FenceWindow::ResolveDragMove(RECT from, int wantX, int wantY,
     dbgObstacles_ = s_obstacleProvider ? (int)others.size() : -1;
 
     if (!others.empty()) {
-        std::vector<int> xs, ys;
-        CollectSnapLines(others, wa, want, xs, ys);
-        wantX = SnapAxis(wantX, w, xs);
-        wantY = SnapAxis(wantY, h, ys);
-        // 吸附不能把盒子带出屏幕（工作区边缘本身也是吸附线，这一步是兜底）
+        if (g_config.autoSnap) {
+            std::vector<int> xs, ys;
+            CollectSnapLines(others, wa, want, xs, ys);
+            wantX = SnapAxis(wantX, w, xs);
+            wantY = SnapAxis(wantY, h, ys);
+        }
+        // 夹回工作区这一步不能放进 autoSnap 里：它既是吸附的兜底，
+        // 也是「关掉吸附后盒子仍然拖不出屏幕」的唯一保证。
         wantX = std::clamp(wantX, (int)wa.left, std::max((int)wa.left, (int)wa.right - w));
         wantY = std::clamp(wantY, (int)wa.top, std::max((int)wa.top, (int)wa.bottom - h));
     }
@@ -2266,7 +2273,8 @@ void FenceWindow::Paint() {
 
     const COLORREF base = (COLORREF)cfg_->color;
     const int alpha = std::clamp(cfg_->alpha, 0, 255);
-    const double rad = (double)std::max(0, cfg_->radius);
+    // 圆角最多 20：和设置页滑块的上限保持一致（这里再夹一次，防止旧配置绕过）
+    const double rad = (double)std::clamp(cfg_->radius, 0, 20);
     const bool light = IsLight(base);
 
     const BYTE r = GetRValue(base), g = GetGValue(base), b = GetBValue(base);
@@ -2536,29 +2544,11 @@ void FenceWindow::Paint() {
             }
         }
 
-        // ---- 滚动指示条 ----
-        // 内容超出可视区域时，右边缘画一根细条，告诉用户「下面还有」。
-        // 只在真的能滚的时候出现，平时不占地方、也不抢视线。
-        if (!collapsed_) {
-            const int maxS = MaxScroll();
-            if (maxS > 0) {
-                const int top = HeadH() + kPad;
-                const int viewH = (curH_ - kPad) - top;
-                if (viewH > 20) {
-                    const int totalH = viewH + maxS;
-                    int thumbH = (int)((long long)viewH * viewH / totalH);
-                    if (thumbH < 18) thumbH = 18;
-                    if (thumbH > viewH) thumbH = viewH;
-                    const int span = viewH - thumbH;
-                    const int thumbTop = top + (span > 0 ? (int)((long long)span * scrollY_ / maxS) : 0);
-                    const float barW = 3.0f;
-                    const float x = (float)width_ - kPad - barW;
-                    const RectF rc(x, (float)thumbTop, barW, (float)thumbH);
-                    SolidBrush sb{light ? Color(56, 0, 0, 0) : Color(72, 255, 255, 255)};
-                    gfx.FillRectangle(&sb, rc);
-                }
-            }
-        }
+        // ---- 滚动条：不画 ----
+        // 内容超出可视区时原来会在右边缘画一根 3px 的细条。用户要求去掉：
+        // 盒子里图标多的时候，那根条正好压在最后一列图标上，很碍眼。
+        // 滚动本身完全保留（鼠标滚轮照旧），只是不再有可见指示器 ——
+        // 判断「下面还有没有」靠的是图标被切一半的视觉效果，足够了。
 
         // ---- 选中高亮（支持多选；双击才打开，所以要有可见的选中态）----
         if (!collapsed_ && !itemDragging_) {

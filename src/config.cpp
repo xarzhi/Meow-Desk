@@ -92,6 +92,8 @@ void LoadLegacyIni(AppConfig& c) {
             else if (k == L"headerHeight") c.headerHeight = ToInt(v, 44);
             else if (k == L"autoExpandOnHover") c.autoExpandOnHover = ToInt(v, 0);
             else if (k == L"sortAnim") c.sortAnim = ToInt(v, 1);
+            else if (k == L"flipAnim") c.flipAnim = ToInt(v, 1);
+            else if (k == L"autoSnap") c.autoSnap = ToInt(v, 1);
             else if (k == L"showFenceTitle") c.showFenceTitle = ToInt(v, 1);
             continue;
         }
@@ -128,6 +130,8 @@ bool ConfigFromDb(AppConfig& c) {
             else if (k == L"headerHeight") c.headerHeight = n;
             else if (k == L"autoExpandOnHover") c.autoExpandOnHover = n;
             else if (k == L"sortAnim") c.sortAnim = n;
+            else if (k == L"flipAnim") c.flipAnim = n;
+            else if (k == L"autoSnap") c.autoSnap = n;
             else if (k == L"showFenceTitle") c.showFenceTitle = n;
             else if (k == L"autoOrganize") c.autoOrganize = n;
             else if (k == L"switchTabOnHover") c.switchTabOnHover = n;
@@ -210,6 +214,12 @@ void ConfigEnsureDefaults() {
         b.title = L"\u5de5\u4f5c";
         g_config.fences.push_back(b);
         dirty = true;
+    }
+    // 圆角上限 20：滑块到头就 20，但老配置里可能存着 28。
+    // 读进来统一夹一次，否则设置页显示 20、盒子上还是画 28，用户会以为没生效。
+    for (auto& f : g_config.fences) {
+        if (f.radius < 0) { f.radius = 0; dirty = true; }
+        else if (f.radius > 20) { f.radius = 20; dirty = true; }
     }
     if (dirty) g_config.Save();
 }
@@ -315,6 +325,8 @@ void AppConfig::Save() const {
         put(L"headerHeight", headerHeight);
         put(L"autoExpandOnHover", autoExpandOnHover);
         put(L"sortAnim", sortAnim);
+        put(L"flipAnim", flipAnim);
+        put(L"autoSnap", autoSnap);
         put(L"showFenceTitle", showFenceTitle);
         put(L"autoOrganize", autoOrganize);
         put(L"switchTabOnHover", switchTabOnHover);

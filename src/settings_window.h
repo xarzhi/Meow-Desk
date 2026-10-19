@@ -113,7 +113,10 @@ private:
     RECT rcShowFenceTitle_{};
     // ---- 交互 ----
     RECT rcHoverExpand_{};
+    // 排序 + 拖放的翻转位移（flip）动画：一个开关同时管 sortAnim 和 flipAnim，
+    // 这两件事在用户眼里是同一类「图标自己挪过去」的动画，拆两个开关只会让人困惑
     RECT rcSortAnim_{};
+    RECT rcSnap_{};         // 自动吸附：移动盒子 / 改尺寸时贴边
     RECT rcTabHover_{};     // 分组标签：鼠标移入就切 / 点击才切
 
     // ---- 整理规则 ----

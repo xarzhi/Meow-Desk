@@ -698,6 +698,12 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
 
+    // 单例：第二个进程启动后发过来的「让一让」。这里只让外部把界面叫出来，
+    // 不抢焦点、不动图标布局。
+    case kMsgActivateInstance:
+        if (onActivateRequest) onActivateRequest();
+        return 0;
+
     case WM_ERASEBKGND:
         // 不透明路径由 WM_PAINT 自己画壁纸，别让系统再刷一遍底色
         return opaque_ ? 1 : 0;

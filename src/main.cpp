@@ -393,6 +393,10 @@ static std::vector<int> g_flipFences;
 
 static void CaptureDragFlips(const std::vector<DesktopIconView*>& batch) {
     g_flipFences.clear();
+    // 「排序 / 拖放动画」关掉之后：既不记槽位也不播动画。
+    // CaptureSlots 本身很便宜，但记了不播会留下 pendingSlots_，下次开动画时
+    // 拿它当基准，图标会从一个很旧的位置翻过来 —— 所以干脆不记。
+    if (!g_config.flipAnim) return;
     for (size_t k = 0; k < g_fences.size(); ++k) {
         if (!g_fences[k]) continue;
         for (auto* e : batch) {
@@ -2245,6 +2249,22 @@ static void CheckAutoOrganize() {
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 物理像素坐标系：不清这个，DWM 会把分层窗口整体拉伸，图标必然发虚
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // ---- 单例 ----
+    // 两个实例会各自建一层桌面、各自把系统桌面图标藏一遍，还会互相覆盖
+    // meow-desk.db 里的图标位置，看着就是「图标乱跳 + 盒子消失」。
+    // 用每用户会话内的命名互斥体挡住：后来者把已有实例的设置窗口叫出来就退出。
+    //
+    // 句柄故意不关：进程退出时系统回收；只要进程活着，互斥体就存在。
+    static HANDLE s_instanceMutex = nullptr;
+    s_instanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\MeowDesk.SingleInstance");
+    if (s_instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 已经在跑：请求它把界面亮出来（找不到窗口就静默退出 —— 它可能正在启动中）
+        if (HWND prev = FindWindowW(L"MeowDeskSurface", nullptr))
+            PostMessageW(prev, kMsgActivateInstance, 0, 0);
+        return 0;
+    }
+
     {
         FILETIME ft{};
         GetSystemTimeAsFileTime(&ft);
@@ -2500,6 +2520,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         ApplyHighPriority(on);
     };
     g_settings.onOrganize = [] { OrganizeDesktopNow(); };
+
+    // 单例：第二个进程双击 exe 时把它的界面叫出来（第二个进程自己不弹任何东西）
+    g_surface.onActivateRequest = [] {
+        g_settings.Show();
+        LogStep("activate request from second instance");
+    };
 
     g_search.SetIcons(&g_icons);
     g_search.onOpen = [](DesktopIconView* e) { OpenPath(e->path); };

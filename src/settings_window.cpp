@@ -34,6 +34,9 @@ const int kContentX = 232;
 const int kCardR = 28;                    // 卡片右边距 → 卡片右边界 = kClientW - kCardR
 const int kCardW = kClientW - kContentX - kCardR;
 const int kRowLeft = kContentX + 20;   // 卡片内文字左边
+// 圆角上限：超过 20px 之后卡片边角的视觉变化基本看不出来，反而开始「啃」内容
+// （图标格子贴着边角被切），所以滑块到 20 就到头了。加载旧配置时也按这个夹。
+const int kRadiusMax = 20;
 
 enum : int {
     ID_NONE = -1,
@@ -59,6 +62,7 @@ enum : int {
     ID_OPENFOLDER = 42,
     ID_AUTOSTART = 43,
     ID_HIGHPRIORITY = 44,
+    ID_SNAP = 45,        // 自动吸附
     ID_NAV0 = 60,     // 60..64 = 导航项
     // 规则行的 EDIT 子控件：5000 + 行号*2（名字）/ +1（扩展名）
     ID_RULE_EDIT = 5000,
@@ -224,7 +228,8 @@ void SettingsWindow::Layout() {
         const int tr = kContentX + kCardW - 24;
         rcHoverExpand_ = RECT{tr - 36, c1 + 46, tr, c1 + 68};
         rcSortAnim_ = RECT{tr - 36, c1 + 98, tr, c1 + 120};
-        rcTabHover_ = RECT{tr - 36, c1 + 150, tr, c1 + 172};
+        rcSnap_ = RECT{tr - 36, c1 + 150, tr, c1 + 172};
+        rcTabHover_ = RECT{tr - 36, c1 + 202, tr, c1 + 224};
     }
 
     // ---- 关于页 ----
@@ -279,6 +284,7 @@ int SettingsWindow::HitTest(POINT pt) const {
     case Page::Interaction:
         if (in(rcHoverExpand_, 150, 18)) return ID_HOVER_EXPAND;
         if (in(rcSortAnim_, 150, 18)) return ID_SORT_ANIM;
+        if (in(rcSnap_, 150, 18)) return ID_SNAP;
         if (in(rcTabHover_, 150, 18)) return ID_TAB_HOVER;
         break;
     case Page::Rules:
@@ -651,7 +657,8 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         g.DrawString(L"\u5706\u89d2", -1, &fBody,
                      RectF((float)kRowLeft, (float)rcRadius_.top, 90.0f, 30.0f), &sf,
                      &brText);
-        drawSlider(rcRadius_, 0, 28, radius, std::to_wstring(radius));
+        drawSlider(rcRadius_, 0, kRadiusMax, std::min(radius, kRadiusMax),
+                   std::to_wstring(std::min(radius, kRadiusMax)));
 
         g.DrawString(L"\u900f\u660e\u5ea6", -1, &fBody,
                      RectF((float)kRowLeft, (float)rcAlpha_.top, 90.0f, 30.0f), &sf,
@@ -711,7 +718,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      RectF((float)kContentX + 2, 56.0f, 460.0f, 18.0f), &sf, &brSub);
 
         const int c1 = 100;
-        drawCard(c1, 200);
+        drawCard(c1, 304);
         g.DrawString(L"\u76d2\u5b50\u884c\u4e3a", -1, &fSection,
                      RectF((float)kContentX + 20, (float)c1 + 14.0f, 260.0f, 22.0f), &sf,
                      &brText);
@@ -726,15 +733,26 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      &sf, &brSub);
         drawToggle(rcHoverExpand_, g_config.autoExpandOnHover != 0);
 
-        g.DrawString(L"\u6392\u5e8f\u65f6\u64ad\u653e\u7ffb\u8f6c\u52a8\u753b", -1, &fBody,
+        g.DrawString(L"\u6392\u5e8f / \u62d6\u653e\u7684\u7ffb\u8f6c\u52a8\u753b", -1, &fBody,
                      RectF((float)kRowLeft, (float)(rcSortAnim_.top - 10), 360.0f, 26.0f),
                      &sf, &brText);
-        g.DrawString(L"\u6539\u6392\u5e8f\u65b9\u5f0f\u65f6\u56fe\u6807\u4f1a\u7ed5\u7ad6\u8f74"
-                     L"\u7ffb\u8fc7\u53bb\u91cd\u6392",
+        g.DrawString(L"\u6539\u6392\u5e8f\u65b9\u5f0f\u3001\u62d6\u56fe\u6807\u63d2\u5165"
+                     L"\u65f6\uff0c\u56fe\u6807\u7ed5\u7ad6\u8f74\u7ffb\u8fc7\u53bb\u91cd\u6392",
                      -1, &fSub,
-                     RectF((float)kRowLeft, (float)(rcSortAnim_.top + 12), 420.0f, 16.0f),
+                     RectF((float)kRowLeft, (float)(rcSortAnim_.top + 12), 460.0f, 16.0f),
                      &sf, &brSub);
-        drawToggle(rcSortAnim_, g_config.sortAnim != 0);
+        drawToggle(rcSortAnim_, (g_config.sortAnim && g_config.flipAnim) != 0);
+
+        g.DrawString(L"\u81ea\u52a8\u5438\u9644", -1, &fBody,
+                     RectF((float)kRowLeft, (float)(rcSnap_.top - 10), 360.0f, 26.0f), &sf,
+                     &brText);
+        g.DrawString(L"\u79fb\u52a8\u76d2\u5b50\u3001\u6539\u5c3a\u5bf8\u65f6\uff0c"
+                     L"\u9760\u8fd1\u5c4f\u5e55\u8fb9\u6216\u5176\u4ed6\u76d2\u5b50 10px "
+                     L"\u5185\u81ea\u52a8\u8d34\u4e0a",
+                     -1, &fSub,
+                     RectF((float)kRowLeft, (float)(rcSnap_.top + 12), 460.0f, 16.0f), &sf,
+                     &brSub);
+        drawToggle(rcSnap_, g_config.autoSnap != 0);
 
         g.DrawString(L"\u5206\u7ec4\u6807\u7b7e\u79fb\u5165\u5c31\u5207\u6362", -1, &fBody,
                      RectF((float)kRowLeft, (float)(rcTabHover_.top - 10), 360.0f, 26.0f),
@@ -816,12 +834,12 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         }
 
         // ---- 开源项目 ----
-        // 本程序自身只依赖 Win32 / GDI+，第三方就这两样：
+        // 和本程序相关的开源组件 / 框架：
         //   · SQLite：布局 / 配置的本地存储（third_party/sqlite，公有领域）
-        //   · iconfont：设置页导航和盒子锁按钮的图标字体（iconfont.cn 下载）
+        //   · core-ui：Fluent 风格的 Windows 桌面 UI 框架，界面与交互的参考来源
         // 许可和用途写清楚，方便对外分发时对账。
         const int c2 = 340;
-        drawCard(c2, 168);
+        drawCard(c2, 190);
         g.DrawString(L"\u5f00\u6e90\u9879\u76ee", -1, &fSection,
                      RectF((float)kRowLeft, (float)c2 + 16.0f, 300.0f, 24.0f), &sf, &brText);
 
@@ -833,8 +851,8 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         static const OsItem kOs[] = {
             {L"SQLite", L"3.50.4 \u00b7 \u516c\u6709\u9886\u57df (Public Domain)",
              L"\u672c\u5730\u6570\u636e\u5b58\u50a8\uff08\u56fe\u6807\u5e03\u5c40 / \u914d\u7f6e\uff09"},
-            {L"iconfont \u56fe\u6807\u5b57\u4f53", L"iconfont.cn \u00b7 \u56fe\u6807\u6388\u6743\u89c1\u5b98\u7f51",
-             L"\u8bbe\u7f6e\u9875\u5bfc\u822a\uff0c\u76d2\u5b50\u7684\u9501\u5b9a / \u89e3\u9501\u56fe\u6807"},
+            {L"core-ui", L"C++ \u00b7 Fluent2 Windows \u6846\u67b6",
+             L"\u754c\u9762\u98ce\u683c\u4e0e\u4ea4\u4e92\u53c2\u8003"},
         };
         float oy = (float)c2 + 54.0f;
         for (const OsItem& it : kOs) {
@@ -1073,8 +1091,16 @@ void SettingsWindow::Toggle(int id) {
     case ID_HOVER_EXPAND:
         g_config.autoExpandOnHover = g_config.autoExpandOnHover ? 0 : 1;
         break;
-    case ID_SORT_ANIM:
-        g_config.sortAnim = g_config.sortAnim ? 0 : 1;
+    case ID_SORT_ANIM: {
+        // 一个开关管两套动画：改排序方式时的翻转过渡（sortAnim）和拖放插入时
+        // 被挤开的图标走过去（flipAnim）。用户眼里都是「图标自己挪过去」。
+        const int nv = (g_config.sortAnim && g_config.flipAnim) ? 0 : 1;
+        g_config.sortAnim = nv;
+        g_config.flipAnim = nv;
+        break;
+    }
+    case ID_SNAP:
+        g_config.autoSnap = g_config.autoSnap ? 0 : 1;
         break;
     case ID_TAB_HOVER:
         g_config.switchTabOnHover = g_config.switchTabOnHover ? 0 : 1;
@@ -1376,7 +1402,7 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                                           : rcHeaderH_;
             RECT tr = TrackRect(row);
             int lo = 0, hi = 100;
-            if (sliderDrag_ == ID_RADIUS) { lo = 0; hi = 28; }
+            if (sliderDrag_ == ID_RADIUS) { lo = 0; hi = kRadiusMax; }
             else if (sliderDrag_ == ID_ALPHA) { lo = 40; hi = 255; }
             else { lo = 28; hi = 72; }
 

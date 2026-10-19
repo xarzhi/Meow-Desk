@@ -1,21 +1,25 @@
 @echo off
-rem Configure MSVC environment and build meow-desk-core
+rem Build meow-desk. Same as ./build.sh -- drives cmake+ninja directly, so no
+rem vcvars64 (and no reg.exe) is needed, and the output lands in build\ like the
+rem rest of the scripts expect.
 setlocal
-
-set "VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Community"
-call "%VS_ROOT%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-
 cd /d "%~dp0"
 
-if not exist build mkdir build
-cd build
+set "PY="
+where python >nul 2>&1 && set "PY=python"
+if not defined PY (
+  where py >nul 2>&1 && set "PY=py -3"
+)
+if not defined PY (
+  echo [ERROR] Python 3 not found. Install it or add python.exe to PATH.
+  pause
+  exit /b 1
+)
 
-cmake -G "Visual Studio 18 2026" -A x64 ..
-if errorlevel 1 exit /b 1
-
-cmake --build . --config Release
-if errorlevel 1 exit /b 1
-
-echo.
-echo Build done. Output: build\Release\meow-desk.exe
-endlocal
+%PY% "tools\build.py" %*
+if errorlevel 1 (
+  echo.
+  echo [FAILED] see the output above.
+  pause
+  exit /b 1
+)

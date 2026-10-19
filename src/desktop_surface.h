@@ -166,6 +166,9 @@ public:
     std::function<void()> onContextInvoked;
     // 周期性心跳（约 500ms）
     std::function<void()> onTick;
+    // 单例模式：第二个进程发现自己多余了，就把这条消息扔给已经在跑的这个实例
+    // （用户双击 exe 通常是想找界面，外部把它接到「打开设置」上）
+    std::function<void()> onActivateRequest;
 
 private:
     // 这个格子（左上角 x,y）上有没有桌面图标挡着。exclude 里的不算。
@@ -290,6 +293,11 @@ void ShowShellItemMenu(HWND owner, const std::wstring& path, POINT screenPt);
 
 // 返回 true = 这条消息已经被菜单处理掉了，宿主窗口直接 return TRUE / 0
 bool ForwardShellMenuMessage(HWND owner, UINT msg, WPARAM wp, LPARAM lp);
+
+// 单例：第二个进程通过这个自定义消息把「我已经多余了，你出来一下」告诉已经在
+// 跑的那个实例（桌面层窗口收到后走 DesktopSurface::onActivateRequest）。
+// register 过的自定义消息，和别的程序的 WM_APP 不冲突。
+constexpr UINT kMsgActivateInstance = WM_APP + 99;
 
 // 菜单里的「重命名」由谁执行。
 //
