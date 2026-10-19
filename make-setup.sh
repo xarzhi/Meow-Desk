@@ -1,14 +1,14 @@
 #!/bin/bash
 # 打包成可分发的安装包（一条命令出 zip）：
 #
-#   ./make-setup.sh               编译 → 打 dist/MeowDesk-<版本>/ → 压 zip
+#   ./make-setup.sh               编译 → 组装 dist/package/ → 压 zip
 #   ./make-setup.sh --no-build    不编译，直接拿 build/ 里现成的 exe 打包
 #   ./make-setup.sh --no-zip      只出目录，不压 zip
 #   ./make-setup.sh --no-verify   跳过图标自检
 #
 # 产物：
 #   dist/meow-desk.exe + dist/meow-setup.exe   平铺一份（原地跑安装程序的旧习惯）
-#   dist/MeowDesk-<版本>/                       分发目录（exe + 安装说明）
+#   dist/package/                               分发目录（两个 exe + 安装说明）
 #   dist/MeowDesk-<版本>.zip                    发给别人就发这个
 #
 # 为什么两个 exe 必须放一起：meow-setup.exe 是从「它自己所在的目录」读
@@ -80,7 +80,9 @@ HASH="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
 VER="$DATE-$HASH"
 [ -n "$VER" ] || { echo "版本号算空了，中止"; exit 1; }
 
-OUT="dist/MeowDesk-$VER"
+# 暂存目录用固定名字：每打一次包就多一个带版本号的目录，几天就堆成垃圾堆。
+# 版本号只体现在 zip 名上（zip 里那层根目录才是带版本号的）。
+OUT="dist/package"
 ZIP="dist/MeowDesk-$VER.zip"
 
 echo ""
@@ -90,9 +92,7 @@ mkdir -p dist
 # 旧位置：平铺一份，之前习惯直接跑 dist/meow-setup.exe 的用法不能坏
 cp -f build/meow-desk.exe build/meow-setup.exe dist/
 
-# 分发目录：只放该发的东西
-# 同名目录已存在就先清掉（同一天同一个 commit 重跑），用 python 删，
-# 不走 shell 的 rm —— 路径里带版本号，出岔子清错地方代价太大
+# 暂存目录每次重建，保证不带上一次的残留。用 python 删不走 shell 的 rm。
 if [ -d "$OUT" ] && [ -n "$PY" ]; then
   "$PY" -c "import shutil,sys; shutil.rmtree(sys.argv[1])" "$OUT"
 fi
@@ -150,15 +150,14 @@ if [ "$DO_ZIP" -eq 1 ]; then
     echo "没有 python，跳过 zip；直接发 $OUT/ 这个文件夹也行"
     DO_ZIP=0
   else
-    "$PY" - "$OUT" "$ZIP" <<'PY'
+    "$PY" - "$OUT" "$ZIP" "MeowDesk-$VER" <<'PY'
 import os, sys, zipfile
-outdir, zippath = sys.argv[1], sys.argv[2]
-base = os.path.basename(outdir)
+outdir, zippath, root = sys.argv[1], sys.argv[2], sys.argv[3]
 with zipfile.ZipFile(zippath, "w", zipfile.ZIP_DEFLATED) as z:
     for name in sorted(os.listdir(outdir)):
         p = os.path.join(outdir, name)
         if os.path.isfile(p):
-            z.write(p, base + "/" + name)
+            z.write(p, root + "/" + name)
 print("  %s  (%.1f MB)" % (zippath, os.path.getsize(zippath) / 1048576.0))
 PY
   fi
