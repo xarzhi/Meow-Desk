@@ -502,6 +502,13 @@ FenceWindow::Edge FenceWindow::HitEdge(POINT pt) const {
     return Edge::B;
 }
 
+FenceWindow::Edge FenceWindow::HitEdgeForPress(POINT pt) const {
+    const Edge e = HitEdge(pt);
+    // 只有「正上方那条边」（Edge::T）会压在手把上；TL / TR 落在左右角落，保留。
+    if (e == Edge::T && !showTitle_ && !collapsed_) return Edge::None;
+    return e;
+}
+
 // 处理 WM_LBUTTONDOWN / WM_LBUTTONDBLCLK（消息参数语义一致，重复一份现场初始化）
 void FenceWindow::BeginPress(HWND h, POINT pt) {
     pressPt_ = pt;
@@ -544,7 +551,7 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     }
 
     // 先判边缘：边缘优先于头部拖动/图标
-    const Edge e = HitEdge(pt);
+    const Edge e = HitEdgeForPress(pt);
     if (e != Edge::None) {
         resizing_ = true;
         resizeCaptured_ = false;   // 第一次真正拉动时才抓底图（见 ApplyResize）
@@ -1749,7 +1756,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             LPCWSTR id = nullptr;
-            switch (HitEdge(pt)) {
+            switch (HitEdgeForPress(pt)) {
             case Edge::L: case Edge::R: id = IDC_SIZEWE; break;
             case Edge::T: case Edge::B: id = IDC_SIZENS; break;
             case Edge::TL: case Edge::BR: id = IDC_SIZENWSE; break;
@@ -2450,16 +2457,6 @@ void FenceWindow::Paint() {
     if (!bits_ || !memDC_ || !cfg_) return;
     std::memset(bits_, 0, (size_t)bufW_ * (size_t)bufH_ * 4);
 
-    // 关掉「显示盒子标题」时没有箭头可点，也就收不起来；万一配置切换把它卡在
-    // 收起态，就整个盒子只留一条 2px 感应条（见 HeadH）。
-    // 填 alpha=1 —— 肉眼看不见，但 per-pixel alpha 分层窗口里 alpha>0 的像素
-    // 才能收到鼠标消息，悬停自动展开靠的就是它。
-    if (!showTitle_ && collapsed_) {
-        auto* p = reinterpret_cast<uint32_t*>(bits_);
-        const size_t n = (size_t)bufW_ * (size_t)std::max(1, bufH_);
-        for (size_t i = 0; i < n; ++i) p[i] = 0x01000000u;
-        return;
-    }
 
     const COLORREF base = (COLORREF)cfg_->color;
     const int alpha = std::clamp(cfg_->alpha, 0, 255);
@@ -2550,8 +2547,9 @@ void FenceWindow::Paint() {
         }
 
         // ---- 头部：略亮、略实，做出层叠感 ----
-        // 关掉「显示盒子标题」时整个头部都不画（标题、箭头、分隔线一起消失），
-        // 卡片就是一整块圆角面板，顶部只保留 HeadH()=2px 的悬停感应区。
+        // 关掉「显示盒子标题」时头部整块降到 4px（kHeadStripH）：标题、分组标签、
+        // 锁、收起箭头、分隔线一起消失，卡片就是一整块圆角面板，
+        // 顶上那 4px 只当拖动手把和悬停感应区。
         //
         // 收起时头部整块塌到 4px：头部内容跟着当前高度一路淡出（headFade），
         // 卡片底色/描边画到底 —— 收起态就是一条干净的圆角把手，
@@ -3206,19 +3204,20 @@ void FenceWindow::ApplyConfig(bool recapture) {
         showTitle_ = newTitle;
         labels_.clear();
         labelKeys_.clear();
-        // 收起高度跟着走：收起态整窗只有 4px（kCollapsedHeadH），和头部高度无关
-        if (collapsed_ && showTitle_) {
-            targetH_ = kCollapsedHeadH;
-            curH_ = kCollapsedHeadH;
-            RECT r = rect();
-            SetWindowPos(hwnd_, nullptr, r.left, r.top, width_, curH_,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-        } else if (collapsed_) {
-            // 关掉「显示盒子标题」之后没有箭头了，收起的盒子就再也打不开 ——
-            // 顺手展开（expandMode() 在这种情况下恒为「始终展开」）
-            collapsed_ = false;
-            targetH_ = height_;
-            curH_ = height_;
+        // 收起高度跟着走：收起态整窗只有 4px（kCollapsedHeadH），和头部高度无关。
+        // 关掉「显示盒子标题」之后头部也是 4px，但收放逻辑完全不变：
+        // 伸缩模式照样悬停展开 / 离开收起（见 CollapseIfIdle 与 WM_MOUSEMOVE）。
+        if (collapsed_) {
+            if (expandMode() == 1) {
+                // 「始终展开」的盒子本来就没有收起入口（关掉标题后连箭头都没了），
+                // 卡在收起态就再也打不开 —— 这种盒子直接摊开。
+                collapsed_ = false;
+                targetH_ = height_;
+                curH_ = height_;
+            } else {
+                targetH_ = kCollapsedHeadH;
+                curH_ = kCollapsedHeadH;
+            }
             RECT r = rect();
             SetWindowPos(hwnd_, nullptr, r.left, r.top, width_, curH_,
                          SWP_NOZORDER | SWP_NOACTIVATE);

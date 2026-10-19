@@ -93,7 +93,9 @@ public:
     // 关掉「显示盒子标题」时头部只剩一条 2px 感应条，没有箭头可点，
     // 也就没有任何收起入口，所以这种情况下恒为「始终展开」。
     int expandMode() const {
-        return (!showTitle_ || !cfg_ || cfg_->expandMode != 0) ? 1 : 0;
+        // 关掉标题不再等于「永远展开」：没有箭头的盒子靠「伸缩模式」的
+        // 悬停展开 / 离开收起照样能收放（头部就那 4px 把手）。
+        return (!cfg_ || cfg_->expandMode != 0) ? 1 : 0;
     }
     void SetExpandMode(int m);
 
@@ -374,12 +376,17 @@ private:
     // ---- 四条边/四角拖拽改大小 ----
     enum class Edge { None, L, R, T, B, TL, TR, BL, BR };
     Edge HitEdge(POINT clientPt) const;
+    // 按下 / 光标反馈用的边缘判定：关掉「显示盒子标题」时，顶上那 4px 是
+    // 拖动手把，不能被 6px 的「改高度」感应带吃掉（否则盒子没法靠头部挪动，
+    // 盒内拖拽是框选、不是移动）。左右角落仍然优先改尺寸。
+    Edge HitEdgeForPress(POINT clientPt) const;
     void BeginPress(HWND h, POINT pt);
     void ApplyResize(POINT screenPt);
 
-    // 实际占用的头部高度：显示标题时 = headerH_；关掉标题时只剩一条 2px 的
-    // 「悬停感应条」（看不见但能收到鼠标，用来悬停展开）。
-    static constexpr int kHeadStripH = 2;
+    // 实际占用的头部高度：显示标题时 = headerH_；关掉标题时只剩一条 4px 的
+    // 「把手」—— 标题、分组标签、锁、收起箭头全都不画，但这一条仍然是
+    // 拖动盒子的抓手动，也仍然是悬停展开的感应区（和收起态那条 4px 一样高）。
+    static constexpr int kHeadStripH = 4;
     // 收起之后头部收缩到的高度：整块盒子变成一条 4px 的圆角「把手」，
     // 头部的标签 / 标题 / 锁 / 箭头全部不画（见 Paint 里的 headFade）。
     static constexpr int kCollapsedHeadH = 4;
