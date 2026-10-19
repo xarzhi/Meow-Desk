@@ -29,7 +29,8 @@ const int kPadX = 24;     // 卡片左右内边距
 const int kPadTop = 22;   // 卡片上内边距
 const int kTitleH = 22;   // 标题行高
 const int kAfterTitle = 16;
-const int kEditH = 32;    // 输入框高度
+const int kEditH = 32;    // 输入格（底槽）高度
+const int kFieldPadX = 10;   // 输入格左右内缩：EDIT 比底槽窄一点，字不贴边框
 const int kAfterEdit = 20;
 const int kBtnW = 92;
 const int kBtnH = 32;
@@ -49,7 +50,15 @@ int g_hover = -1;           // 0 = 取消，1 = 确定，-1 = 空白
 int g_press = -1;
 
 int g_cardH = 0;
-RECT g_rcEdit{};    // 下面三个都是「客户区坐标」（已含 kShadow 偏移）
+// g_rcField = 卡片上画出来的「输入格」（视觉上的那个框，圆角+描边）
+// g_rcEdit  = 真正的 EDIT 窗口，只有「一行字」那么高，垂直居中嵌在 g_rcField 里。
+//
+// 为什么不让 EDIT 直接填满 g_rcField：单行 EDIT 是**按自己的字体行高从客户区顶部**
+// 开始排字的，窗口给 32px 高、字只有 19px，字就会贴着上半截 —— 看起来没居中。
+// 把窗口高度收成一行高、再整体居中摆进底槽，垂直居中就由几何保证了，
+// 不用依赖 EDIT 的内部排版规则（那个规则在不同系统版本上还不完全一样）。
+RECT g_rcField{};
+RECT g_rcEdit{};
 RECT g_rcOk{};
 RECT g_rcCancel{};
 
@@ -114,6 +123,22 @@ HFONT DialogFont() {
     return cached;
 }
 
+// 输入框字体的行高（tmHeight）。输入框窗口的高度就从这里推 ——
+// 不能写死像素，换系统字号 / 高 DPI 会露半个字。
+int FieldLineHeight() {
+    static int cached = 0;
+    if (cached > 0) return cached;
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return 20;
+    HGDIOBJ of = SelectObject(dc, DialogFont());
+    TEXTMETRICW tm{};
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, of);
+    DeleteDC(dc);
+    cached = tm.tmHeight > 0 ? (int)tm.tmHeight : 20;
+    return cached;
+}
+
 // 深色主题下输入框的底色。拿不到 WM_CTLCOLOREDIT 时（顶层 EDIT 走的是 owner），
 // 最差结果也只是「白底黑字的输入格」，永远可读，不会出现黑字黑底。
 HBRUSH EditBgBrush() {
@@ -143,8 +168,16 @@ void Layout() {
     g_cardH = CardHeight();
     const int cx = kShadow, cy = kShadow;
 
-    const int editTop = cy + kPadTop + kTitleH + kAfterTitle;
-    g_rcEdit = RECT{cx + kPadX, editTop, cx + kCardW - kPadX, editTop + kEditH};
+    // 输入格（底槽）：卡片自己画
+    const int fieldTop = cy + kPadTop + kTitleH + kAfterTitle;
+    g_rcField = RECT{cx + kPadX, fieldTop, cx + kCardW - kPadX, fieldTop + kEditH};
+
+    // EDIT 本体：只占一行高，垂直居中放进底槽
+    int lh = FieldLineHeight() + 4;   // 上下各留 2px，抬一像素也不会被切掉
+    if (lh > kEditH - 2) lh = kEditH - 2;
+    const int editTop = fieldTop + (kEditH - lh) / 2;
+    g_rcEdit = RECT{g_rcField.left + kFieldPadX, editTop, g_rcField.right - kFieldPadX,
+                    editTop + lh};
 
     const int btnTop = cy + g_cardH - kPadBottom - kBtnH;
     const int okRight = cx + kCardW - kPadX;
@@ -223,6 +256,22 @@ void Paint() {
                          RectF((float)kShadow + kPadX, (float)kShadow + kPadTop,
                                (float)kCardW - kPadX * 2, (float)kTitleH),
                          &leftAligned, &tb);
+        }
+
+        // 输入格（底槽）：圆角 + 1px 描边，和整张卡片同一套配色。
+        // 真正画字的是嵌在里面的 EDIT，它比这块窄一圈、只占一行高。
+        {
+            const RectF field((float)g_rcField.left, (float)g_rcField.top,
+                              (float)(g_rcField.right - g_rcField.left),
+                              (float)(g_rcField.bottom - g_rcField.top));
+            GraphicsPath fp;
+            AddRoundRect(fp, field, 8.0f);
+            // 底色必须和 WM_CTLCOLOREDIT 里给 EDIT 的刷子一模一样，
+            // 否则 EDIT 那一小块和底槽会有色差（拼成一块补丁）。
+            SolidBrush fb(light ? 0xFFFFFFFF : 0xFF232329);
+            g.FillPath(&fb, &fp);
+            Pen fpen(light ? 0xFFD6D6DC : 0xFF3E3E46, 1.0f);
+            g.DrawPath(&fpen, &fp);
         }
 
         auto drawButton = [&](const RECT& r, const wchar_t* label, bool primary, bool hot) {
@@ -532,7 +581,8 @@ void Show(HWND anchor, const std::wstring& title, const std::wstring& currentNam
         return;
     }
     SendMessageW(g_edit, WM_SETFONT, (WPARAM)DialogFont(), TRUE);
-    SendMessageW(g_edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(8, 8));
+    // 左右留白由「EDIT 比底槽窄一圈」保证（见 Layout），这里不用再加边距
+    SendMessageW(g_edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(0, 0));
     SendMessageW(g_edit, EM_SETLIMITTEXT, 200, 0);
     SetWindowSubclass(g_edit, EditProc, 1, 0);
     SetWindowTextW(g_edit, currentName.c_str());
