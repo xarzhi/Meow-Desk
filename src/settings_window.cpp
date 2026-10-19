@@ -723,15 +723,13 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      RectF((float)kContentX + 20, (float)c1 + 14.0f, 260.0f, 22.0f), &sf,
                      &brText);
 
-        g.DrawString(L"\u9f20\u6807\u79fb\u5230\u5934\u90e8\u81ea\u52a8\u6253\u5f00", -1, &fBody,
+        g.DrawString(L"新建盒子默认伸缩模式", -1, &fBody,
                      RectF((float)kRowLeft, (float)(rcHoverExpand_.top - 10), 360.0f, 26.0f),
                      &sf, &brText);
-        g.DrawString(L"\u6536\u8d77\u65f6\u79fb\u5165\u5934\u90e8\u5c55\u5f00\uff0c"
-                     L"\u79fb\u51fa\u6574\u4e2a\u76d2\u5b50\u81ea\u52a8\u6536\u8d77",
-                     -1, &fSub,
-                     RectF((float)kRowLeft, (float)(rcHoverExpand_.top + 12), 420.0f, 16.0f),
+        g.DrawString(L"伸缩：移入头部展开、移出收起；展开：始终展开", -1, &fSub,
+                     RectF((float)kRowLeft, (float)(rcHoverExpand_.top + 12), 470.0f, 16.0f),
                      &sf, &brSub);
-        drawToggle(rcHoverExpand_, g_config.autoExpandOnHover != 0);
+        drawToggle(rcHoverExpand_, g_config.defaultTelescope != 0);
 
         g.DrawString(L"\u6392\u5e8f / \u62d6\u653e\u7684\u7ffb\u8f6c\u52a8\u753b", -1, &fBody,
                      RectF((float)kRowLeft, (float)(rcSortAnim_.top - 10), 360.0f, 26.0f),
@@ -1089,7 +1087,9 @@ void SettingsWindow::Toggle(int id) {
         g_config.autoOrganize = g_config.autoOrganize ? 0 : 1;
         break;
     case ID_HOVER_EXPAND:
-        g_config.autoExpandOnHover = g_config.autoExpandOnHover ? 0 : 1;
+        // 「新建盒子默认伸缩模式」：只影响以后新建的盒子，
+        // 已有的盒子各自记着自己的展开方式（头部右侧箭头切的）
+        g_config.defaultTelescope = g_config.defaultTelescope ? 0 : 1;
         break;
     case ID_SORT_ANIM: {
         // 一个开关管两套动画：改排序方式时的翻转过渡（sortAnim）和拖放插入时

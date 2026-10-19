@@ -1371,6 +1371,7 @@ static void NewFenceNear(int fi) {
     c.h = h;
     c.title = L"新盒子";
     InheritFenceStyle(c);
+    c.expandMode = g_config.defaultTelescope ? 0 : 1;   // 新盒子用哪种展开方式
     g_config.fences.push_back(c);
     // 容器可能重新分配：先把已有盒子手里的配置指针重绑一遍，再建新的那个
     for (auto& f : g_fences)
@@ -1466,6 +1467,7 @@ static int CreateRuleFence(const std::wstring& title) {
     c.h = h;
     c.title = title;
     InheritFenceStyle(c);
+    c.expandMode = g_config.defaultTelescope ? 0 : 1;   // 和「新建盒子」保持一致
     g_config.fences.push_back(c);
     for (auto& f : g_fences)
         if (f) f->RebindConfig();   // 容器可能重分配，先把已有盒子重绑
@@ -1896,7 +1898,9 @@ static void AddFenceWindow(int i) {
             g_config.fences[i].x = r.left;
             g_config.fences[i].y = r.top;
             g_config.fences[i].w = r.right - r.left;
-            g_config.fences[i].h = r.bottom - r.top;
+            // 高度必须用「展开时的高度」：收起态窗口只有 4px，
+            // 直接存 rect 的高度会把盒子存成一条线，重启之后就再也展不开了
+            g_config.fences[i].h = g_fences[i]->expandedHeight();
             g_config.Save();
         }
         g_fences[i]->ApplyConfig(true);   // 亚克力底图要跟着新位置重抓
@@ -2480,9 +2484,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 换壁纸 / 改分辨率 → 盒子重抓磨砂底图。
     // 底图只在盒子创建时抓过一次，壁纸一换，磨砂里还是旧壁纸，看起来就像
     // 「桌面变了、盒子没变」；以前得拖一下盒子（触发补抓）才会更新。
+    //
+    // 注意这里是「排一单延后的」，不是当场抓：广播比画面早到，当场抓到的
+    // 常常还是旧壁纸（见 ScheduleBackdropRefresh 的注释）。
     g_surface.onShellChanged = [] {
         for (auto& f : g_fences)
-            if (f) f->RecaptureBackdrop();
+            if (f) f->ScheduleBackdropRefresh();
     };
 
     // 系统原生菜单里的「重命名」：菜单项由 shell 给，执行归我们（见 BeginRenameIcon）
@@ -2559,6 +2566,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         RestoreZOrder();
         CheckAutoOrganize();
         PollDesktopWatch();
+        // 壁纸指纹轮询：动态壁纸 / 幻灯片轮播不会发 SPI_SETDESKWALLPAPER，
+        // 只能靠像素差分发现。一次采样是 16×16 的 StretchBlt（微秒级），
+        // 只有真的变了才会去重抓；延后的重抓也在这里落地。
+        for (auto& f : g_fences)
+            if (f) f->PollBackdropChange();
     };
 
     RestoreZOrder();

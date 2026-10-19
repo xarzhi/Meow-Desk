@@ -90,7 +90,9 @@ void LoadLegacyIni(AppConfig& c) {
             else if (k == L"shortcutArrow") c.shortcutArrow = ToInt(v, 1);
             else if (k == L"showLabels") c.showLabels = ToInt(v, 1);
             else if (k == L"headerHeight") c.headerHeight = ToInt(v, 44);
-            else if (k == L"autoExpandOnHover") c.autoExpandOnHover = ToInt(v, 0);
+            // autoExpandOnHover 是这一项的老键名，语义已收窄成「新盒子默认用伸缩模式」
+            else if (k == L"defaultTelescope" || k == L"autoExpandOnHover")
+                c.defaultTelescope = ToInt(v, 0);
             else if (k == L"sortAnim") c.sortAnim = ToInt(v, 1);
             else if (k == L"flipAnim") c.flipAnim = ToInt(v, 1);
             else if (k == L"autoSnap") c.autoSnap = ToInt(v, 1);
@@ -128,7 +130,8 @@ bool ConfigFromDb(AppConfig& c) {
             else if (k == L"shortcutArrow") c.shortcutArrow = n;
             else if (k == L"showLabels") c.showLabels = n;
             else if (k == L"headerHeight") c.headerHeight = n;
-            else if (k == L"autoExpandOnHover") c.autoExpandOnHover = n;
+            else if (k == L"defaultTelescope" || k == L"autoExpandOnHover")
+                c.defaultTelescope = n;
             else if (k == L"sortAnim") c.sortAnim = n;
             else if (k == L"flipAnim") c.flipAnim = n;
             else if (k == L"autoSnap") c.autoSnap = n;
@@ -141,7 +144,7 @@ bool ConfigFromDb(AppConfig& c) {
     {
         storage::Stmt st(
             "SELECT x,y,w,h,color,alpha,radius,acrylic,title,viewMode,sortKey,sortAsc,locked,"
-            "activeGroup FROM fence ORDER BY id");
+            "activeGroup,expandMode FROM fence ORDER BY id");
         if (!st.ok()) return false;
         while (st.step()) {
             FenceConfig f;
@@ -159,6 +162,7 @@ bool ConfigFromDb(AppConfig& c) {
             f.sortAsc = st.colInt(11);
             f.locked = st.colInt(12);
             f.activeGroup = st.colInt(13);
+            f.expandMode = st.colInt(14);   // -1 = 老数据，下面 ConfigEnsureDefaults 补
             c.fences.push_back(std::move(f));
         }
     }
@@ -220,6 +224,13 @@ void ConfigEnsureDefaults() {
     for (auto& f : g_config.fences) {
         if (f.radius < 0) { f.radius = 0; dirty = true; }
         else if (f.radius > 20) { f.radius = 20; dirty = true; }
+        // expandMode 没存过（-1）：按全局默认落定。
+        // 老用户如果原来开着「悬停展开」，defaultTelescope 就是 1（老键名照认），
+        // 于是盒子继续走伸缩模式 —— 升级不该让一个已经生效的行为悄悄失效。
+        if (f.expandMode < 0 || f.expandMode > 1) {
+            f.expandMode = g_config.defaultTelescope != 0 ? 0 : 1;
+            dirty = true;
+        }
     }
     if (dirty) g_config.Save();
 }
@@ -323,7 +334,7 @@ void AppConfig::Save() const {
         put(L"shortcutArrow", shortcutArrow);
         put(L"showLabels", showLabels);
         put(L"headerHeight", headerHeight);
-        put(L"autoExpandOnHover", autoExpandOnHover);
+        put(L"defaultTelescope", defaultTelescope);
         put(L"sortAnim", sortAnim);
         put(L"flipAnim", flipAnim);
         put(L"autoSnap", autoSnap);
@@ -334,8 +345,8 @@ void AppConfig::Save() const {
 
         storage::Stmt fs(
             "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title,"
-            "viewMode,sortKey,sortAsc,locked,activeGroup)"
-            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)");
+            "viewMode,sortKey,sortAsc,locked,activeGroup,expandMode)"
+            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)");
         for (size_t i = 0; i < fences.size() && fs.ok(); ++i) {
             const FenceConfig& c = fences[i];
             fs.bindInt(1, (int)i);
@@ -353,6 +364,8 @@ void AppConfig::Save() const {
             fs.bindInt(13, c.sortAsc);
             fs.bindInt(14, c.locked);
             fs.bindInt(15, c.activeGroup);
+            // -1 不许写回库里：那是「还没定过」的临时值，落盘要落一个真实选择
+            fs.bindInt(16, c.expandMode == 0 ? 0 : 1);
             ok = fs.done() && ok;
             fs.reset();
         }

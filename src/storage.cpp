@@ -24,7 +24,8 @@ std::wstring g_file;
 //   v3 — fence 表加 locked（盒子锁定）；新增 rule 表（整理规则）
 //   v4 — fence 表加 activeGroup；新增 fence_group 表（盒子内的分组标签）；
 //        icon_layout 加 grp（图标属于哪个分组）
-const int kSchemaVersion = 4;
+//   v5 — fence 表加 expandMode（展开 / 伸缩模式；-1 = 老数据，启动时按全局默认补）
+const int kSchemaVersion = 5;
 
 void SetError(const char* what) {
     g_lastError = what ? what : "";
@@ -60,7 +61,11 @@ bool Upgrade(int from) {
         "  sortKey  INTEGER NOT NULL DEFAULT 4,"
         "  sortAsc  INTEGER NOT NULL DEFAULT 1,"
         "  locked   INTEGER NOT NULL DEFAULT 0,"
-        "  activeGroup INTEGER NOT NULL DEFAULT 0"
+        "  activeGroup INTEGER NOT NULL DEFAULT 0,"
+        // 展开方式：0 = 伸缩（悬停展开 / 移出收起），1 = 始终展开。
+        // 默认写 -1 = 还没定过，启动时由 ConfigEnsureDefaults 按全局默认补齐
+        // （和 v5 迁移给老库补的那一列保持同一套语义，免得两条路走出两种结果）。
+        "  expandMode  INTEGER NOT NULL DEFAULT -1"
         ");"
         // 盒子内的分组（头部那一排标签）。ord=0 就是盒子自己的标题，
         // 所以一个盒子只要有分组，第一条一定是它。
@@ -103,6 +108,12 @@ bool Upgrade(int from) {
         AddColumn("fence", "activeGroup", "INTEGER NOT NULL DEFAULT 0");
         AddColumn("icon_layout", "grp", "INTEGER NOT NULL DEFAULT 0");
         // fence_group 同样由 kSchema 建好
+    }
+    if (from < 5) {
+        // 老库补这一列时写 -1（= 没填过），启动时 ConfigEnsureDefaults 会按
+        // 全局默认（老配置里的 autoExpandOnHover）决定每个盒子用哪种方式，
+        // 不能直接给 1 —— 那样原来开着「悬停展开」的用户会突然发现它失效了。
+        AddColumn("fence", "expandMode", "INTEGER NOT NULL DEFAULT -1");
     }
 
     const std::string ver = "PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";";

@@ -35,6 +35,15 @@ bool CaptureDesktopRegion(int x, int y, int w, int h, std::vector<uint8_t>& out)
 // 抓取屏幕 (x,y,w,h) 区域（会抓到自己，调用方负责先把窗口排除掉）
 bool CaptureScreenRegion(int x, int y, int w, int h, std::vector<uint8_t>& out);
 
+// 采样屏幕 (x,y,w,h) 区域的平均颜色，写进 r/g/b（0-255）。
+//
+// 用途只有一个：当「壁纸指纹」。整块缩到 16×16 再求均值，一次 StretchBlt
+// 是微秒级，可以每秒问一圈而不心疼；换了壁纸均值就会变，没换就一笔不动。
+//
+// 和 CaptureScreenRegionFast 一样**不带 CAPTUREBLT** —— 带上它会把我们自己的
+// 分层窗口（桌面图标层 / 盒子）也抓进来，那样量到的就是我们自己上一帧的画面。
+bool SampleScreenMean(int x, int y, int w, int h, int& r, int& g, int& b);
+
 // 同上，但不带 CAPTUREBLT：**分层窗口不进画面**。
 //
 // 这一条是给「拖动时背景不卡」用的。带 CAPTUREBLT 时，我们自己的盒子（都是分层窗口）

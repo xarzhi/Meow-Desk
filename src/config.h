@@ -26,6 +26,13 @@ struct FenceConfig {
     // 1 = 锁定：右上角的锁按钮按下后，盒子既不能拖动也不能改尺寸
     int locked = 0;
     std::wstring title;
+    // 展开方式（头部右侧那个箭头点击切换）：
+    //   1 = 展开模式：始终展开，鼠标移出去也不收
+    //   0 = 伸缩模式：鼠标移到头部展开，移出整个盒子自动收起
+    // 收起后头部只剩 4px（见 FenceWindow::kCollapsedHeadH），头部的标签/标题/
+    // 锁/箭头全都不画 —— 整块缩成一条「把手」。
+    // -1 = 老数据里没有这个字段，由 ConfigEnsureDefaults 按全局默认补齐
+    int expandMode = -1;
 
     // 盒子内的分组（头部那一排标签）。空 = 没有分组，标题栏直接显示 title。
     // 一旦有分组，groups[0] 就是盒子自己的标题，后面的才是「创建分组」加出来的。
@@ -64,7 +71,11 @@ struct AppConfig {
     int shortcutArrow = 1;      // 快捷方式箭头
     int showLabels = 1;         // 显示图标标题（桌面 + 盒子）
     int headerHeight = 44;      // 盒子头部高度
-    int autoExpandOnHover = 0;  // 鼠标移到收起盒子的头部时自动展开，移出整个盒子再收起
+    // 新建盒子的默认展开方式：1 = 伸缩模式，0 = 展开模式（始终展开）。
+    // 历史上这一项是「鼠标移到头部自动展开」的全局开关；现在这件事由每个盒子
+    // 头部右侧的箭头自己决定，它退化成「新建盒子时用哪种方式」的默认值。
+    // 老配置里的 autoExpandOnHover 键仍然认（见 config.cpp 的读取分支）。
+    int defaultTelescope = 0;
     int sortAnim = 1;           // 改排序方式时，盒内图标播位移过渡动画
     // 拖放 / 插入的 flip 位移动画：拖着图标插到别的图标之间时，被挤开的那些
     // 用翻转位移走过去。和 sortAnim 一起受交互页那个「排序 / 拖放动画」开关控制，

@@ -51,6 +51,10 @@ public:
     HWND hwnd() const { return hwnd_; }
     RECT rect() const;
 
+    // 展开时的高度（就是配置里存的那个 h）。收起状态下窗口只有 4px，
+    // 拿 rect() 存配置 / 算避让会把盒子「存成一条线」，所以要用这个。
+    int expandedHeight() const { return height_; }
+
     // 配置变化（颜色/圆角/透明度/亚克力/标题）→ 重绘。
     // recapture = true 时才重新抓取亚克力底图（很贵，拖动滑块时不要带）
     void ApplyConfig(bool recapture = false);
@@ -60,9 +64,32 @@ public:
     // （以前只有「拖一下盒子」触发补抓才会更新）。
     void RecaptureBackdrop();
 
+    // 壁纸可能变了（收到 SPI_SETDESKWALLPAPER / 分辨率变化）：**延后**再重抓。
+    //
+    // 不能收到广播就立刻抓：那条广播是先到的，DWM 往往还没把新壁纸合成出来，
+    // 当场抓到的还是旧画面，之后又没有第二个人来重抓 —— 磨砂就永远停在旧壁纸上。
+    // 交给 PollBackdropChange 统一处理（等一小会儿再抓）。
+    void ScheduleBackdropRefresh();
+
+    // 心跳里轮询（主程序每 500ms 叫一个盒子，转着圈来）：
+    //   · 到点的延后重抓 → 现在就抓
+    //   · 否则采样盒子外面一小块屏幕的均值，和上次比变了就重抓
+    // 动态壁纸 / 幻灯片轮播根本不发 SPI_SETDESKWALLPAPER，只能靠像素差分发现。
+    // 采样一次是一块 16×16 的 StretchBlt，微秒级；重抓只在真的变了时发生。
+    void PollBackdropChange();
+
     void Redraw();
     void SetCollapsed(bool collapsed);
     bool collapsed() const { return collapsed_; }
+
+    // 展开方式：1 = 展开模式（始终展开）0 = 伸缩模式（悬停展开 / 移出收起）。
+    // 由头部右侧的箭头点击切换，存在 FenceConfig::expandMode 里。
+    // 关掉「显示盒子标题」时头部只剩一条 2px 感应条，没有箭头可点，
+    // 也就没有任何收起入口，所以这种情况下恒为「始终展开」。
+    int expandMode() const {
+        return (!showTitle_ || !cfg_ || cfg_->expandMode != 0) ? 1 : 0;
+    }
+    void SetExpandMode(int m);
 
     // 拖动时用来避让的其他盒子矩形（屏幕坐标），由 main 提供。
     //
@@ -315,6 +342,9 @@ private:
     // 实际占用的头部高度：显示标题时 = headerH_；关掉标题时只剩一条 2px 的
     // 「悬停感应条」（看不见但能收到鼠标，用来悬停展开）。
     static constexpr int kHeadStripH = 2;
+    // 收起之后头部收缩到的高度：整块盒子变成一条 4px 的圆角「把手」，
+    // 头部的标签 / 标题 / 锁 / 箭头全部不画（见 Paint 里的 headFade）。
+    static constexpr int kCollapsedHeadH = 4;
     int HeadH() const { return showTitle_ ? headerH_ : kHeadStripH; }
 
     int minW() const;
@@ -372,6 +402,15 @@ private:
     int backdropX_ = 0, backdropY_ = 0;
     // 上一次提交后台补抓的时刻（限频用）
     DWORD backdropCoverT_ = 0;
+    // 壁纸指纹：定期采样盒子外面一小块屏幕的均值，变了就说明壁纸动了。
+    // bdRefreshPending_ = 「有一单延后的重抓排着」（收到壁纸广播后等 DWM 合成完再抓）
+    bool bdRefreshPending_ = false;
+    DWORD bdDue_ = 0;
+    bool probeValid_ = false;
+    int probeR_ = 0, probeG_ = 0, probeB_ = 0;
+    // 连续几次采样都和基线不同。要求连续两次才动手：别的窗口扫过采样点
+    // （或者那附近有个图标被 hover 高亮）也会让均值变一点，一次就信会误抓。
+    int probeHits_ = 0;
     // 已经确认过「这块地方的壁纸就是一片纯色」：之后快路径抓到纯色也直接用，
     // 不再走慢路径反复确认（纯色壁纸 + 反复确认 = 拖动时一直闪）。
     bool bdPlainArea_ = false;

@@ -517,8 +517,10 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     pressCtrl_ = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
     pressShift_ = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
-    // 锁按钮优先级最高：它压在头部右侧，点在它上面不能算「拖头部」
-    if (showTitle_ && pt.y < HeadH()) {
+    // 锁按钮优先级最高：它压在头部右侧，点在它上面不能算「拖头部」。
+    // 收起状态（4px 把手）里头部内容一个都不画，所以锁 / 标签 / 箭头都不参与命中，
+    // 整条把手就是「拖盒子」的抓手动。
+    if (showTitle_ && !collapsed_ && pt.y < HeadH()) {
         const RECT lr = LockRect();
         if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom) {
             pressLock_ = true;
@@ -545,7 +547,7 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
         return;
     }
 
-    if (pt.y < HeadH() && showTitle_ && pt.x > width_ - 40) {
+    if (pt.y < HeadH() && showTitle_ && !collapsed_ && pt.x > width_ - 40) {
         pressArrow_ = true;
     } else if (pt.y < HeadH()) {
         // 锁定后头部不再能拖动（不然「锁住位置」就成了空话）
@@ -1328,7 +1330,8 @@ RECT FenceWindow::rect() const {
 
 RECT FenceWindow::bodyRect() const {
     RECT r = rect();
-    r.top += HeadH();
+    // 收起后整窗只有 4px，比 HeadH() 还矮：别让 top 越过 bottom
+    r.top = std::min((int)r.bottom, (int)r.top + HeadH());
     return r;
 }
 
@@ -1525,6 +1528,9 @@ void FenceWindow::AbortItemsDrag() {
 void FenceWindow::UpdateDropHint(POINT screenPt) {
     if (!hwnd_) return;
     RECT wr = rect();
+    // 收起后这条把手只有 4px 高，拿它当拖放入口太苛刻了：
+    // 拖着图标过来时判定范围往下放宽一点，够到就把盒子拉开展示。
+    if (collapsed_) wr.bottom += 28;
     const bool inside = screenPt.x >= wr.left && screenPt.x < wr.right &&
                         screenPt.y >= wr.top && screenPt.y < wr.bottom;
 
@@ -1633,8 +1639,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             POINT pt{};
             GetCursorPos(&pt);
             ScreenToClient(h, &pt);
-            // 锁按钮上给手型（它和头部拖动长得很近，得有个区分）
-            if (showTitle_ && pt.y < HeadH()) {
+            // 锁按钮上给手型（它和头部拖动长得很近，得有个区分）。
+            // 收起态的 4px 把手上什么都没有，直接跳过这一套。
+            if (showTitle_ && !collapsed_ && pt.y < HeadH()) {
                 const RECT lr = LockRect();
                 if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
@@ -1699,7 +1706,11 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (mdx || mdy) {
                         dragLastCursor_ = cur;
                         const int fw = (int)(dragStartRect_.right - dragStartRect_.left);
-                        const int fh2 = (int)(dragStartRect_.bottom - dragStartRect_.top);
+                        // 收起时窗口只有 4px 高，位置夹取和吸附要按「展开后的大小」算，
+                        // 否则盒子能被拖到贴着屏幕底边，一展开就出屏了
+                        const int fh2 =
+                            collapsed_ ? height_
+                                       : (int)(dragStartRect_.bottom - dragStartRect_.top);
 
                         // 累积到**未吸附**的原始位置上，再让吸附只影响「摆到哪儿」。
                         //
@@ -1748,7 +1759,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 // 拖着图标划到某个分组标签上 → 立刻切过去，松手就落进那个分组。
                 // 这里不能只靠下面的悬停逻辑：鼠标已被 SetCapture 抓住，
                 // 上面早就 return 了，根本走不到那段。
-                if (showTitle_ && pt.y >= 0 && pt.y < HeadH()) {
+                if (showTitle_ && !collapsed_ && pt.y >= 0 && pt.y < HeadH()) {
                     const int t = HitTab(pt);
                     if (t >= 0 && t != activeGroup()) SetActiveGroup(t);
                 }
@@ -1797,10 +1808,11 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
-        // 悬停自动展开：收起状态下鼠标移到头部就展开（移开整个盒子在 MOUSELEAVE 里收起）
-        // 关掉标题时头部只有 2px，没有别的展开入口，所以这时强制启用自动展开。
-        if ((g_config.autoExpandOnHover || !showTitle_) && collapsed_ && !suppressAutoExpand_ &&
-            pt.y < HeadH()) {
+        // 伸缩模式：收起状态下鼠标移到头部（那条 4px 把手）就展开，
+        // 移开整个盒子在 MOUSELEAVE 里收起。展开模式的盒子根本不收起，不必进来。
+        // suppressAutoExpand_：刚手动收起时光标还压在把手上，抑制一次，
+        // 否则「点了收起又立刻弹开」。
+        if (expandMode() == 0 && collapsed_ && !suppressAutoExpand_ && pt.y < HeadH()) {
             autoExpanded_ = true;
             SetCollapsed(false);
         }
@@ -1833,7 +1845,11 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (hot_ != -1) { hot_ = -1; Redraw(); }
         // 原生菜单 / 改名输入框是模态的（或至少盖在盒子上），它们一出现鼠标就「离开」了
         // 盒子；这时候不能把盒子收起来，否则菜单或正在改的名字底下直接缩没了。
-        if (autoExpanded_ && !menuOpen_ && !holdOpen_) {
+        //
+        // 只有伸缩模式才自动收（展开模式 = 始终展开）。也不再要求这次展开必须由
+        // 悬停触发：伸缩模式的定义就是「鼠标不在就收起来」，盒子刚建出来是开着的，
+        // 用户第一次移开也该收。
+        if (expandMode() == 0 && !menuOpen_ && !holdOpen_) {
             if (itemDragging_ || dragging_) {
                 autoExpanded_ = false;   // 正在操作，别收
             } else {
@@ -1875,7 +1891,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (onContextMenu) onContextMenu(it, sp);
         menuOpen_ = false;
         // 菜单关掉之后鼠标多半还停在外面：该收就收，别留一个开着却没人操作的盒子
-        if (nativeMenu && autoExpanded_) {
+        if (nativeMenu && expandMode() == 0) {
             POINT cur{};
             GetCursorPos(&cur);
             if (!HitTest(cur)) {
@@ -1955,9 +1971,21 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (arrow) {
+            // 箭头 = 展开方式开关，两态互切：
+            //   展开模式（始终展开）→ 点一下变伸缩模式，当场收起来给个反馈
+            //   伸缩模式（悬停展开）→ 点一下变展开模式，摊开并定住
             autoExpanded_ = false;   // 手动操作以用户意图为准
-            SetCollapsed(!collapsed_);
-            suppressAutoExpand_ = collapsed_;   // 刚收起且光标还在头上，别又弹开
+            if (expandMode() == 1) {
+                SetExpandMode(0);
+                // 光标还压在头部上，先抑制一次自动展开，否则收起来的那一帧
+                // 就会被「悬停展开」原路弹回去
+                suppressAutoExpand_ = true;
+                SetCollapsed(true);
+            } else {
+                SetExpandMode(1);
+                suppressAutoExpand_ = false;
+                SetCollapsed(false);
+            }
             return 0;
         }
         // 点标签：没拖动过才切分组（拖着走 = 用户只是想挪盒子）
@@ -2261,10 +2289,11 @@ void FenceWindow::Paint() {
     if (!bits_ || !memDC_ || !cfg_) return;
     std::memset(bits_, 0, (size_t)bufW_ * (size_t)bufH_ * 4);
 
-    // 关掉「显示盒子标题」并且已经收起：整个盒子就是一条 2px 的感应条。
+    // 关掉「显示盒子标题」时没有箭头可点，也就收不起来；万一配置切换把它卡在
+    // 收起态，就整个盒子只留一条 2px 感应条（见 HeadH）。
     // 填 alpha=1 —— 肉眼看不见，但 per-pixel alpha 分层窗口里 alpha>0 的像素
     // 才能收到鼠标消息，悬停自动展开靠的就是它。
-    if (!showTitle_ && curH_ <= kHeadStripH + 1) {
+    if (!showTitle_ && collapsed_) {
         auto* p = reinterpret_cast<uint32_t*>(bits_);
         const size_t n = (size_t)bufW_ * (size_t)std::max(1, bufH_);
         for (size_t i = 0; i < n; ++i) p[i] = 0x01000000u;
@@ -2362,8 +2391,19 @@ void FenceWindow::Paint() {
         // ---- 头部：略亮、略实，做出层叠感 ----
         // 关掉「显示盒子标题」时整个头部都不画（标题、箭头、分隔线一起消失），
         // 卡片就是一整块圆角面板，顶部只保留 HeadH()=2px 的悬停感应区。
+        //
+        // 收起时头部整块塌到 4px：头部内容跟着当前高度一路淡出（headFade），
+        // 卡片底色/描边画到底 —— 收起态就是一条干净的圆角把手，
+        // 而不是「内容区没了、头部还杵在那儿」。
         const float headH = (float)HeadH();
-        if (showTitle_) {
+        const float headFade =
+            showTitle_ ? std::clamp((float)(curH_ - kCollapsedHeadH) /
+                                        (float)std::max(1, headerH_ - kCollapsedHeadH),
+                                    0.0f, 1.0f)
+                       : 0.0f;
+        const bool drawHead = showTitle_ && headFade > 0.02f;
+        const BYTE fadeA = (BYTE)std::lround(255.0f * headFade);
+        if (drawHead) {
             GraphicsPath head;
             {
                 const float d = (float)rad * 2.0f;
@@ -2378,8 +2418,8 @@ void FenceWindow::Paint() {
             }
             const BYTE hA = hasBackdrop ? (BYTE)std::min(255, (int)(alpha * 0.72))
                                         : (BYTE)std::min(255, alpha + 42);
-            SolidBrush headBrush{Color(hA, (BYTE)Lighten(r, 0.45), (BYTE)Lighten(g, 0.45),
-                                        (BYTE)Lighten(b, 0.45))};
+            SolidBrush headBrush{Color((BYTE)(hA * headFade), (BYTE)Lighten(r, 0.45),
+                                        (BYTE)Lighten(g, 0.45), (BYTE)Lighten(b, 0.45))};
             // 头部这个路径是「上圆下方」的，只适合贴在卡片顶上。盒子收起时
             // 卡片只剩头部那么高，它的两个下直角就落到卡片圆角外面去了 ——
             // 表现为头部左右下角「多出两个直角」。按卡片形状裁一刀就干净了。
@@ -2391,8 +2431,8 @@ void FenceWindow::Paint() {
         // ---- 描边 / 分隔线 ----
         Pen border{Color(46, 0, 0, 0), 1.0f};
         gfx.DrawPath(&border, &shape);
-        if (showTitle_) {
-            Pen sep{Color(30, 0, 0, 0), 1.0f};
+        if (drawHead) {
+            Pen sep{Color((BYTE)(30 * headFade), 0, 0, 0), 1.0f};
             gfx.DrawLine(&sep, 0.0f, headH, (float)bufW_, headH);
         }
 
@@ -2401,7 +2441,7 @@ void FenceWindow::Paint() {
         // ---- 头部：分组标签 / 单一标题 ----
         // 有分组时整个头部变成一排标签（当前分组高亮）。标签是导航控件，
         // 不受「显示图标标题」开关影响 —— 关掉它标签就没了，等于切不了分组。
-        if (showTitle_ && hasTabs()) {
+        if (drawHead && hasTabs()) {
             const std::vector<RECT> tabs = TabRects();
             const int act = activeGroup();
             FontFamily family(L"Microsoft YaHei UI");
@@ -2424,16 +2464,16 @@ void FenceWindow::Paint() {
                     // 先垫一层淡影：不然纯白块贴在浅色卡片上是「死」的，没有层次
                     GraphicsPath sh;
                     AddRoundRect(sh, RectF(pr.X, pr.Y + 1.0f, pr.Width, pr.Height), 4.0f);
-                    SolidBrush shadow{Color(18, 0, 0, 0)};
+                    SolidBrush shadow{Color((BYTE)(18 * headFade), 0, 0, 0)};
                     gfx.FillPath(&shadow, &sh);
-                    SolidBrush face{Color(242, 255, 255, 255)};
+                    SolidBrush face{Color((BYTE)(242 * headFade), 255, 255, 255)};
                     gfx.FillPath(&face, &pp);
-                    Pen edge{Color(44, 0, 0, 0), 1.0f};
+                    Pen edge{Color((BYTE)(44 * headFade), 0, 0, 0), 1.0f};
                     gfx.DrawPath(&edge, &pp);
                 } else {
-                    SolidBrush face{Color(36, 255, 255, 255)};
+                    SolidBrush face{Color((BYTE)(36 * headFade), 255, 255, 255)};
                     gfx.FillPath(&face, &pp);
-                    Pen edge{Color(44, 255, 255, 255), 1.0f};
+                    Pen edge{Color((BYTE)(44 * headFade), 255, 255, 255), 1.0f};
                     gfx.DrawPath(&edge, &pp);
                 }
             }
@@ -2448,16 +2488,17 @@ void FenceWindow::Paint() {
                 const bool on = ((int)i == act);
                 const RectF rr((float)tr.left, (float)tr.top, (float)(tr.right - tr.left),
                                (float)(tr.bottom - tr.top));
-                SolidBrush txt{on ? Color(fg) : WithAlpha(fg, (BYTE)(light ? 122 : 146))};
+                const BYTE tabA = on ? fadeA : (BYTE)((light ? 122 : 146) * headFade);
+                SolidBrush txt{Color(WithAlpha(fg, tabA))};
                 const std::wstring name = GroupName((int)i);
                 const RectF box(rr.X + 2.0f, rr.Y, std::max(4.0f, rr.Width - 4.0f), rr.Height);
                 gfx.DrawString(name.c_str(), -1, on ? &tabFontBold : &tabFont, box, &tf, &txt);
             }
-        } else if (showTitle_ && g_config.showLabels) {
+        } else if (drawHead && g_config.showLabels) {
             FontFamily family(L"Microsoft YaHei UI");
             const float fs = headerH_ >= 40 ? 14.0f : 12.5f;
             Font titleFont(&family, fs, FontStyleRegular, UnitPixel);
-            SolidBrush brush{Color(fg)};
+            SolidBrush brush{Color(WithAlpha(fg, fadeA))};
             StringFormat fmt;
             fmt.SetLineAlignment(StringAlignmentCenter);
             fmt.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsNoClip);
@@ -2469,13 +2510,14 @@ void FenceWindow::Paint() {
 
         // ---- 锁按钮（自绘挂锁）----
         // 锁上：实心锁体 + 蓝色；未锁：只有描边、颜色淡一些，不抢标题的视觉重量。
-        if (showTitle_) {
+        if (drawHead) {
             const RECT lr = LockRect();
             const float cx = (float)(lr.left + lr.right) * 0.5f;
             const float cy = (float)(lr.top + lr.bottom) * 0.5f;
             const bool on = locked();
             // 白色：和头部标题一致，状态只靠「实心 / 淡」区分（锁上更实、未锁更淡）。
-            const Color lc = on ? Color(255, 255, 255, 255) : Color(150, 255, 255, 255);
+            const Color lc = on ? Color(fadeA, 255, 255, 255)
+                                : Color((BYTE)(150 * headFade), 255, 255, 255);
             // 优先用图标字体里的「锁定 / 解锁」（iconfont：e635 / e616）：
             // 手搓的挂锁在 18px 里能表达的状态差异很有限（只有锁梁抬不抬起来），
             // 图标字体的解锁是另一张图，一眼就能分清。
@@ -2505,17 +2547,15 @@ void FenceWindow::Paint() {
             }
         }
 
-        // ---- 收起 / 展开箭头 ----
-        // 收起/展开是有高度补间的，箭头按「展开程度」绕 90° 转过去，跟高度一起动。
-        // 展开程度直接由当前高度推出来，不用再单独维护一套动画状态。
-        if (showTitle_) {
-            float t = 1.0f;
-            if (height_ > headerH_)
-                t = (float)(curH_ - headerH_) / (float)(height_ - headerH_);
-            t = std::clamp(t, 0.0f, 1.0f);
-            const float ang = -(float)(3.14159265358979 / 2.0) * (1.0f - t);
+        // ---- 展开方式箭头（点击在两种模式之间切）----
+        // 同一个 V 形，只转 180°：
+        //   展开模式（始终展开）→ 朝下的 V：躺开不动
+        //   伸缩模式（悬停展开）→ 朝上的 ^：鼠标一离开就会收上去
+        // 收起态整条把手只有 4px，头部内容全淡出，不画箭头（headFade 会把它抹掉）。
+        if (drawHead) {
+            const float ang = (expandMode() == 0) ? (float)3.14159265358979f : 0.0f;
 
-            Pen pen{Color(fg), 1.8f};
+            Pen pen{Color(WithAlpha(fg, fadeA)), 1.8f};
             pen.SetStartCap(LineCapRound);
             pen.SetEndCap(LineCapRound);
             const float cx = (float)bufW_ - 21.0f;
@@ -2524,7 +2564,7 @@ void FenceWindow::Paint() {
             auto rot = [&](float x, float y) {
                 return PointF(cx + x * ca - y * sa, cy + x * sa + y * ca);
             };
-            // 未旋转时是「朝下的 V」（展开态）；转 -90° 变成「朝右的 >」（收起态）
+            // 未旋转时是「朝下的 V」；转 180° 就是「朝上的 ^」
             const PointF a = rot(-5.0f, -2.5f);
             const PointF b = rot(0.0f, 2.5f);
             const PointF c = rot(5.0f, -2.5f);
@@ -2876,6 +2916,93 @@ void FenceWindow::RecaptureBackdrop() {
     Redraw();
 }
 
+void FenceWindow::ScheduleBackdropRefresh() {
+    if (!hwnd_) return;
+    bdRefreshPending_ = true;
+    // 延后 260ms 再抓：SPI_SETDESKWALLPAPER 这条广播比画面早到，收到就抓
+    // 抓到的还是旧壁纸（DWM 还没合成新的），然后就没有第二次机会了 ——
+    // 磨砂就一直停在旧壁纸上。这正是「壁纸变了盒子不变」的另一半原因。
+    bdDue_ = GetTickCount() + 260;
+}
+
+// 壁纸是否变了 —— 靠「盒子外面一小块屏幕的平均色」当指纹。
+//
+// 为什么不能只等广播：动态壁纸 / 幻灯片轮播根本不会发 SPI_SETDESKWALLPAPER，
+// 只有像素真的变了才是唯一可靠的信号。
+//
+// 为什么采样点必须在盒子外面：盒子自己盖住的地方抓到的就是我们自己画的画面，
+// 拿它当指纹等于自己跟自己比，永远比不出结果。
+void FenceWindow::PollBackdropChange() {
+    if (!hwnd_ || !cfg_ || !cfg_->acrylic) return;
+    if (dragging_ || resizing_ || bdJob_) return;   // 忙的时候不插队（拖动时绝不抓屏）
+
+    const DWORD now = GetTickCount();
+    if (bdRefreshPending_) {
+        if ((int)(now - bdDue_) < 0) return;   // 还没到点
+        bdRefreshPending_ = false;
+        probeValid_ = false;   // 重抓完重新立基线
+        probeHits_ = 0;
+        RecaptureBackdrop();
+        return;
+    }
+
+    RECT r = rect();
+    const int w = (int)(r.right - r.left);
+    const int h = (int)(r.bottom - r.top);
+    if (w <= 0 || h <= 0) return;
+
+    const int vsx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vsy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vsw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int vsh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const int kProbe = 16;   // 采样块大小
+    const int kGap = 6;      // 离盒子多远（贴着边缘会被描边/阴影算进去）
+
+    // 下 / 上 / 右 / 左依次试，取第一个整块落在虚拟桌面里的
+    const int cx = (int)r.left + w / 2;
+    const int cy = (int)r.top + h / 2;
+    const int candX[4] = {cx, cx, (int)r.right + kGap, (int)r.left - kGap - kProbe};
+    const int candY[4] = {(int)r.bottom + kGap, (int)r.top - kGap - kProbe, cy, cy};
+    int px = 0, py = 0;
+    bool found = false;
+    for (int i = 0; i < 4 && !found; ++i) {
+        if (candX[i] >= vsx && candY[i] >= vsy && candX[i] + kProbe <= vsx + vsw &&
+            candY[i] + kProbe <= vsy + vsh) {
+            px = candX[i];
+            py = candY[i];
+            found = true;
+        }
+    }
+    if (!found) return;   // 盒子把屏幕铺满了，没地方采样（这时也不用跟了）
+
+    int rr = 0, gg = 0, bb = 0;
+    if (!SampleScreenMean(px, py, kProbe, kProbe, rr, gg, bb)) return;
+
+    if (!probeValid_) {
+        probeValid_ = true;
+        probeR_ = rr;
+        probeG_ = gg;
+        probeB_ = bb;
+        return;
+    }
+    const int diff = std::max({std::abs(rr - probeR_), std::abs(gg - probeG_),
+                               std::abs(bb - probeB_)});
+    if (diff < 8) {
+        probeHits_ = 0;
+        return;
+    }
+    // 变了。要求连续两次都变才动手：别的窗口从采样点上面扫过去、或者那附近
+    // 有个桌面图标被 hover 出了一层底色，均值同样会抖几个数 —— 一次就信会误抓。
+    if (++probeHits_ < 2) return;
+    probeHits_ = 0;
+    probeR_ = rr;
+    probeG_ = gg;
+    probeB_ = bb;
+    // 走后台抓（不是同步 RecaptureBackdrop）：壁纸在动的时候这会每隔一会儿
+    // 来一次，同步抓就是十几毫秒的卡顿 —— 玩游戏时最不能要的就是这个。
+    RequestBackdropAsync(0);
+}
+
 void FenceWindow::ApplyConfig(bool recapture) {
     if (!hwnd_ || !cfg_) return;
 
@@ -2888,10 +3015,19 @@ void FenceWindow::ApplyConfig(bool recapture) {
         showTitle_ = newTitle;
         labels_.clear();
         labelKeys_.clear();
-        // 收起高度跟着头部走（关掉标题时头部只有 2px）
-        if (collapsed_) {
-            targetH_ = HeadH();
-            curH_ = HeadH();
+        // 收起高度跟着走：收起态整窗只有 4px（kCollapsedHeadH），和头部高度无关
+        if (collapsed_ && showTitle_) {
+            targetH_ = kCollapsedHeadH;
+            curH_ = kCollapsedHeadH;
+            RECT r = rect();
+            SetWindowPos(hwnd_, nullptr, r.left, r.top, width_, curH_,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        } else if (collapsed_) {
+            // 关掉「显示盒子标题」之后没有箭头了，收起的盒子就再也打不开 ——
+            // 顺手展开（expandMode() 在这种情况下恒为「始终展开」）
+            collapsed_ = false;
+            targetH_ = height_;
+            curH_ = height_;
             RECT r = rect();
             SetWindowPos(hwnd_, nullptr, r.left, r.top, width_, curH_,
                          SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2966,9 +3102,24 @@ void FenceWindow::SetCollapsed(bool collapsed) {
     collapsed_ = collapsed;
     hot_ = -1;
     StopFlip();
-    targetH_ = collapsed ? HeadH() : height_;
+    drop_ = DropHint{};
+    // 收起 = 整块缩成一条 4px 的把手（头部一起收，不只是内容区）。
+    // 以前这里是 HeadH()（只把内容区收掉，头部保持原样），用户要求头部也收。
+    targetH_ = collapsed ? kCollapsedHeadH : height_;
     if (hwnd_) SetTimer(hwnd_, kAnimTimer, 16, nullptr);
     Redraw();
+}
+
+void FenceWindow::SetExpandMode(int m) {
+    if (!cfg_) return;
+    const int v = m == 0 ? 0 : 1;
+    if (cfg_->expandMode == v) return;
+    cfg_->expandMode = v;
+    // 切到「始终展开」就立刻摊开；切到「伸缩模式」不在这里收 ——
+    // 是让鼠标离开时自然收（箭头那一下会自己 SetCollapsed(true) 给个即时反馈）
+    if (v == 1) SetCollapsed(false);
+    Redraw();
+    if (onStateChanged) onStateChanged();   // 存配置
 }
 
 void FenceWindow::Destroy() {

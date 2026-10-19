@@ -238,6 +238,42 @@ bool CaptureScreenRegionFast(int x, int y, int w, int h, std::vector<uint8_t>& o
     return true;
 }
 
+bool SampleScreenMean(int x, int y, int w, int h, int& r, int& g, int& b) {
+    r = g = b = 0;
+    if (w <= 0 || h <= 0) return false;
+
+    // 16×16 就够了：当指纹只关心「这块地方整体变色没有」，
+    // 分辨率再高也只会把噪点和抗锯齿抖动一起放大。
+    const int dw = 16, dh = 16;
+    MemDib m;
+    if (!MakeMemDib(dw, dh, m)) return false;
+
+    HDC screen = GetDC(nullptr);
+    if (!screen) return false;
+    // COLORONCOLOR（近邻取样）而不是 HALFTONE：后者每次调用都要建一张半色调表，
+    // 这一路是「每 500ms 每个盒子一次」的常驻开销，不能用慢模式。
+    // 当指纹只关心均值，近邻取样的 256 个点完全够。
+    SetStretchBltMode(m.dc, COLORONCOLOR);
+    // 不带 CAPTUREBLT：分层窗口不进画面（和我们抓底图的快路径保持同一层视角，
+    // 否则量到的是我们自己画出来的东西，永远量不出「壁纸变了」）
+    const BOOL ok = StretchBlt(m.dc, 0, 0, dw, dh, screen, x, y, w, h, SRCCOPY);
+    ReleaseDC(nullptr, screen);
+    if (!ok) return false;
+
+    const auto* p = reinterpret_cast<const uint8_t*>(m.bits);
+    long long sr = 0, sg = 0, sb = 0;
+    for (int i = 0; i < dw * dh; ++i) {
+        sb += p[i * 4 + 0];
+        sg += p[i * 4 + 1];
+        sr += p[i * 4 + 2];
+    }
+    const int n = dw * dh;
+    r = (int)(sr / n);
+    g = (int)(sg / n);
+    b = (int)(sb / n);
+    return true;
+}
+
 void BlurRgba(std::vector<uint8_t>& px, int w, int h, int radius, int passes) {
     if (w <= 0 || h <= 0 || radius <= 0) return;
     if (px.size() < (size_t)w * h * 4) return;
