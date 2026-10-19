@@ -22,10 +22,12 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "backdrop.h"
 #include "config.h"
 #include "desktop_surface.h"
 #include "icon_render.h"
@@ -190,6 +192,12 @@ public:
     // 「查看 / 排序 / 重命名」改完之后：外部存配置 + 存图标布局
     std::function<void()> onStateChanged;
 
+    // ---- 拖拽落位动画（给 main 用）----
+    // 用法：拖拽松手时先 CaptureSlots()，接着改 g_icons 的归属/顺序，
+    // 改完再 PlayPendingFlip()。后面的图标就会从旧槽位滑到新槽位。
+    void CaptureSlots();
+    void PlayPendingFlip();
+
 private:
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -200,7 +208,9 @@ private:
     // pad > 0：多抓一圈（拖动/改尺寸期间用）。之后盒子在这个圈里挪动时，
     // 底图直接按偏移「取子窗口」就够了 —— 不用每帧重新抓屏+模糊。
     void RefreshBackdrop(int pad = 0);
-    // 底图还盖得住当前矩形吗？盖不住就（限频）重抓一圈
+    // 把「抓一块」丢给工作线程（pad：四周多抓一圈）。已有在途请求时直接返回。
+    void RequestBackdropAsync(int pad);
+    // 底图还盖得住当前矩形吗？盖不住就提交一次后台补抓
     void EnsureBackdropCover();
 
     void Collect(std::vector<DesktopIconView*>& out) const;
@@ -283,6 +293,9 @@ private:
     DWORD flipT0_ = 0;
     int flipDur_ = 260;
     std::unordered_map<DesktopIconView*, FlipNode> flipNodes_;
+    // 拖动落位用：先记住「插之前」每个图标的槽位，列表改完之后再整体播一次
+    // 位移动画。插入到中间时后面的图标全都要往后让一格，直接瞬移会很突兀。
+    std::unordered_map<DesktopIconView*, int> pendingSlots_;
     // 当前进度 0..1（未在动画时返回 1）
     float FlipProgress() const;
     // MEOW_DEBUG_HOOKS=1 时才响应 WM_APP+7（wParam=sortKey | asc<<8），
@@ -353,8 +366,13 @@ private:
     std::vector<uint8_t> backdrop_;
     int backdropW_ = 0, backdropH_ = 0;   // 抓取时的尺寸（总是展开尺寸）
     int backdropX_ = 0, backdropY_ = 0;
-    // 上一次「因为盖不住而重新抓」的时刻（限频用；拖动时每帧抓一次会卡）
+    // 上一次提交后台补抓的时刻（限频用）
     DWORD backdropCoverT_ = 0;
+    // 已经确认过「这块地方的壁纸就是一片纯色」：之后快路径抓到纯色也直接用，
+    // 不再走慢路径反复确认（纯色壁纸 + 反复确认 = 拖动时一直闪）。
+    bool bdPlainArea_ = false;
+    // 后台正在抓的那一单（抓屏 + 模糊在工作线程做，UI 线程每帧问一次好了没）
+    std::shared_ptr<BackdropCaptureJob> bdJob_;
 
     DropHint drop_;
 

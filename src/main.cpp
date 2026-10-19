@@ -377,6 +377,39 @@ static void SendIconsToDesktop(int fi, const std::vector<DesktopIconView*>& list
     g_surface.Redraw();
 }
 
+// ---------------------------------------------------------------------------
+// 拖拽落位动画
+//
+// 往两个图标中间插一个图标时，后面的图标全都要往后让一格。以前是松手瞬间
+// 整体瞬移，看着像「闪了一下」。现在改成：改列表之前先记下每个图标占第几格，
+// 改完再让受影响的盒子播一次位移动画（和「改排序」用的是同一套 StartFlip）。
+//
+// 为什么必须在改之前 Capture：槽位是「改之后」算不出来的。
+// 为什么只包住真正改动的那一句：别的分支里 DropIconOntoIcon 可能触发图标重载，
+// 那会把 g_icons 整个重建，先前记下的指针就成了野指针。
+// ---------------------------------------------------------------------------
+static std::vector<int> g_flipFences;
+
+static void CaptureDragFlips(const std::vector<DesktopIconView*>& batch) {
+    g_flipFences.clear();
+    for (size_t k = 0; k < g_fences.size(); ++k) {
+        if (!g_fences[k]) continue;
+        for (auto* e : batch) {
+            if (e && e->owner == (int)k) {
+                g_flipFences.push_back((int)k);
+                break;
+            }
+        }
+    }
+    for (int i : g_flipFences) g_fences[i]->CaptureSlots();
+}
+
+static void PlayDragFlips() {
+    for (int i : g_flipFences)
+        if (i >= 0 && i < (int)g_fences.size() && g_fences[i]) g_fences[i]->PlayPendingFlip();
+    g_flipFences.clear();
+}
+
 // 把当前「归属 + 盒内顺序 + 桌面坐标」整份写盘
 static void SaveIconLayout() {
     if (g_icons.empty()) return;
@@ -748,7 +781,9 @@ static DWORD AcceptDroppedFiles(const std::vector<std::wstring>& paths, POINT sc
     }
 
     if (fenceIndex >= 0 && fenceIndex < (int)g_fences.size() && g_fences[fenceIndex]) {
+        CaptureDragFlips(fresh);   // 从资源管理器拖文件进来也走同一套让位动画
         InsertIntoFenceMulti(fresh, fenceIndex, -1);
+        PlayDragFlips();
     } else {
         std::vector<DesktopIconView*> pending;
         int k = 0;
@@ -1973,7 +2008,10 @@ static void AddFenceWindow(int i) {
                 // MOVE = 文件被搬走了（进文件夹 / 进回收站），图标要跟着消失
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
             } else {
+                // 插入之前先记槽位，插完再播位移动画（后面的图标让开一格）
+                CaptureDragFlips(batch);
                 InsertIntoFenceMulti(batch, fi, h.active() ? h.insert : -1);
+                PlayDragFlips();
             }
         } else {
             // 盒子 → 桌面：先看落点有没有压在桌面图标上（文件夹 / 回收站 / 程序），
@@ -1984,8 +2022,10 @@ static void AddFenceWindow(int i) {
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
             } else {
                 // 第一张落到光标处，其余会顺着空位依次散开
+                CaptureDragFlips(batch);   // 盒子里的图标要往前补位，也给它动画
                 std::vector<DesktopIconView*> pending;
                 for (auto* e : batch) PlaceOnDesktop(e, pt, pending);
+                PlayDragFlips();
             }
         }
         SaveIconLayout();

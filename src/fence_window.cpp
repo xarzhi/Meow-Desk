@@ -883,6 +883,27 @@ void FenceWindow::StopFlip() {
     flipNodes_.clear();
 }
 
+// 拖拽落位用：记下「现在」每个图标占第几格。改完列表之后调 PlayPendingFlip()，
+// 走的就是和「改排序」同一套 StartFlip —— 插入到中间时，后面的图标会平滑地
+// 往后让一格，而不是「啪」一下整体跳位。
+void FenceWindow::CaptureSlots() {
+    pendingSlots_.clear();
+    std::vector<DesktopIconView*> mine;
+    CollectVisible(mine);
+    pendingSlots_.reserve(mine.size() + 4);
+    for (size_t i = 0; i < mine.size(); ++i) pendingSlots_[mine[i]] = (int)i;
+}
+
+void FenceWindow::PlayPendingFlip() {
+    if (pendingSlots_.empty()) return;
+    std::vector<DesktopIconView*> after;
+    CollectVisible(after);
+    auto from = std::move(pendingSlots_);
+    pendingSlots_.clear();
+    StartFlip(from, after);
+    Redraw();
+}
+
 float FenceWindow::FlipProgress() const {
     if (!flipActive_ || flipDur_ <= 0) return 1.0f;
     const DWORD el = GetTickCount() - flipT0_;
@@ -1636,6 +1657,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     // 未吸附的「原始位置」从当前实际位置起算
                     dragRawX_ = dragLastX_;
                     dragRawY_ = dragLastY_;
+                    // 先把「四周多抓一圈」的磨砂底图丢给工作线程：这样接下来
+                    // 一两百个像素的移动都不用再补抓，也就不会有任何卡顿。
+                    if (cfg_ && cfg_->acrylic) RequestBackdropAsync(128);
                 }
                 if (dragging_) {
                     const int mdx = cur.x - dragLastCursor_.x;
@@ -1958,6 +1982,14 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             busy = true;
         }
 
+        // 亚克力底图补抓（在工作线程里跑）：回来了就在这里换上并重画一帧。
+        // 鼠标停住不动时没有鼠标消息，只能靠这个定时器把结果收进来。
+        if (bdJob_) {
+            EnsureBackdropCover();
+            // 要么还在等（继续转），要么刚换上（这一帧要重画）
+            busy = true;
+        }
+
         if (!busy) {
             KillTimer(h, kAnimTimer);
             return 0;
@@ -2039,18 +2071,34 @@ void FenceWindow::RefreshBackdrop(int pad) {
         h = y1 - y0;
     }
 
-    // 抓屏前把自己排除掉，避免"抓到上一帧的自己"形成回授；
-    // 顺便把别的自家窗口（其他盒子 / 桌面图标层）也排除，否则磨砂里会出现它们
-    // 的一团团鬼影 —— 拖动经过别的盒子时特别明显。
-    const bool hook = s_captureExcluder != nullptr;
-    if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, true);
-    SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE);
     wchar_t mode[32]{};
     GetEnvironmentVariableW(L"MEOW_BACKDROP", mode, 32);
     const bool preferDesktop = _wcsicmp(mode, L"desktop") == 0;
-    const bool ok = CaptureBlurredBackdrop(x, y, w, h, 20, backdrop_, preferDesktop);
-    SetWindowDisplayAffinity(hwnd_, WDA_NONE);
-    if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, false);
+
+    // 快路径：不带 CAPTUREBLT 的抓屏。
+    //
+    // 分层窗口（我们自己的盒子 / 桌面图标层）在不带 CAPTUREBLT 时天然不进画面，
+    // 所以完全不用去动 SetWindowDisplayAffinity —— 那一步每次都会让 DWM 把整个
+    // 桌面重新合成一遍，还要 EnumWindows 扫一遍所有窗口，抓完再改回来又是两遍。
+    // 拖动时每 100ms 来一轮，看到的就是「磨砂一卡一卡」。
+    bool ok = false;
+    bool uni = false;
+    if (!preferDesktop) ok = CaptureBlurredBackdropFast(x, y, w, h, backdrop_, &uni);
+
+    // uni：快路径抓到的是一片纯色 —— 可能是壁纸真的纯色，也可能是壁纸画在分层
+    // 窗口上（快路径看不见它）。这条同步路径只在「首次 / 换壁纸 / 后台失败兜底」时走，
+    // 宁可慢一点也要拿对，所以一律让慢路径再确认一次。
+    if (!ok || uni) {
+        // 慢路径：壁纸是分层窗口画的（某些动态壁纸），快路径抓到一片纯色/全黑。
+        // 这时必须带 CAPTUREBLT 把分层窗口也抓进来，同时把所有自家窗口排除掉
+        // （否则会抓到上一帧的自己，形成回授）。
+        const bool hook = s_captureExcluder != nullptr;
+        if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, true);
+        SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE);
+        ok = CaptureBlurredBackdrop(x, y, w, h, 20, backdrop_, preferDesktop);
+        SetWindowDisplayAffinity(hwnd_, WDA_NONE);
+        if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, false);
+    }
     if (!ok) {
         backdrop_.clear();
         return;
@@ -2062,12 +2110,84 @@ void FenceWindow::RefreshBackdrop(int pad) {
     backdropCoverT_ = GetTickCount();
 }
 
-// 拖动 / 改尺寸期间：底图盖不住当前矩形了就补抓一圈。
+// 提交一次后台抓取：矩形 = 当前盒子 + 四周 pad，夹在虚拟桌面内。
+void FenceWindow::RequestBackdropAsync(int pad) {
+    if (!cfg_ || !cfg_->acrylic || !hwnd_ || bdJob_) return;
+    RECT r = rect();
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    const int needW = width_ > 0 ? width_ : (int)(r.right - r.left);
+    const int needH = height_ > 0 ? height_ : (int)(r.bottom - r.top);
+    // 比屏幕还大 / 坐标跑到虚拟桌面外的老配置：永远补不全，别一直提交
+    const RECT vs = ScreenUtil::VirtualScreen();
+    if (needW + 4 > (int)(vs.right - vs.left) || needH + 4 > (int)(vs.bottom - vs.top))
+        return;
+    RECT want{(int)r.left - pad, (int)r.top - pad, (int)r.left + needW + pad,
+              (int)r.top + needH + pad};
+    want.left = std::max((int)want.left, (int)vs.left);
+    want.top = std::max((int)want.top, (int)vs.top);
+    want.right = std::min((int)want.right, (int)vs.right);
+    want.bottom = std::min((int)want.bottom, (int)vs.bottom);
+    bdJob_ = BackdropCaptureAsync(want);
+    // 结果要靠定时器收（鼠标停住时没有鼠标消息）
+    if (bdJob_ && hwnd_) SetTimer(hwnd_, kAnimTimer, 16, nullptr);
+}
+
+// 拖动 / 改尺寸期间：底图盖不住当前矩形了就把「抓一块新的」丢给工作线程。
 //
-// 限频 70ms：抓屏 + 模糊是最贵的一步（几百 k 像素），每帧做会让拖动变成幻灯片。
-// 正常情况下开头抓的那一圈够用很久（挪出圈外才需要补），所以这条路径很少走到。
+// 以前这里是同步抓（抓屏 8~11ms + 模糊 35ms），拖动时每挪 128px 就停下来 40 多毫秒，
+// 看到的就是「磨砂一卡一卡」。现在 UI 线程只提交矩形，不等结果：这一帧照旧
+// 用旧底图（Paint 会按偏移取样，越界的那一条用最近的一列/一行撑开，不会露出色带），
+// 下一帧或下下帧再换上新的。
+//
+// **别改回同步抓。** 抓屏那 8~11ms 是 GPU 回读，压不下去；模糊已经从 35ms 压到 7ms。
 void FenceWindow::EnsureBackdropCover() {
-    if (!cfg_ || !cfg_->acrylic || !hwnd_ || backdrop_.empty()) return;
+    if (!cfg_ || !cfg_->acrylic || !hwnd_) return;
+
+    // 先看后台那一单有没有回来
+    if (bdJob_) {
+        if (!bdJob_->finished.load(std::memory_order_acquire)) return;   // 还在抓
+        if (bdJob_->ok && (!bdJob_->uniform || bdPlainArea_ || backdrop_.empty())) {
+            // 用上了。uniform 的两种含义见 CaptureBlurredBackdropFast 的注释：
+            // 已知这块地方就是纯色（bdPlainArea_）、或者现在压根没有底图时，照用。
+            backdrop_ = std::move(bdJob_->px);
+            backdropW_ = bdJob_->w;
+            backdropH_ = bdJob_->h;
+            backdropX_ = bdJob_->x;
+            backdropY_ = bdJob_->y;
+            backdropCoverT_ = GetTickCount();
+            if (!bdJob_->uniform) bdPlainArea_ = false;
+            bdJob_.reset();
+            return;
+        }
+        const bool wasUniform = bdJob_->uniform;
+        bdJob_.reset();
+        // 第一次抓到「一片纯色」：分不清是壁纸本来就纯色，还是壁纸是分层窗口画的
+        // （快路径看不见它）。用慢路径确认一次；确认下来也是纯色就记住，以后不折腾。
+        const DWORD nowT = GetTickCount();
+        if (wasUniform && nowT - backdropCoverT_ >= 500) {
+            backdropCoverT_ = nowT;
+            RefreshBackdrop(dragging_ || resizing_ ? 128 : 0);
+            bdPlainArea_ = !backdrop_.empty() && NearlyUniform(backdrop_, backdropW_,
+                                                              backdropH_);
+            return;
+        }
+        // 其它情况（抓屏直接失败）：慢路径兜底，限频 300ms 别把拖动拖垮
+        if (nowT - backdropCoverT_ >= 300) {
+            backdropCoverT_ = nowT;
+            RefreshBackdrop(dragging_ || resizing_ ? 128 : 0);
+        }
+        return;
+    }
+
+    if (backdrop_.empty()) {
+        // 还没有底图（首次 / 后台抓不到）：只能同步抓一次，否则整块没有磨砂
+        const DWORD now0 = GetTickCount();
+        if (now0 - backdropCoverT_ < 200) return;
+        backdropCoverT_ = now0;
+        RefreshBackdrop(dragging_ || resizing_ ? 128 : 0);
+        return;
+    }
+
     RECT r = rect();
     const int needW = width_ > 0 ? width_ : (int)(r.right - r.left);
     const int needH = height_ > 0 ? height_ : (int)(r.bottom - r.top);
@@ -2076,16 +2196,11 @@ void FenceWindow::EnsureBackdropCover() {
     const bool covered = sx >= 0 && sy >= 0 && sx + needW <= backdropW_ &&
                          sy + needH <= backdropH_;
     if (covered) return;
-    // 比屏幕还大 / 坐标跑到虚拟桌面外的老配置：永远补不全，别每 70ms 抓一次屏
-    {
-        const RECT vs = ScreenUtil::VirtualScreen();
-        if (needW + 4 > (int)(vs.right - vs.left) || needH + 4 > (int)(vs.bottom - vs.top))
-            return;
-    }
+    // 限频：一次 18ms（在别的线程），别每帧都往队列里塞
     const DWORD now = GetTickCount();
-    if (now - backdropCoverT_ < 70) return;
+    if (now - backdropCoverT_ < 60) return;
     backdropCoverT_ = now;
-    RefreshBackdrop(128);
+    RequestBackdropAsync(128);
 }
 
 void FenceWindow::Paint() {
@@ -2135,19 +2250,34 @@ void FenceWindow::Paint() {
         // ---- 卡片底 ----
         if (hasBackdrop) {
             // 亚克力：模糊壁纸打底 + 半透明着色，整体不透明。
-            // 底图只覆盖「抓取时那一圈」，窗口挪到圈外时超出部分就只剩着色 ——
-            // 此时 EnsureBackdropCover 会补抓（限频），所以露出来的机会不多。
+            //
+            // 底图只覆盖「抓取时那一圈」，窗口挪到圈外时超出部分以前就只剩着色，
+            // 看起来是盒子里突然多出一条没有磨砂的色带。现在补抓是异步的
+            // （见 EnsureBackdropCover），必然有几帧还没换上新底图 ——
+            // 所以这里把越界的部分用「最近的边」撑开：模糊过的画面本来就没有细节，
+            // 拉伸一列/一行几乎看不出来，总比露一条纯色带好。
             Bitmap blur(backdropW_, backdropH_, backdropW_ * 4, PixelFormat32bppPARGB,
                         backdrop_.data());
-            int dx = std::max(0, -bsx);          // 目标里第一块有效像素
-            int dy = std::max(0, -bsy);
-            int cx = std::max(0, bsx);           // 底图里对应的起点
-            int cy = std::max(0, bsy);
+            const int dx = std::max(0, -bsx);          // 目标里第一块有效像素
+            const int dy = std::max(0, -bsy);
+            const int cx = std::max(0, bsx);           // 底图里对应的起点
+            const int cy = std::max(0, bsy);
             const int cw = std::min(bufW_ - dx, backdropW_ - cx);
             const int chh = std::min(bufH_ - dy, backdropH_ - cy);
             if (cw > 0 && chh > 0) {
                 gfx.SetClip(&shape);
                 gfx.DrawImage(&blur, Rect(dx, dy, cw, chh), cx, cy, cw, chh, UnitPixel);
+                // 左右越界：把最近的一列撑开；上下越界：把最近的一行撑开
+                if (dx > 0)
+                    gfx.DrawImage(&blur, Rect(0, dy, dx, chh), cx, cy, 1, chh, UnitPixel);
+                if (dx + cw < bufW_)
+                    gfx.DrawImage(&blur, Rect(dx + cw, dy, bufW_ - dx - cw, chh),
+                                  cx + cw - 1, cy, 1, chh, UnitPixel);
+                if (dy > 0)
+                    gfx.DrawImage(&blur, Rect(0, 0, bufW_, dy), cx, cy, cw, 1, UnitPixel);
+                if (dy + chh < bufH_)
+                    gfx.DrawImage(&blur, Rect(0, dy + chh, bufW_, bufH_ - dy - chh), cx,
+                                  cy + chh - 1, cw, 1, UnitPixel);
                 gfx.ResetClip();
             }
             SolidBrush tint{Color((BYTE)std::min(255, (int)(alpha * 0.58)), r, g, b)};
@@ -2685,6 +2815,8 @@ void FenceWindow::Redraw() {
 
 void FenceWindow::RecaptureBackdrop() {
     if (!cfg_ || !cfg_->acrylic || !hwnd_) return;
+    bdJob_.reset();       // 在途的那一单作废（换壁纸了，抓到的是旧壁纸）
+    bdPlainArea_ = false; // 壁纸变了，「这块是纯色」的结论也要重来
     // 拖动 / 改尺寸途中就再抓一圈大的，别把正在用的那一圈收窄了
     RefreshBackdrop((dragging_ || resizing_) ? 128 : 0);
     Redraw();
@@ -2797,6 +2929,8 @@ void FenceWindow::Destroy() {
     if (memDC_) { DeleteDC(memDC_); memDC_ = nullptr; }
     bits_ = nullptr;
     bufW_ = bufH_ = 0;
+    bdJob_.reset();   // 工作线程那一单由 shared_ptr 自己收尾，不会悬空
+    pendingSlots_.clear();   // 里面是指向图标的裸指针，盒子拆了就不能留
     backdrop_.clear();
     labels_.clear();
     labelKeys_.clear();
