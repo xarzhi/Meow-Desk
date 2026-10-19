@@ -635,18 +635,6 @@ RECT DesktopSurface::CellRect(const DesktopIconView* e) const {
     return r;
 }
 
-RECT DesktopSurface::IconLabelScreenRect(const DesktopIconView* e) const {
-    RECT out{};
-    if (!e || !hwnd_ || !e->OnDesktop()) return out;
-    const int ih = e->bmp.valid() ? e->bmp.height : iconPx_;
-    // 桌面层的客户区和屏幕是同一个原点（窗口铺满整块屏幕，origin_ 就是它的左上角）
-    out.left = e->pos.x + 2;
-    out.right = e->pos.x + cellW_ - 2;
-    out.top = e->pos.y + kIconTopPad + ih + kTextGap;
-    out.bottom = out.top + IconLabelLineHeight() * 2;
-    return out;
-}
-
 DesktopIconView* DesktopSurface::HitTest(POINT pt) const {
     if (!icons_) return nullptr;
     for (auto* e : *icons_) {

@@ -1023,8 +1023,15 @@ static void CommitRename(const std::wstring& oldPath, const std::wstring& newNam
     }
 }
 
-// 菜单点了「重命名」→ 找到那个图标，在它的标题上弹输入框
+// 菜单点了「重命名」→ 在图标所属的盒子正中弹命名弹窗（桌面图标就居中于屏幕）
 static bool BeginRenameIcon(HWND /*owner*/, const std::wstring& path) {
+    // 回收站 / 此电脑 这类虚拟项没有文件系统路径，改不了名 —— 与其弹个必然失败的
+    // 输入框，不如直接不响应（菜单项是 shell 给的，我们拦在这里）。
+    if (path.empty() || path.find(L'\\') == std::wstring::npos) {
+        LogStep("rename: not a filesystem item " + Narrow(path));
+        return false;
+    }
+
     DesktopIconView* e = nullptr;
     for (auto* o : g_icons) {
         if (o && o->path == path) {
@@ -1037,25 +1044,19 @@ static bool BeginRenameIcon(HWND /*owner*/, const std::wstring& path) {
         return false;
     }
 
-    RECT box{};
+    // 锚点 = 这个图标所在的盒子；图标在桌面上就没有锚点（居中于屏幕）
+    HWND anchor = nullptr;
     if (e->owner >= 0 && e->owner < (int)g_fences.size() && g_fences[e->owner])
-        box = g_fences[e->owner]->ItemLabelScreenRect(e);
-    else
-        box = g_surface.IconLabelScreenRect(e);
-    if (box.right <= box.left) {
-        // 拿不到标签位置（图标不在屏幕上）：退回到鼠标位置附近，聊胜于无
-        POINT cur{};
-        GetCursorPos(&cur);
-        box = RECT{cur.x, cur.y, cur.x + 200, cur.y + 24};
-    }
+        anchor = g_fences[e->owner]->hwnd();
 
     // 预填「真实文件名」（带扩展名），让用户改的是磁盘上的名字。
-    // 输入框里只选中主文件名（不带扩展名），所以直接打字不会把 .lnk 打掉。
+    // 弹窗里只选中主文件名（不带扩展名），所以直接打字不会把 .lnk 打掉。
     const size_t slash = path.find_last_of(L'\\');
     const std::wstring fileName = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
     const std::wstring oldPath = path;
-    RenameBox::Show(nullptr, box, fileName,
-                    [oldPath](const std::wstring& name) { CommitRename(oldPath, name); });
+    RenameBox::Show(anchor, L"重命名", fileName,
+                    [oldPath](const std::wstring& name) { CommitRename(oldPath, name); },
+                    RenameBox::Sel::Stem);
     LogStep("rename box open for " + Narrow(fileName));
     return true;
 }
@@ -1463,151 +1464,35 @@ static void NewDesktopFolder() {
     ReloadDesktopIcons();
 }
 
-// ---- 重命名分区 ----
-// 盒子是 WS_EX_NOACTIVATE 的分层窗口，拿不到键盘焦点，所以用一个能激活的小弹窗
-// 贴着盒子头部显示（回车提交 / Esc 取消 / 失去焦点也提交）。
-static HWND g_renameWnd = nullptr;
-static HWND g_renameEdit = nullptr;
-static WNDPROC g_renameEditProc = nullptr;
-static int g_renameFence = -1;
-static int g_renameGroup = -1;   // >= 0 = 改的是这个分组标签；-1 = 改盒子标题
-
-static void FinishRename(bool commit) {
-    if (!g_renameWnd) return;
-    const int fi = g_renameFence;
-    const int gi = g_renameGroup;
-    std::wstring text;
-    if (commit && g_renameEdit) {
-        // 用 WM_GETTEXT 而不是 GetWindowTextW：输入框的文本可能是别的进程
-        // （自动化脚本）通过 WM_SETTEXT 写进来的，让 EDIT 自己回答更可靠
-        wchar_t buf[256]{};
-        SendMessageW(g_renameEdit, WM_GETTEXT, (WPARAM)255, (LPARAM)buf);
-        text = buf;
-        size_t a = 0, b = text.size();
-        while (a < b && (text[a] == L' ' || text[a] == L'\t')) ++a;
-        while (b > a && (text[b - 1] == L' ' || text[b - 1] == L'\t')) --b;
-        text = text.substr(a, b - a);
-    }
-    HWND wnd = g_renameWnd;
-    g_renameWnd = nullptr;
-    g_renameEdit = nullptr;
-    g_renameFence = -1;
-    g_renameGroup = -1;
-    DestroyWindow(wnd);
-
-    if (commit && !text.empty() && fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) {
-        // SetTitle / SetGroupName 内部都会存盘
-        if (gi >= 0) g_fences[fi]->SetGroupName(gi, text);
-        else g_fences[fi]->SetTitle(text);
-        LogStep("rename fence #" + std::to_string(fi) + (gi >= 0 ? " group " : " -> ") +
-                (gi >= 0 ? std::to_string(gi) + " -> " : std::string()) + Narrow(text));
-    }
-}
-
-static LRESULT CALLBACK RenameEditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_KEYDOWN) {
-        if (w == VK_RETURN) {
-            FinishRename(true);
-            return 0;
-        }
-        if (w == VK_ESCAPE) {
-            FinishRename(false);
-            return 0;
-        }
-    }
-    // 回车/ESC 已经被吃掉，别再走 WM_CHAR，否则每敲一下都 ding
-    if (m == WM_CHAR && (w == L'\r' || w == L'\n' || w == 27)) return 0;
-    return CallWindowProcW(g_renameEditProc, h, m, w, l);
-}
-
-static LRESULT CALLBACK RenameProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    switch (m) {
-    case WM_ACTIVATE:
-        if (LOWORD(w) == WA_INACTIVE) FinishRename(true);
-        return 0;
-    case WM_CLOSE:
-        FinishRename(false);
-        return 0;
-    default:
-        break;
-    }
-    return DefWindowProcW(h, m, w, l);
-}
-
-// 真正建输入框：x 是屏幕坐标（改分组时贴在对应标签上），w 是输入框宽度
-static void BeginRenameBoxAt(int fi, int group, const std::wstring& initial, int x, int w,
-                             int headH) {
-    if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
-    RECT r = g_fences[fi]->rect();
-    const int h = std::max(24, headH - 14);
-    if (w < 40) return;
-
-    HINSTANCE inst = GetModuleHandleW(nullptr);
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = RenameProc;
-    wc.hInstance = inst;
-    wc.lpszClassName = L"MeowDeskRename";
-    wc.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    RegisterClassExW(&wc);
-
-    g_renameFence = fi;
-    g_renameGroup = group;
-    g_renameWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"MeowDeskRename", L"",
-                                  WS_POPUP, x, r.top + (headH - h) / 2, w, h, nullptr, nullptr,
-                                  inst, nullptr);
-    if (!g_renameWnd) {
-        g_renameFence = -1;
-        g_renameGroup = -1;
-        return;
-    }
-
-    g_renameEdit = CreateWindowExW(0, L"EDIT", initial.c_str(),
-                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 3, 2,
-                                   w - 6, h - 4, g_renameWnd, (HMENU)1, inst, nullptr);
-    if (g_renameEdit) {
-        SendMessageW(g_renameEdit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-        SendMessageW(g_renameEdit, EM_SETSEL, 0, -1);
-        g_renameEditProc = (WNDPROC)SetWindowLongPtrW(g_renameEdit, GWLP_WNDPROC,
-                                                      (LONG_PTR)RenameEditProc);
-    }
-    ShowWindow(g_renameWnd, SW_SHOW);
-    SetForegroundWindow(g_renameWnd);
-    if (g_renameEdit) SetFocus(g_renameEdit);
-}
-
-// group < 0 = 改盒子标题；group >= 0 = 改第 group 个分组标签
-static void BeginRenameBox(int fi, int group, const std::wstring& initial) {
-    if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
-    FenceWindow* f = g_fences[fi].get();
-    if (g_renameWnd) FinishRename(false);
-
-    RECT r = f->rect();
-    const int headH = f->headerH();
-    int x = r.left + 12;
-    int w = std::min<int>((int)(r.right - r.left) - 24, 260);
-    // 改分组时输入框摆到那个标签上（宽度也跟着标签走），改标题就贴头部左边
-    if (group >= 0) {
-        const auto tabs = f->TabRects();
-        if (group < (int)tabs.size() && tabs[group].right > tabs[group].left) {
-            x = r.left + tabs[group].left;
-            const int avail = (int)(r.right - r.left) - (int)(x - r.left) - 8;
-            const int tabW = (int)(tabs[group].right - tabs[group].left) + 48;
-            w = std::max(60, std::min(avail, tabW));
-        }
-    }
-    BeginRenameBoxAt(fi, group, initial, x, w, headH);
-}
-
+// ---- 重命名分区 / 分组 ----
+// 盒子是 WS_EX_NOACTIVATE 的分层窗口，拿不到键盘焦点，所以改名走 RenameBox 那个
+// 能激活的小弹窗，摆在盒子正中间。
+// 以前是「贴着头部/标签原地弹一个输入框」：盒子靠屏幕边缘时输入框会被挤出去，
+// 改分组名时还会压住下面一排图标 —— 现在统一成居中的卡片。
 static void BeginRenameFence(int fi) {
     if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
-    BeginRenameBox(fi, -1, g_fences[fi]->title());
+    FenceWindow* f = g_fences[fi].get();
+    const int idx = fi;
+    RenameBox::Show(f->hwnd(), L"重命名分区", f->title(),
+                    [idx](const std::wstring& n) {
+                        // SetTitle 内部会存盘并重画（有分组时第一个标签跟着改）
+                        if (idx >= 0 && idx < (int)g_fences.size() && g_fences[idx])
+                            g_fences[idx]->SetTitle(n);
+                    });
 }
 
+// gi == 0 时 SetGroupName 内部会转成 SetTitle（第一个标签就是盒子标题）
 static void BeginRenameGroup(int fi, int gi) {
     if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
-    BeginRenameBox(fi, gi, g_fences[fi]->GroupName(gi));
+    FenceWindow* f = g_fences[fi].get();
+    if (gi < 0 || gi >= f->groupCount()) return;
+    const int idx = fi;
+    const int g = gi;
+    RenameBox::Show(f->hwnd(), L"重命名分组", f->GroupName(gi),
+                    [idx, g](const std::wstring& n) {
+                        if (idx >= 0 && idx < (int)g_fences.size() && g_fences[idx])
+                            g_fences[idx]->SetGroupName(g, n);
+                    });
 }
 
 static void ShowFenceMenu(int fi, POINT sp, int item) {
@@ -1832,6 +1717,8 @@ static void AddFenceWindow(int i) {
         }
         ShowFenceMenu(i, sp, item);
     };
+    // 双击分组标签 → 在盒子正中弹改名弹窗（0 = 盒子标题本身）
+    f->onRenameGroup = [i](int group) { BeginRenameGroup(i, group); };
     // 「查看 / 排序 / 重命名」改完之后存盘：配置（viewMode 等）+ 图标顺序
     f->onStateChanged = [i] {
         EnsureFenceIconSize(i);
@@ -1998,6 +1885,9 @@ static void DeleteActiveGroup(int fi) {
 static void DeleteFence(int fi) {
     if (fi < 0 || fi >= (int)g_fences.size() || fi >= (int)g_config.fences.size()) return;
 
+    // 重命名弹窗可能正摆在这个盒子上（锚点是它的窗口），盒子要拆了先按取消收掉
+    RenameBox::Close();
+
     std::vector<DesktopIconView*> moved;
     for (auto* e : g_icons)
         if (e && e->owner == fi) moved.push_back(e);
@@ -2022,6 +1912,8 @@ static void DeleteFence(int fi) {
 
 // 按当前 g_config.fences 把所有盒子窗口重建一遍（下标变了之后必须走这条路）
 static void RebuildFences() {
+    // 盒子窗口要全拆掉重建，弹窗的锚点（也是盒子窗口）会跟着失效，先收掉
+    RenameBox::Close();
     for (auto& f : g_fences)
         if (f) f->Destroy();
     g_fences.clear();

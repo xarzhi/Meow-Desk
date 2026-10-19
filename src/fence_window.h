@@ -140,9 +140,6 @@ public:
     // 拖放落点判定用：松手时要知道「放到哪个图标上了」。
     DesktopIconView* ItemAtScreen(POINT screenPt) const;
 
-    // 图标标题在屏幕上的矩形（重命名输入框贴在它上面）。拿不到返回全 0。
-    RECT ItemLabelScreenRect(DesktopIconView* e) const;
-
     // 调试：最近一次拖动夹取的实况（障碍数量 / 期望位置 / 实际位置）。
     // 不参与任何逻辑，只往日志里写 —— 盒子互相避让出问题时，这一行能直接区分
     // 「一个障碍都没拿到」和「拿到了但没挡住」。
@@ -159,6 +156,8 @@ public:
     std::function<void(const std::vector<DesktopIconView*>&, POINT)> onItemsDrop;
     // 右键（POINT 是屏幕坐标；item 为 -1 表示点在空白/头部）
     std::function<void(int item, POINT)> onContextMenu;
+    // 双击分组标签 → 改这个标签的名字（0 = 盒子标题本身，SetGroupName 会转到 SetTitle）
+    std::function<void(int group)> onRenameGroup;
     // 「查看 / 排序 / 重命名」改完之后：外部存配置 + 存图标布局
     std::function<void()> onStateChanged;
 

@@ -107,10 +107,6 @@ public:
     // HitTestScreen 会因为 mode_ != None 一律返回 nullptr。
     DesktopIconView* ItemAtScreen(POINT screenPt) const;
 
-    // 图标标题在屏幕上的矩形（重命名输入框贴在它上面）。
-    // 图标不在桌面上时返回全 0。
-    RECT IconLabelScreenRect(const DesktopIconView* e) const;
-
     // 桌面左上角起、按列（先从上到下扫完一列，再往右）的第一个空闲格子。
     // 删除盒子 / 删除分组把图标倒回桌面时用：图标会从左上角开始一个挨一个往下排，
     // 一列排满再换右边一列，而不是各自「就近抢一个」格子撒得满屏都是。
