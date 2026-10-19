@@ -2482,8 +2482,14 @@ void FenceWindow::Paint() {
                       reinterpret_cast<BYTE*>(bits_));
         Graphics gfx(&target);
         gfx.SetSmoothingMode(SmoothingModeAntiAlias);
+        // -0.5 偏移让整数坐标正好落在像素中心：1px 描边才是一像素实的，
+        // 换成 PixelOffsetModeNone 会把每条 1px 线摊到相邻两像素上（糊）。
         gfx.SetPixelOffsetMode(PixelOffsetModeHighQuality);
-        gfx.SetTextRenderingHint(TextRenderingHintAntiAlias);
+        // 文字清晰度靠的是这一行：以前是 TextRenderingHintAntiAlias（不做网格对齐），
+        // 13px 中文的字干落在半像素上，糊成一层灰边 —— 用户说的「tab 文字不清晰」。
+        // ClearType 在 per-pixel alpha 的分层窗口上不能用（次像素渲染会出色边，
+        // 还会把 alpha 写成彩色），AntiAliasGridFit 是这种场景下最锐的一档。
+        gfx.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
 
         const RectF full(0.0f, 0.0f, (float)bufW_, (float)bufH_);
         GraphicsPath shape;
@@ -2647,7 +2653,10 @@ void FenceWindow::Paint() {
                 const bool on = ((int)i == act);
                 const RectF rr((float)tr.left, (float)tr.top, (float)(tr.right - tr.left),
                                (float)(tr.bottom - tr.top));
-                const BYTE tabA = on ? fadeA : (BYTE)((light ? 122 : 146) * headFade);
+                // 非当前分组：以前只有 48%（浅色）/ 57%（深色）不透明度，
+                // 压在模糊壁纸上就发灰、发虚 —— 这是「tab 文字不清晰」的另一半。
+                // 提到 67% / 78%：层级差异还在，但字读得清。
+                const BYTE tabA = on ? fadeA : (BYTE)((light ? 172 : 200) * headFade);
                 SolidBrush txt{Color(WithAlpha(fg, tabA))};
                 const std::wstring name = GroupName((int)i);
                 const RectF box(rr.X + 2.0f, rr.Y, std::max(4.0f, rr.Width - 4.0f), rr.Height);
