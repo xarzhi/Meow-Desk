@@ -30,11 +30,14 @@ const int kWidth = 680;
 const int kRowH = 46;
 const int kMaxRows = 8;
 const int kPad = 16;
+// 上边距单独一个值：左右保持 16，但顶部只要 5px —— 窗口本身没有标题栏，
+// 顶部留太多会显得整块内容被往下压。
+const int kPadTop = 5;
 const int kSearchH = 46;
 // 顶部「logo + 标题」那一行。搜索框整体下移这么多 —— 用户在面板左上角要求有品牌标识，
 // 参考的是浏览器地址栏/命令面板那种「上方一行小标题」的排版。
 const int kHeaderH = 40;
-const int kSearchTop = kPad + kHeaderH;          // 搜索框的 y
+const int kSearchTop = kPadTop + kHeaderH;       // 搜索框的 y
 const int kListTop = kSearchTop + kSearchH + 10;
 const int kFooterH = 30;
 
@@ -485,8 +488,8 @@ void SearchWindow::Repaint() {
     // 不裁剪、不挑其中一块 —— 这条是用户明确要求过的（见 make_icon.py 里的 TILE）。
     {
         const int logoX = kPad + 2;
-        // 和四周一致的上边距：标题行在 kPad..kSearchTop 之间，logo 在里面垂直居中
-        const int logoY = kPad + (kHeaderH - kLogoPx) / 2;
+        // 标题行在 kPadTop..kSearchTop 之间，logo 在里面垂直居中
+        const int logoY = kPadTop + (kHeaderH - kLogoPx) / 2;
         if (Bitmap* logo = AppLogoBitmap()) {
             g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
             g.DrawImage(logo, Rect(logoX, logoY, kLogoPx, kLogoPx));
