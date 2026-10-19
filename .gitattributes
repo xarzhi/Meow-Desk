@@ -1,0 +1,7 @@
+# shell 脚本必须以 LF 落盘：Git Bash 读到 CRLF 的 #!/bin/bash 会报
+# "bad interpreter: No such file or directory"（本机 core.autocrlf=true，
+# 没这行的话别人 clone 下来就跑不了）。
+*.sh text eol=lf
+
+# .bat 反过来，必须是 CRLF
+*.bat text eol=crlf
