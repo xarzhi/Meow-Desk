@@ -25,7 +25,8 @@ std::wstring g_file;
 //   v4 — fence 表加 activeGroup；新增 fence_group 表（盒子内的分组标签）；
 //        icon_layout 加 grp（图标属于哪个分组）
 //   v5 — fence 表加 expandMode（展开 / 伸缩模式；-1 = 老数据，启动时按全局默认补）
-const int kSchemaVersion = 5;
+//   v6 — 把全局开关 defaultTelescope 落成 0：新建的盒子默认始终展开，不自己收起
+const int kSchemaVersion = 6;
 
 void SetError(const char* what) {
     g_lastError = what ? what : "";
@@ -114,6 +115,16 @@ bool Upgrade(int from) {
         // 全局默认（老配置里的 autoExpandOnHover）决定每个盒子用哪种方式，
         // 不能直接给 1 —— 那样原来开着「悬停展开」的用户会突然发现它失效了。
         AddColumn("fence", "expandMode", "INTEGER NOT NULL DEFAULT -1");
+    }
+    if (from < 6) {
+        // v6：新建的盒子默认不再自己收起来。
+        // 「新建盒子默认伸缩模式」这个全局开关以前是开着的，于是新盒子一出生就是
+        // 伸缩态、鼠标一移开就缩成一条 —— 这不是用户要的。这里把全局默认落成 0
+        // （= 始终展开），开关本身留着，想要新盒子伸缩再自己打开。
+        // 已经存在的盒子各自都存了 expandMode，不受这次迁移影响；
+        // 盒子头部右边的箭头也照样能单独切某一个盒子。
+        sqlite3_exec(g_db, "INSERT OR REPLACE INTO app(k,v) VALUES('defaultTelescope','0');",
+                     nullptr, nullptr, nullptr);
     }
 
     const std::string ver = "PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";";

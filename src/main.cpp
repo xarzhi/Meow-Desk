@@ -1386,7 +1386,11 @@ static void NewFenceNear(int fi) {
 // 框选「创建盒子」：位置和尺寸都照抄用户画出来的那个蓝框。
 // 只有框小到装不下一列图标（还没算头部）时才补到最小可用尺寸 ——
 // 太小的话新盒子一出生就只看得见一条边，用户还得自己再拉一次。
-static void NewFenceInRect(RECT r) {
+//
+// picked：框选时被框住、并且已经在桌面上亮着选中态的那些图标。盒子建好后
+// 直接把它们搬进去 —— 用户画框的意图就是「这一堆归这个盒子」，再让他手动
+// 一张一张拖一遍纯属白费力气。列表为空时行为和以前完全一样。
+static void NewFenceInRect(RECT r, const std::vector<DesktopIconView*>& picked) {
     int w = (int)(r.right - r.left);
     int h = (int)(r.bottom - r.top);
     if (w < 180) w = 180;
@@ -1418,11 +1422,22 @@ static void NewFenceInRect(RECT r) {
     g_config.fences.push_back(c);
     for (auto& f : g_fences)
         if (f) f->RebindConfig();
-    AddFenceWindow((int)g_config.fences.size() - 1, false);   // 新建的盒子直接展开
+    const int idx = (int)g_config.fences.size() - 1;
+    AddFenceWindow(idx, false);   // 新建的盒子直接展开
+
+    // 框里选中的图标搬进新盒子。InsertIntoFenceMulti 会顺手把选中态清掉
+    // （换盒子之后不该还带着高亮），所以这里必须先搬完再持久化。
+    if (!picked.empty() && idx >= 0 && idx < (int)g_fences.size() && g_fences[idx]) {
+        InsertIntoFenceMulti(picked, idx, -1);
+        SaveIconLayout();
+        RedrawAll();
+    }
+
     g_config.Save();
     LogStep("new fence #" + std::to_string((int)g_config.fences.size() - 1) +
             " from marquee at " + std::to_string(x) + "," + std::to_string(y) + " " +
-            std::to_string(w) + "x" + std::to_string(h));
+            std::to_string(w) + "x" + std::to_string(h) + " picked " +
+            std::to_string(picked.size()));
 }
 
 // ---------------------------------------------------------------------------
@@ -2400,8 +2415,33 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_surface.onMarqueeMenu = [](const RECT& r, POINT sp) {
         if (!g_fenceMenu.Create()) return;
         g_fenceMenu.SetOwner(g_surface.hwnd());
-        g_fenceMenu.onCommand = [r](int id) {
-            if (id == kCmdFenceFromMarquee) NewFenceInRect(r);
+
+        // 框选时 UpdateMarqueeSelection 已经把框内的桌面图标打上了 selected，
+        // 这里趁菜单弹出前把这批图标的**路径**抄一份。
+        // 不存指针：菜单可能开着放一会儿，期间图标列表有可能被重建（桌面监听、
+        // 资源管理器那头的增删都会触发重载），指针会悬空；存路径再按路径找回来最稳。
+        std::vector<std::wstring> picked;
+        for (auto* e : g_icons)
+            if (e && e->OnDesktop() && e->selected && !e->path.empty())
+                picked.push_back(e->path);
+
+        g_fenceMenu.onCommand = [r, picked](int id) {
+            if (id != kCmdFenceFromMarquee) return;
+            std::vector<DesktopIconView*> list;
+            if (!picked.empty()) {
+                // 按 g_icons 的顺序收（就是桌面上的先后），再按位置从左到右、
+                // 从上到下排一遍 —— 框出来的东西进盒子后顺序才跟眼睛看到的一致。
+                for (auto* e : g_icons) {
+                    if (!e || !e->OnDesktop() || e->path.empty()) continue;
+                    if (std::find(picked.begin(), picked.end(), e->path) == picked.end()) continue;
+                    list.push_back(e);
+                }
+                std::sort(list.begin(), list.end(), [](DesktopIconView* a, DesktopIconView* b) {
+                    if (a->pos.y != b->pos.y) return a->pos.y < b->pos.y;
+                    return a->pos.x < b->pos.x;
+                });
+            }
+            NewFenceInRect(r, list);
         };
         std::vector<PopupMenuItem> items;
         items.push_back(
