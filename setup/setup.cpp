@@ -1,7 +1,7 @@
 // meow-desk 安装程序
 //
 // 设计取舍：
-//   · 不嵌资源。安装包需要把 meow-desk.exe 一起分发，这里从「setup.exe 所在目录」
+//   · 不嵌资源。安装包需要把 MeowDesk.exe 一起分发，这里从「setup.exe 所在目录」
 //     读它并复制到用户选定的安装位置。这样 build 产物直接可用，不必在 CMake 里
 //     造一条「先构建主程序、再把 exe 打进 rc」的依赖链（那条链在增量构建里很容易
 //     出现「改了主程序但安装包还是旧的」）。
@@ -33,10 +33,10 @@
 
 namespace {
 
-// 装完之后主程序叫这个（用户要求：MeowPlayer.exe）。
-// 打包里带的那份已经叫 MeowPlayer.exe；也认老名字，方便直接拿 build 里的产物测。
-const wchar_t* kAppExe = L"MeowPlayer.exe";
-const wchar_t* kLegacyExe = L"meow-desk.exe";
+// 装完之后主程序叫这个（用户要求：MeowDesk.exe）。
+// 注意：NTFS 大小写不敏感，它和从前的 meow-desk.exe 是**同一个路径**，
+// 所以不需要任何"老名字兼容 / 改名迁移"的代码 —— 别再加回来。
+const wchar_t* kAppExe = L"MeowDesk.exe";
 
 // 数据目录 / 便携标记沿用老名字：主程序 storage::Dir() 里是写死的，
 // 改名会让老用户「布局全没了」，所以这里一个字符都不动。
@@ -130,7 +130,7 @@ bool EnsureDir(const std::wstring& dir) {
 //   1. 注册表（新版自己写的，最准）
 //   2. **快捷方式指向哪** —— 安装位置可以自己改（有人装 D 盘），
 //      老版本又没写过注册表；但快捷方式是安装器自己建的，它指哪就是哪
-//   3. 默认路径 %LOCALAPPDATA%\Programs\meow-desk 下有没有 meow-desk.exe
+//   3. 默认路径 %LOCALAPPDATA%\Programs\meow-desk 下有没有 MeowDesk.exe
 // 只有前面都拿不到才用默认值 —— 之前漏了第 2 步，装到 D 盘的用户会看到错的路径。
 // ---------------------------------------------------------------------------
 const wchar_t* kRegKey = L"Software\\meow-desk";
@@ -188,7 +188,7 @@ struct PrevInstall {
     bool portable = false;
 };
 
-// 读 .lnk 的 TargetPath（安装器自己建的快捷方式，指向真正的 meow-desk.exe）
+// 读 .lnk 的 TargetPath（安装器自己建的快捷方式，指向真正的 MeowDesk.exe）
 std::wstring ReadShortcutTarget(const std::wstring& lnk) {
     std::wstring out;
     IShellLinkW* link = nullptr;
@@ -215,11 +215,10 @@ std::wstring DirOfPath(const std::wstring& p) {
 
 PrevInstall DetectPrevInstall() {
     PrevInstall p;
-    // 目录里有没有主程序：新名字优先，也认老的 meow-desk.exe（升级上来的用户）
+    // 目录里有没有主程序（大小写不敏感，老安装的 meow-desk.exe 同样算命中）
     auto hasExe = [](const std::wstring& d) {
         if (d.empty()) return false;
-        if (GetFileAttributesW((d + L"\\" + kAppExe).c_str()) != INVALID_FILE_ATTRIBUTES) return true;
-        return GetFileAttributesW((d + L"\\" + kLegacyExe).c_str()) != INVALID_FILE_ATTRIBUTES;
+        return GetFileAttributesW((d + L"\\" + kAppExe).c_str()) != INVALID_FILE_ATTRIBUTES;
     };
 
     std::wstring dir = RegGetStr(L"InstallDir");
@@ -306,6 +305,14 @@ bool PortableSelected() {
     return SendMessageW(g_portable, BM_GETCHECK, 0, 0) == BST_CHECKED;
 }
 
+// 两个路径是不是同一个文件（只看拼写，不看内容）
+bool SamePath(const std::wstring& a, const std::wstring& b) {
+    wchar_t fa[MAX_PATH * 2]{}, fb[MAX_PATH * 2]{};
+    if (GetFullPathNameW(a.c_str(), MAX_PATH * 2, fa, nullptr) == 0) return false;
+    if (GetFullPathNameW(b.c_str(), MAX_PATH * 2, fb, nullptr) == 0) return false;
+    return _wcsicmp(fa, fb) == 0;
+}
+
 void DoInstall(HWND hwnd) {
     const std::wstring dir = ReadPath();
     if (dir.empty()) {
@@ -314,14 +321,12 @@ void DoInstall(HWND hwnd) {
         return;
     }
 
-    // 安装包里带的主程序：新名字优先，也认 build 里那个 meow-desk.exe
-    std::wstring src = ExeDir() + L"\\" + kAppExe;
-    if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES)
-        src = ExeDir() + L"\\" + kLegacyExe;
+    // 安装包里带的主程序。NTFS 大小写不敏感，build 里那个 meow-desk.exe 也认。
+    const std::wstring src = ExeDir() + L"\\" + kAppExe;
     if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES) {
         MessageBoxW(hwnd,
-                    L"\u627e\u4e0d\u5230 MeowPlayer.exe\u3002\n\n"
-                    L"\u8bf7\u628a\u5b89\u88c5\u7a0b\u5e8f\u548c MeowPlayer.exe "
+                    L"\u627e\u4e0d\u5230 MeowDesk.exe\u3002\n\n"
+                    L"\u8bf7\u628a\u5b89\u88c5\u7a0b\u5e8f\u548c MeowDesk.exe "
                     L"\u653e\u5728\u540c\u4e00\u4e2a\u6587\u4ef6\u5939\u91cc\u518d\u8fd0\u884c\u3002",
                     L"meow-desk", MB_ICONERROR);
         return;
@@ -343,7 +348,9 @@ void DoInstall(HWND hwnd) {
 
     SetStatus(L"\u6b63\u5728\u590d\u5236\u7a0b\u5e8f\u6587\u4ef6\u2026", 35);
     const std::wstring dst = dir + L"\\" + kAppExe;
-    if (!CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
+    // 便携模式装到「安装程序自己所在的目录」时，源和目标就是同一个文件，
+    // CopyFileW 会直接失败 —— 这种情况本来就不用复制。
+    if (!SamePath(src, dst) && !CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
         SetStatus(L"\u590d\u5236\u5931\u8d25", 0);
         MessageBoxW(hwnd,
                     (L"\u65e0\u6cd5\u5199\u5165\uff1a\n" + dst +
@@ -365,7 +372,7 @@ void DoInstall(HWND hwnd) {
         if (f != INVALID_HANDLE_VALUE) {
             const char* note =
                 "meow-desk portable mode\r\n"
-                "config.ini / meow-desk.db are stored next to MeowPlayer.exe.\r\n"
+                "config.ini / meow-desk.db are stored next to MeowDesk.exe.\r\n"
                 "Delete this file to go back to %APPDATA%\\meow-desk.\r\n";
             DWORD wrote = 0;
             WriteFile(f, note, (DWORD)strlen(note), &wrote, nullptr);
@@ -387,12 +394,6 @@ void DoInstall(HWND hwnd) {
 
     SetStatus(L"\u6b63\u5728\u521b\u5efa\u5feb\u6377\u65b9\u5f0f\u2026", 80);
     {
-        // 老版本装的是同目录的 meow-desk.exe：新版复制完就把它删掉，
-        // 免得目录里两个 exe、用户不知道该点哪个。正在运行删不掉就算了。
-        const std::wstring legacy = dir + L"\\" + kLegacyExe;
-        if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES)
-            DeleteFileW(legacy.c_str());
-
         const std::wstring menu = KnownFolder(FOLDERID_Programs);   // 开始菜单\程序
         if (!menu.empty() && EnsureDir(menu))
             CreateShortcut(dst, menu + L"\\meow-desk.lnk");
@@ -450,7 +451,7 @@ void CreateControls(HWND h) {
     g_path = Child(h, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_PATH);
     SendMessageW(g_path, WM_SETFONT, (WPARAM)g_font, TRUE);
 
-    // 装过就直接显示上次装的路径（注册表里有，或者默认路径下真有一个 meow-desk.exe），
+    // 装过就直接显示上次装的路径（注册表里有，或者默认路径下真有一个 MeowDesk.exe），
     // 没装过才用默认值 —— 否则升级时用户得自己再找一遍装在哪。
     const PrevInstall prev = DetectPrevInstall();
     g_prevFound = prev.found;

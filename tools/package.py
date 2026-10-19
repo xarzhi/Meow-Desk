@@ -16,15 +16,15 @@
 产物名字会带上：dist/MeowDesk-<版本>.zip，包内根目录 MeowDesk-<版本>/。
 
 产物：
-    dist/MeowPlayer.exe + dist/MeowDesk_v<版本>_setup.exe   平铺一份（老习惯，直接能跑安装程序）
+    dist/MeowDesk.exe + dist/MeowDesk_v<版本>_setup.exe   平铺一份（老习惯，直接能跑安装程序）
     dist/package/                               分发目录（两个 exe + 安装说明.txt + version.txt）
     dist/MeowDesk-<版本>.zip                    发给别人就发这个
 
 命名：安装器带版本号（MeowDesk_v0.1.0_setup.exe），装完的主程序固定叫
-MeowPlayer.exe —— 这两个名字是用户定的，改之前先问。
+MeowDesk.exe —— 这两个名字是用户定的，改之前先问。
 
 为什么两个 exe 必须放一起：安装器是从「它自己所在的目录」读
-MeowPlayer.exe 的，分开放就装不了。
+MeowDesk.exe 的，分开放就装不了。
 """
 
 import datetime
@@ -53,10 +53,10 @@ README = """meow-desk 安装说明
 --------------
   1) {setup}
      安装程序，双击这个。
-  2) MeowPlayer.exe
+  2) MeowDesk.exe
      主程序，安装器会把它复制到安装目录。
 
-两个必须放在同一个文件夹里 —— 安装器是从「它自己所在的目录」读 MeowPlayer.exe 的。
+两个必须放在同一个文件夹里 —— 安装器是从「它自己所在的目录」读 MeowDesk.exe 的。
 
 怎么装
 ------
@@ -65,7 +65,7 @@ README = """meow-desk 安装说明
      · 默认：%APPDATA%\\meow-desk（跟着用户走，重装不丢）
      · 便携：程序同目录（U 盘带着走）
    已经装过的话，这里会直接填好上次的位置，点「重新安装」即可。
-3. 点「安装」，开始菜单和桌面上会各建一个 meow-desk 快捷方式，指向 MeowPlayer.exe。
+3. 点「安装」，开始菜单和桌面上会各建一个 meow-desk 快捷方式，指向 MeowDesk.exe。
 
 默认装到
 --------
@@ -74,7 +74,7 @@ README = """meow-desk 安装说明
 卸载
 ----
 安装器只做「复制程序 + 建快捷方式」，没有注册系统卸载入口，手动删这几样就行：
-  1. 安装目录（默认 %LOCALAPPDATA%\\Programs\\meow-desk，里面是 MeowPlayer.exe）
+  1. 安装目录（默认 %LOCALAPPDATA%\\Programs\\meow-desk，里面是 MeowDesk.exe）
   2. 开始菜单和桌面上的 meow-desk 快捷方式
   3. 想连布局记忆一起清掉，再删 %APPDATA%\\meow-desk
      （便携模式删安装目录里的 meow-desk.db 和 meow-desk.portable）
@@ -166,28 +166,28 @@ def main(argv):
 
     zip_path = os.path.join(DIST, "MeowDesk-%s.zip" % ver)
     root = "MeowDesk-%s" % ver
-    # 包里的文件名：安装器带版本号，主程序固定叫 MeowPlayer.exe
+    # 包里的文件名：安装器带版本号，主程序固定叫 MeowDesk.exe
     setup_name = "MeowDesk_v%s_setup.exe" % ver
-    files = ((os.path.join(BUILD, "meow-desk.exe"), "MeowPlayer.exe"),
+    files = ((os.path.join(BUILD, "meow-desk.exe"), "MeowDesk.exe"),
              (os.path.join(BUILD, "meow-setup.exe"), setup_name))
 
     print("")
     print("== 3/4 组装 dist/（版本 %s%s）==" % (ver, (" / " + commit) if commit else ""))
     os.makedirs(DIST, exist_ok=True)
     # 老位置：平铺一份，以前直接跑 dist/ 里 setup 的用法不能坏。
-    # 顺便把改名前的老文件清掉，否则目录里会出现两套、分不清哪个是新的。
-    for old in ("meow-desk.exe", "meow-setup.exe"):
+    # 顺便把改名前 / 旧版本号的产物清掉，否则目录里会出现两套、分不清哪个是新的。
+    # 注意 Windows 文件名大小写不敏感：按小写比较，别把这次要生成的删了。
+    want = {n.lower() for _, n in files}
+    stale = lambda n: (n.lower() not in want) and (
+        n.lower() in ("meow-desk.exe", "meow-setup.exe", "meowplayer.exe")
+        or (n.startswith("MeowDesk_v") and n.endswith("_setup.exe")))
+    for name in os.listdir(DIST):
+        if not stale(name):
+            continue
         try:
-            os.remove(os.path.join(DIST, old))
+            os.remove(os.path.join(DIST, name))
         except OSError:
             pass
-    # 上次带着旧版本号的安装器：留着容易点错，一并清掉（dist/ 就是产物目录）
-    for name in os.listdir(DIST):
-        if name.startswith("MeowDesk_v") and name.endswith("_setup.exe") and name != setup_name:
-            try:
-                os.remove(os.path.join(DIST, name))
-            except OSError:
-                pass
     for src, name in files:
         shutil.copy2(src, os.path.join(DIST, name))
 
@@ -224,7 +224,7 @@ def main(argv):
     print("")
     print("完成。")
     print("  分发用：%s" % (os.path.relpath(zip_path, CORE) if do_zip else "dist/package/"))
-    print("  本机试用：先退出正在运行的 MeowPlayer，再启动 dist/MeowPlayer.exe")
+    print("  本机试用：先退出正在运行的 MeowDesk，再启动 dist/MeowDesk.exe")
     return 0
 
 
