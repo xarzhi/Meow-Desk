@@ -28,6 +28,9 @@ const wchar_t* kClassName = L"MeowDeskSurface";
 const int kIconTopPad = DesktopSurface::kIconTopPad;
 const int kTextGap = DesktopSurface::kTextGap;
 const int kLabelInset = 10;    // 标签左右内缩（对齐资源管理器的折行宽度）
+// 框选松手后弹「创建盒子」菜单的最小框尺寸：小于它就是「点了下空白处」，
+// 那种情况弹菜单会很烦（用户只是想取消选中）。
+const int kMarqueeMenuMin = 30;
 
 inline int SnapTo(int v, int step) {
     if (step <= 0) return v;
@@ -943,6 +946,17 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 for (auto* e : dragSet_) e->dragPos = e->pos;
             }
         }
+        // 框选松手：先趁 marqueeA_/B_ 还在，把蓝框换算成屏幕矩形。
+        // 只有拉出了足够大的一块才弹菜单 —— 单击空白处（框面积≈0）照旧只是取消选中。
+        RECT mq{0, 0, 0, 0};
+        if (mode_ == Mode::Marquee) {
+            const RECT m = Normalize(marqueeA_, marqueeB_);
+            if (m.right - m.left >= kMarqueeMenuMin && m.bottom - m.top >= kMarqueeMenuMin) {
+                mq = RECT{origin_.x + m.left, origin_.y + m.top,
+                          origin_.x + m.right, origin_.y + m.bottom};
+            }
+        }
+
         dragSet_.clear();
         dragStartPos_.clear();
         moved_ = false;
@@ -952,9 +966,9 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         seamCellValid_ = false;
         mode_ = Mode::None;
         Redraw();
+        if (mq.right > mq.left && onMarqueeMenu) onMarqueeMenu(mq, curScreen_);
         return 0;
     }
-
     case WM_MEASUREITEM:
     case WM_DRAWITEM:
     case WM_INITMENUPOPUP:

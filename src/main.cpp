@@ -1270,10 +1270,11 @@ enum {
     kCmdRenameGroup = 4044,   // 重命名当前分组
     kCmdDeleteGroup = 4045,   // 删除当前分组（图标回桌面）
     kCmdDeleteFence = 4046,   // 删除整个盒子（图标回桌面）
+    kCmdFenceFromMarquee = 4050,   // 桌面框选松手后的菜单：按框的矩形建盒子
     kCmdMoveToGroup = 4100,   // 4100..4127：盒内图标「移动到第 N 个分组」
 };
 
-static void AddFenceWindow(int i);
+static void AddFenceWindow(int i, bool startCollapsed = true);
 static void ShowFenceMenu(int fi, POINT sp, int item = -1);
 static void BeginRenameGroup(int fi, int gi);
 static void DeleteFence(int fi);
@@ -1376,10 +1377,52 @@ static void NewFenceNear(int fi) {
     // 容器可能重新分配：先把已有盒子手里的配置指针重绑一遍，再建新的那个
     for (auto& f : g_fences)
         if (f) f->RebindConfig();
-    AddFenceWindow((int)g_config.fences.size() - 1);
+    AddFenceWindow((int)g_config.fences.size() - 1, false);   // 新建的盒子直接展开
     g_config.Save();
     LogStep("new fence #" + std::to_string((int)g_config.fences.size() - 1) + " at " +
             std::to_string(x) + "," + std::to_string(y));
+}
+
+// 框选「创建盒子」：位置和尺寸都照抄用户画出来的那个蓝框。
+// 只有框小到装不下一列图标（还没算头部）时才补到最小可用尺寸 ——
+// 太小的话新盒子一出生就只看得见一条边，用户还得自己再拉一次。
+static void NewFenceInRect(RECT r) {
+    int w = (int)(r.right - r.left);
+    int h = (int)(r.bottom - r.top);
+    if (w < 180) w = 180;
+    if (h < 140) h = 140;
+
+    RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+    if (mon && GetMonitorInfoW(mon, &mi)) lim = mi.rcWork;
+
+    // 只做「别超出工作区」的夹取：用户框在哪就放哪，不再另找空位
+    // （画这个框本身就是明确的位置意图，挪走反而莫名其妙）
+    int x = (int)r.left;
+    int y = (int)r.top;
+    if (x + w > lim.right) x = (int)lim.right - w;
+    if (y + h > lim.bottom) y = (int)lim.bottom - h;
+    if (x < lim.left) x = (int)lim.left;
+    if (y < lim.top) y = (int)lim.top;
+
+    FenceConfig c;
+    c.x = x;
+    c.y = y;
+    c.w = w;
+    c.h = h;
+    c.title = L"新盒子";
+    InheritFenceStyle(c);
+    c.expandMode = g_config.defaultTelescope ? 0 : 1;
+    g_config.fences.push_back(c);
+    for (auto& f : g_fences)
+        if (f) f->RebindConfig();
+    AddFenceWindow((int)g_config.fences.size() - 1, false);   // 新建的盒子直接展开
+    g_config.Save();
+    LogStep("new fence #" + std::to_string((int)g_config.fences.size() - 1) +
+            " from marquee at " + std::to_string(x) + "," + std::to_string(y) + " " +
+            std::to_string(w) + "x" + std::to_string(h));
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,7 +1515,7 @@ static int CreateRuleFence(const std::wstring& title) {
     for (auto& f : g_fences)
         if (f) f->RebindConfig();   // 容器可能重分配，先把已有盒子重绑
     const int idx = (int)g_config.fences.size() - 1;
-    AddFenceWindow(idx);
+    AddFenceWindow(idx, false);   // 一键整理刚建出来的盒子直接展开
     LogStep("rule fence \"" + Narrow(title) + "\" #" + std::to_string(idx));
     return idx;
 }
@@ -1881,7 +1924,7 @@ static void MaybeHandOffToShell(POINT pt) {
 // ---------------------------------------------------------------------------
 // 盒子（动态增删：菜单里的「新建盒子」要能加）
 // ---------------------------------------------------------------------------
-static void AddFenceWindow(int i) {
+static void AddFenceWindow(int i, bool startCollapsed) {
     if (i < 0 || i >= (int)g_config.fences.size()) return;
     auto f = std::make_unique<FenceWindow>();
     const FenceConfig c = g_config.fences[i];
@@ -2038,6 +2081,7 @@ static void AddFenceWindow(int i) {
         RedrawAll();
     };
 
+    f->SetStartCollapsed(startCollapsed);
     if (!f->Create(i, c.x, c.y, c.w, c.h))
         LogStep("fence create FAILED " + std::to_string(i));
     // 即使创建失败也占位，保证 g_fences 下标 == 配置下标
@@ -2351,6 +2395,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_surface.SetShowLabels(g_config.showLabels != 0);
     g_surface.onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
     g_surface.onContextInvoked = [] { ReloadDesktopIcons(); };
+    // 空白处框选松手 → 在松手点弹一个只含「创建盒子」的菜单，点它就按这个框建。
+    // 和盒子右键菜单同一套自绘 PopupMenu，观感一致。
+    g_surface.onMarqueeMenu = [](const RECT& r, POINT sp) {
+        if (!g_fenceMenu.Create()) return;
+        g_fenceMenu.SetOwner(g_surface.hwnd());
+        g_fenceMenu.onCommand = [r](int id) {
+            if (id == kCmdFenceFromMarquee) NewFenceInRect(r);
+        };
+        std::vector<PopupMenuItem> items;
+        items.push_back(
+            PopupMenuItem(L"\u521b\u5efa\u76d2\u5b50", kCmdFenceFromMarquee));   // 创建盒子
+        g_fenceMenu.Show(sp, std::move(items));
+    };
     g_surface.overTarget = [](POINT pt) { return FenceIndexAt(pt) >= 0; };
     g_surface.onDragHover = [](POINT pt) {
         UpdateAllDropHints(pt);

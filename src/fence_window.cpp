@@ -3182,6 +3182,16 @@ bool FenceWindow::Create(int index, int x, int y, int w, int h) {
     curH_ = h;
     targetH_ = h;
 
+    // 伸缩模式的盒子在启动时本来就该是收着的：用户点箭头切到伸缩模式的那一刻它就收了，
+    // 这个状态存在 expandMode 里。以前创建时没落这个状态，得等鼠标滑过去再离开
+    // （WM_MOUSELEAVE）才收 —— 看起来像是「忘了收」。
+    // 窗口直接用收起高度建出来，避免先闪一帧展开态。
+    if (startCollapsed_ && expandMode() == 0) {
+        collapsed_ = true;
+        curH_ = kCollapsedHeadH;
+        targetH_ = kCollapsedHeadH;
+    }
+
     // 调试口子：MEOW_FLIP_MS=1200 可以把排序 flip 动画放慢，方便逐帧截图核对
     {
         wchar_t v[32]{};
@@ -3195,7 +3205,7 @@ bool FenceWindow::Create(int index, int x, int y, int w, int h) {
 
     hwnd_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                             kClass, L"meow-desk-fence", WS_POPUP,
-                            x, y, w, h, nullptr, nullptr, inst, this);
+                            x, y, width_, curH_, nullptr, nullptr, inst, this);
     if (!hwnd_) return false;
 
     EnsureBackbuffer(width_, curH_);

@@ -168,6 +168,10 @@ public:
     std::function<void(DesktopIconView*)> onOpen;
     // 右键菜单执行完（可能改名/删除了文件）→ 外部重新枚举
     std::function<void()> onContextInvoked;
+    // 框选（空白处按住左键拖出一个蓝框）松手后回调：screenRect 是框的屏幕矩形，
+    // screenPt 是松手点。外部据此弹菜单（「创建盒子」按这个矩形建）。
+    // 框太小（其实就是点了一下空白处）不会触发，免得单击桌面就蹦菜单。
+    std::function<void(const RECT& screenRect, POINT screenPt)> onMarqueeMenu;
     // 周期性心跳（约 500ms）
     std::function<void()> onTick;
     // 单例模式：第二个进程发现自己多余了，就把这条消息扔给已经在跑的这个实例

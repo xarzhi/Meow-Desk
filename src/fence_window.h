@@ -38,6 +38,12 @@ public:
     bool Create(int index, int x, int y, int w, int h);
     void Destroy();
 
+    // 创建时是否允许「一出生就是收起的」。
+    // 启动 / 重建盒子时传 true：伸缩模式（expandMode==0）的盒子本来就该收着，
+    // 否则要等鼠标滑过去再离开才收，看起来像忘了收。
+    // 刚新建的盒子传 false —— 用户刚建完就看见一条 4px 的线会以为没建成。
+    void SetStartCollapsed(bool on) { startCollapsed_ = on; }
+
     // g_config.fences 是 vector：新建盒子时 push_back 可能把元素搬到新地址，
     // 盒子手里指向自己那条配置的指针就悬空了。往容器里加过东西之后必须重绑一次。
     void RebindConfig() {
@@ -388,6 +394,7 @@ private:
     int curH_ = 0;
     int targetH_ = 0;
     bool collapsed_ = false;
+    bool startCollapsed_ = true;   // 见 SetStartCollapsed：创建时是否允许一出生就收起
     bool autoExpanded_ = false;   // 这次展开是「悬停自动展开」造成的
     // 刚用箭头手动收起时，光标还停在头部上；抑制一次自动展开，
     // 否则会「点了收起又立刻展开」，用户永远收不起来
