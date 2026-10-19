@@ -58,6 +58,10 @@ static DesktopSurface g_surface;
 static DragLayer g_drag;
 static std::vector<std::unique_ptr<FenceWindow>> g_fences;
 
+// 抓磨砂背景的那几毫秒里，被临时排除出抓屏的自家窗口（抓完立刻还原）。
+// 见盒子创建处注册的 SetCaptureExcluder。
+static std::vector<HWND> g_captureExcluded;
+
 static TrayIcon g_tray;
 static SettingsWindow g_settings;
 static SearchWindow g_search;
@@ -1079,9 +1083,23 @@ static bool BeginRenameIcon(HWND /*owner*/, const std::wstring& path) {
     const std::wstring oldPath = path;
     const int fi = e->owner;   // 图标在盒子里 → 改名期间占住那个盒子
     HoldFence(fi, true);
+    // 原标签不画了，让位给输入框（两者互斥，否则新旧两个名字会叠在一起）
+    for (auto* o : g_icons)
+        if (o) o->renaming = false;
+    e->renaming = true;
+    if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) g_fences[fi]->Redraw();
+    else g_surface.Redraw();
     RenameBox::ShowInPlace(
         lr, fileName, [oldPath](const std::wstring& name) { CommitRename(oldPath, name); },
-        RenameBox::Sel::Stem, [fi]() { HoldFence(fi, false); });
+        RenameBox::Sel::Stem, [fi]() {
+            HoldFence(fi, false);
+            // 注意：提交回调（CommitRename）可能刚把 g_icons 整个重建过，
+            // 这里绝对不能碰 ShowInPlace 之前存下来的那个 DesktopIconView 指针。
+            for (auto* o : g_icons)
+                if (o) o->renaming = false;
+            if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) g_fences[fi]->Redraw();
+            else g_surface.Redraw();
+        });
     LogStep("rename field open for " + Narrow(fileName));
     return true;
 }
@@ -2362,6 +2380,39 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (f->hwnd()) v.push_back(f->rect());
         }
         return v;
+    });
+
+    // 抓磨砂背景时，把「我们自己的窗口」暂时从抓屏里排除掉。
+    // 不排除的话：拖着 A 盒子经过 B 盒子，A 的磨砂里会出现 B 的鬼影（被抓进去了）；
+    // 桌面图标层同理（那一片图标会被糊进卡片里）。只处理跟抓取区域相交的窗口 ——
+    // 一次改十几个窗口的显示亲和性会让 DWM 重新合成，看起来像闪一下。
+    FenceWindow::SetCaptureExcluder([](const RECT& rc, bool exclude) {
+        if (!exclude) {
+            for (HWND h : g_captureExcluded) SetWindowDisplayAffinity(h, WDA_NONE);
+            g_captureExcluded.clear();
+            return;
+        }
+        g_captureExcluded.clear();
+        const DWORD me = GetCurrentProcessId();
+        struct Ctx {
+            const RECT* rc;
+            DWORD pid;
+        } ctx{&rc, me};
+        EnumWindows(
+            [](HWND h, LPARAM lp) -> BOOL {
+                auto* c = reinterpret_cast<Ctx*>(lp);
+                DWORD pid = 0;
+                GetWindowThreadProcessId(h, &pid);
+                if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
+                RECT r{};
+                if (!GetWindowRect(h, &r)) return TRUE;
+                if (r.right <= c->rc->left || c->rc->right <= r.left) return TRUE;
+                if (r.bottom <= c->rc->top || c->rc->bottom <= r.top) return TRUE;
+                if (SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE))
+                    g_captureExcluded.push_back(h);
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&ctx));
     });
     for (int i = 0; i < (int)g_config.fences.size(); ++i) AddFenceWindow(i);
     LogStep("fences created: " + std::to_string(g_fences.size()));

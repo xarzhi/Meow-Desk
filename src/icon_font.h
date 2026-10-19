@@ -28,13 +28,17 @@ class Graphics;
 }
 struct GdiplusColor;
 
-// 五个导航图标的码位（见 src/iconfont/iconfont.json）
+// 图标码位（见 src/iconfont/iconfont.json）
 namespace IconCode {
-constexpr wchar_t kGeneral = L'\ue632';   // 设置-常规设置
+// —— 设置页左侧导航 ——
+constexpr wchar_t kGeneral = L'\ue632';      // 设置-常规设置
 constexpr wchar_t kAppearance = L'\ue6b3';   // theme（外观）
 constexpr wchar_t kInteract = L'\ue629';     // 交互设计
 constexpr wchar_t kRules = L'\ue637';        // 整理箱（整理规则）
 constexpr wchar_t kAbout = L'\ue60b';        // 关于
+// —— 盒子头部 ——
+constexpr wchar_t kLock = L'\ue635';         // 锁定
+constexpr wchar_t kUnlock = L'\ue616';       // 解锁
 }  // namespace IconCode
 
 namespace IconFont {

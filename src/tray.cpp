@@ -145,7 +145,7 @@ bool TrayIcon::Create(HWND owner) {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = kCallbackMsg;
     nid.hIcon = MakeTrayIcon(32);
-    wcscpy_s(nid.szTip, L"meow-desk \u00b7 \u684c\u9762\u5206\u533a");
+    wcscpy_s(nid.szTip, L"Meow Desk \u00b7 \u684c\u9762\u5206\u533a");
     added_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
     if (nid.hIcon) DestroyIcon(nid.hIcon);
     return added_;

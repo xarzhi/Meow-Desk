@@ -1066,7 +1066,8 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging) {
                   reinterpret_cast<const BYTE*>(e->bmp.pixels.data()), iw, ih, ix, iy);
     }
 
-    if (e->name.empty() || !showLabels_) return;
+    // 正在原地改名：名字由那个输入框代替（见 DesktopIconView::renaming）
+    if (e->name.empty() || !showLabels_ || e->renaming) return;
 
     // 标题区按「两行」预留：平时只画一行（超出用省略号），单击选中后展开成两行。
     // 两行是硬上限 —— 再长的名字也只是两行 + 省略号，不会顶到下一排图标上去。
@@ -1321,7 +1322,8 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging) {
         }
     }
 
-    if (e->name.empty() || !showLabels_) return;
+    // 正在原地改名：名字由那个输入框代替（见 DesktopIconView::renaming）
+    if (e->name.empty() || !showLabels_ || e->renaming) return;
 
     // 同上：标题区两行预留，单行省略 / 选中展开
     const int lineH = IconLabelLineHeight();

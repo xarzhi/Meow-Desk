@@ -16,7 +16,9 @@
 #include "backdrop.h"
 #include "desktop_surface.h"
 #include "file_drop.h"
+#include "icon_font.h"
 #include "icon_render.h"
+#include "screen_util.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -25,10 +27,16 @@ using namespace Gdiplus;
 
 // 拖动避让的统一数据源（定义见头文件里的注释）
 std::function<std::vector<RECT>(const FenceWindow*)> FenceWindow::s_obstacleProvider;
+// 抓磨砂底图前，把自家窗口从抓屏里排除掉
+std::function<void(const RECT&, bool)> FenceWindow::s_captureExcluder;
 
 void FenceWindow::SetObstacleProvider(
     std::function<std::vector<RECT>(const FenceWindow*)> fn) {
     s_obstacleProvider = std::move(fn);
+}
+
+void FenceWindow::SetCaptureExcluder(std::function<void(const RECT&, bool)> fn) {
+    s_captureExcluder = std::move(fn);
 }
 
 namespace {
@@ -43,6 +51,68 @@ const int kColInset = 10;
 
 // 四条边/四角可以拖拽改大小的判定宽度
 const int kEdgeMargin = 6;
+
+// ---- 吸附（拖动位置 / 改尺寸共用）----
+// 吸附距离（像素）。太大就会「粘住」，太小又感觉不到
+constexpr int kSnapPx = 8;
+
+// 一维吸附：v 是盒子左边（上边），size 是宽（高）——
+// 我的左边贴候选线，或者我的右边贴候选线。
+int SnapAxis(int v, int size, const std::vector<int>& edges) {
+    int bestV = v;
+    int bestD = kSnapPx + 1;
+    for (int e : edges) {
+        int d = std::abs(v - e);
+        if (d < bestD) {
+            bestD = d;
+            bestV = e;
+        }
+        d = std::abs(v + size - e);
+        if (d < bestD) {
+            bestD = d;
+            bestV = e - size;
+        }
+    }
+    return bestD <= kSnapPx ? bestV : v;
+}
+
+// 单条边的吸附（改尺寸用：只挪一条边）
+int SnapEdge(int v, const std::vector<int>& edges) {
+    int best = v;
+    int bestD = kSnapPx + 1;
+    for (int c : edges) {
+        const int d = std::abs(v - c);
+        if (d < bestD) {
+            bestD = d;
+            best = c;
+        }
+    }
+    return bestD <= kSnapPx ? best : v;
+}
+
+// 候选吸附线：工作区的四条边 + 别的盒子的四条边。
+// 只收「另一个方向上挨得比较近」的盒子 —— 隔着半个屏幕的盒子不该抢吸附。
+void CollectSnapLines(const std::vector<RECT>& others, const RECT& wa, const RECT& want,
+                      std::vector<int>& xs, std::vector<int>& ys) {
+    xs.push_back((int)wa.left);
+    xs.push_back((int)wa.right);
+    ys.push_back((int)wa.top);
+    ys.push_back((int)wa.bottom);
+    for (const RECT& o : others) {
+        // 横向吸附：纵向要有点关系（相交，或者首尾接得近）
+        if ((int)o.bottom + kSnapPx >= (int)want.top &&
+            (int)o.top - kSnapPx <= (int)want.bottom) {
+            xs.push_back((int)o.left);
+            xs.push_back((int)o.right);
+        }
+        if ((int)o.right + kSnapPx >= (int)want.left &&
+            (int)o.left - kSnapPx <= (int)want.right) {
+            ys.push_back((int)o.top);
+            ys.push_back((int)o.bottom);
+        }
+    }
+}
+
 const UINT_PTR kAnimTimer = 2;
 // 「鼠标移入切分组」现在是一移上去就切（用户嫌 200ms 延迟明显），
 // 所以原来那个延迟定时器整个删掉了 —— 别再加回来。
@@ -463,6 +533,8 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
         resizeStartRect_ = dragStartRect_;
         resizeStartW_ = width_;
         resizeStartH_ = height_;
+        // 底图不在这里重抓：只是「按下」还没动，提前抓会让单击边缘也卡一下。
+        // 真正开始改尺寸时 ApplyResize → EnsureBackdropCover 会补一圈。
         SetCapture(h);
         return;
     }
@@ -495,25 +567,44 @@ void FenceWindow::ApplyResize(POINT screenPt) {
     if (e == Edge::T || e == Edge::TL || e == Edge::TR) t += dy;
     if (e == Edge::B || e == Edge::BL || e == Edge::BR) b += dy;
 
+    const bool moveL = (e == Edge::L || e == Edge::TL || e == Edge::BL);
+    const bool moveR = (e == Edge::R || e == Edge::TR || e == Edge::BR);
+    const bool moveT = (e == Edge::T || e == Edge::TL || e == Edge::TR);
+    const bool moveB = (e == Edge::B || e == Edge::BL || e == Edge::BR);
+
+    // 边缘吸附：改尺寸时也要能贴上别的盒子 / 屏幕边。
+    // 只吸「正在拖的那条边」，固定不动的那几条边不参与。
+    {
+        std::vector<RECT> others;
+        if (s_obstacleProvider) others = s_obstacleProvider(this);
+        std::vector<int> xs, ys;
+        const RECT self{l, t, r, b};
+        // 吸附线不收自己，但 s_obstacleProvider 已经排除自己了
+        CollectSnapLines(others, ScreenUtil::WorkAreaForRect(self), self, xs, ys);
+        if (moveL) l = SnapEdge(l, xs);
+        if (moveR) r = SnapEdge(r, xs);
+        if (moveT) t = SnapEdge(t, ys);
+        if (moveB) b = SnapEdge(b, ys);
+    }
+
     // 最小尺寸（从左/上拖时调的是 left/top）
     if (r - l < minW()) {
-        if (e == Edge::L || e == Edge::TL || e == Edge::BL) l = r - minW();
+        if (moveL) l = r - minW();
         else r = l + minW();
     }
     if (b - t < minH()) {
-        if (e == Edge::T || e == Edge::TL || e == Edge::TR) t = b - minH();
+        if (moveT) t = b - minH();
         else b = t + minH();
     }
 
-    // 不出屏幕
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-    if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) lim = mi.rcWork;
-    if (l < lim.left) { if (e == Edge::L || e == Edge::TL || e == Edge::BL) { l = lim.left; } }
-    if (t < lim.top) { if (e == Edge::T || e == Edge::TL || e == Edge::TR) { t = lim.top; } }
-    if (r > lim.right) { if (e == Edge::R || e == Edge::TR || e == Edge::BR) { r = lim.right; } }
-    if (b > lim.bottom) { if (e == Edge::B || e == Edge::BL || e == Edge::BR) { b = lim.bottom; } }
+    // 不出屏幕（多屏：按「矩形压在哪块屏上」取工作区，跨屏时是并集）
+    {
+        const RECT wa = ScreenUtil::WorkAreaForRect(RECT{l, t, r, b});
+        if (moveL && l < (int)wa.left) l = (int)wa.left;
+        if (moveT && t < (int)wa.top) t = (int)wa.top;
+        if (moveR && r > (int)wa.right) r = (int)wa.right;
+        if (moveB && b > (int)wa.bottom) b = (int)wa.bottom;
+    }
     if (r - l < minW()) r = l + minW();
     if (b - t < minH()) b = t + minH();
 
@@ -537,6 +628,10 @@ void FenceWindow::ApplyResize(POINT screenPt) {
         ClearDetailCache();
     }
     StopFlip();
+    // 改尺寸时盒子本身在长/缩，磨砂底图那一圈要跟着盖得住 ——
+    // 以前尺寸一变就对不上（要求 backdropW_ == bufW_），整块退回纯半透明，
+    // 看起来就是「拖大小的时候盒子变透明了」。
+    if (cfg_ && cfg_->acrylic) EnsureBackdropCover();
     Redraw();
 }
 
@@ -1195,154 +1290,55 @@ bool FenceWindow::HitTest(POINT screenPt) const {
 }
 
 // ---------------------------------------------------------------------------
-// 拖动夹取：分轴「扫掠」
+// 拖动定位：屏幕边硬夹 + 别的盒子「磁吸」
 //
-// 以前是「先算出这一帧想去哪，再按最小穿透量把他推回来」。那种写法有个致命问题：
-// 一帧跳几百像素时（机器忙，WM_MOUSEMOVE 会被合并），目标点已经在障碍另一侧，
-// 此时「最低穿透量的方向」恰好就是「从另一侧穿出去」，于是表现为盒子能穿过别的盒子、
-// 只有屏幕边这种硬夹取挡得住。
+// 历史：最早是「先算出这一帧想去哪、再按最小穿透量推回来」（一帧跳几百像素时
+// 会从另一侧穿出去）；后来改成「分轴扫掠 + 硬阻挡」（穿不过去了，但盒子成了墙，
+// 想把 A 挪到 B 的左边变成不可能完成的任务）。
 //
-// 扫掠的思路：只认「前进方向上、起点还没越过的那条边」，最多贴到那条边上。
-// 起点都已经越过的障碍一律不管 —— 那属于「本来就连在一起」的情况，强行推开会让
-// 盒子寸步难行，也会把「从重叠里拖出去」这个动作锁死。
+// 现在：屏幕边仍然硬夹（那是物理边界），**别的盒子只提供吸附线**。
+// 靠近到 kSnapPx 以内就把边缘贴上去（左边对左边、右边贴左边、右对右……），
+// 继续往那个方向拖超过阈值就自然脱离，可以任意越过其他盒子。
+//
+// 吸附线 / 阈值在文件开头的匿名命名空间里（改尺寸那边也要用）。
 // ---------------------------------------------------------------------------
-namespace {
-// 松手收尾时允许「推出去」的最大距离。超过这个值说明盒子跟别人本来就深度重叠
-// （老配置 / 手工改过数据库），硬推会让它在松手瞬间瞬移，不如原地不动。
-constexpr int kSnapOutMax = 48;
-}  // namespace
-
 void FenceWindow::ResolveDragMove(RECT from, int wantX, int wantY,
                                   int& outX, int& outY) const {
+    // from 只用来取尺寸：位置一律按「这一帧想去哪」算，不再依赖起点
     const int w = (int)(from.right - from.left);
     const int h = (int)(from.bottom - from.top);
-    const int fx = (int)from.left;
-    const int fy = (int)from.top;
     dbgWant_ = RECT{wantX, wantY, wantX + w, wantY + h};
 
-    // 1) 屏幕：用目标点所在显示器的工作区（避开任务栏）
-    POINT probe{wantX, wantY};
-    HMONITOR mon = MonitorFromPoint(probe, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    RECT wa{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-    if (mon && GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
-    const int limL = (int)wa.left;
-    const int limT = (int)wa.top;
-    const int limR = std::max(limL + w, (int)wa.right);
-    const int limB = std::max(limT + h, (int)wa.bottom);
-    wantX = std::clamp(wantX, limL, limR - w);
-    wantY = std::clamp(wantY, limT, limB - h);
+    // 1) 屏幕：按「矩形跟哪块屏重叠最多」选工作区（跨屏时是几块屏的并集）。
+    //    以前按左上角所在屏取，盒子往第二块屏拖时左上角还在旧屏上，
+    //    于是被旧屏的右边界夹住 —— 拖到交界处就过不去了。
+    RECT want{wantX, wantY, wantX + w, wantY + h};
+    const RECT wa = ScreenUtil::WorkAreaForRect(want);
+    want = ScreenUtil::ClampRect(want, wa);
+    wantX = (int)want.left;
+    wantY = (int)want.top;
+    want.right = wantX + w;
+    want.bottom = wantY + h;
 
-    // 2) 障碍：其他盒子的实时窗口矩形（统一转成 int，别让 LONG 混进来）
+    // 2) 别的盒子：只作为吸附参考线（不再是墙）
     std::vector<RECT> others;
     if (s_obstacleProvider) others = s_obstacleProvider(this);
     dbgObstacles_ = s_obstacleProvider ? (int)others.size() : -1;
 
-    if (others.empty()) {
-        outX = wantX;
-        outY = wantY;
-        dbgGot_ = POINT{outX, outY};
-        return;
+    if (!others.empty()) {
+        std::vector<int> xs, ys;
+        CollectSnapLines(others, wa, want, xs, ys);
+        wantX = SnapAxis(wantX, w, xs);
+        wantY = SnapAxis(wantY, h, ys);
+        // 吸附不能把盒子带出屏幕（工作区边缘本身也是吸附线，这一步是兜底）
+        wantX = std::clamp(wantX, (int)wa.left, std::max((int)wa.left, (int)wa.right - w));
+        wantY = std::clamp(wantY, (int)wa.top, std::max((int)wa.top, (int)wa.bottom - h));
     }
 
-    // 3) 横向能走到哪：curY 是这一趟假定的纵向位置（判断「纵向挨不挨着」用）
-    auto resolveX = [&](int curY) -> int {
-        if (wantX == fx) return fx;
-        int ox = wantX;
-        for (const RECT& o : others) {
-            const int ol = (int)o.left, orr = (int)o.right;
-            const int ot = (int)o.top, ob = (int)o.bottom;
-            if (curY + h <= ot || ob <= curY) continue;
-            if (wantX > fx) {                   // 往右：最多贴到障碍左边缘
-                if (ol >= fx + w) ox = std::min(ox, ol - w);
-            } else {                            // 往左：最多贴到障碍右边缘
-                if (orr <= fx) ox = std::max(ox, orr);
-            }
-        }
-        return std::clamp(ox, limL, limR - w);
-    };
-    // 4) 纵向同理，curX 是这一趟假定的横向位置
-    auto resolveY = [&](int curX) -> int {
-        if (wantY == fy) return fy;
-        int oy = wantY;
-        for (const RECT& o : others) {
-            const int ol = (int)o.left, orr = (int)o.right;
-            const int ot = (int)o.top, ob = (int)o.bottom;
-            if (curX + w <= ol || orr <= curX) continue;
-            if (wantY > fy) {                   // 往下：最多贴到障碍上边缘
-                if (ot >= fy + h) oy = std::min(oy, ot - h);
-            } else {                            // 往上：最多贴到障碍下边缘
-                if (ob <= fy) oy = std::max(oy, ob);
-            }
-        }
-        return std::clamp(oy, limT, limB - h);
-    };
-
-    // 两趟顺序各算一遍，取离目标更近的结果。
-    // 斜着沿障碍边缘拖时，先算哪一轴会决定「能不能拐过去」，只固定一种顺序会出现
-    // 「明明有路却卡住」的手感。两趟都很便宜，直接都算。
-    const int ax = resolveX(fy);
-    const int ay = resolveY(ax);
-    const int by = resolveY(fx);
-    const int bx = resolveX(by);
-    const long long dA = (long long)std::abs(ax - wantX) + std::abs(ay - wantY);
-    const long long dB = (long long)std::abs(bx - wantX) + std::abs(by - wantY);
-
-    outX = (dA <= dB) ? ax : bx;
-    outY = (dA <= dB) ? ay : by;
+    outX = wantX;
+    outY = wantY;
     dbgGot_ = POINT{outX, outY};
 }
-
-bool FenceWindow::SnapOutOfOverlap() {
-    if (!hwnd_ || !s_obstacleProvider) return false;
-    RECT r{};
-    GetWindowRect(hwnd_, &r);
-    const int w = r.right - r.left;
-    const int h = r.bottom - r.top;
-    const std::vector<RECT> others = s_obstacleProvider(this);
-    if (others.empty()) return false;
-
-    bool any = false;
-    for (int pass = 0; pass < 3; ++pass) {
-        bool hit = false;
-        for (const RECT& o : others) {
-            const RECT c{r.left, r.top, r.left + w, r.top + h};
-            if (c.right <= o.left || o.right <= c.left) continue;
-            if (c.bottom <= o.top || o.bottom <= c.top) continue;
-
-            const int pl = o.left - c.right;    // <= 0
-            const int pr = o.right - c.left;    // >= 0
-            const int pu = o.top - c.bottom;    // <= 0
-            const int pd = o.bottom - c.top;    // >= 0
-            int best = pl;
-            if (std::abs(pr) < std::abs(best)) best = pr;
-            if (std::abs(pu) < std::abs(best)) best = pu;
-            if (std::abs(pd) < std::abs(best)) best = pd;
-            if (std::abs(best) > kSnapOutMax) continue;   // 深重叠，不动
-            if (best == pl || best == pr) r.left += best;
-            else r.top += best;
-            hit = any = true;
-        }
-        if (!hit) break;
-    }
-    if (!any) return false;
-
-    // 推出去之后别再顶到屏幕外（一个 20px 的横向推挤就可能把贴着左边的盒子推到负坐标）
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-    if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) lim = mi.rcWork;
-    r.left = std::max((int)lim.left, std::min((int)r.left, (int)lim.right - w));
-    r.top = std::max((int)lim.top, std::min((int)r.top, (int)lim.bottom - h));
-
-    dragLastX_ = (int)r.left;
-    dragLastY_ = (int)r.top;
-    SetWindowPos(hwnd_, nullptr, (int)r.left, (int)r.top, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    return true;
-}
-
 
 std::wstring FenceWindow::DragDebug() const {
     return L"obstacles=" + std::to_wstring(dbgObstacles_) + L" want=(" +
@@ -1652,6 +1648,12 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                             dragLastY_ = ny;
                             SetWindowPos(h, nullptr, nx, ny, 0, 0,
                                          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                            // 窗口一动，位图里的底图也得按新偏移重画一遍，
+                            // 否则磨砂会「整块跟着窗口平移」（等于背景冻住了）。
+                            if (cfg_ && cfg_->acrylic) {
+                                EnsureBackdropCover();
+                                Redraw();
+                            }
                         }
                     }
                     return 0;
@@ -1840,9 +1842,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wasDragging) {
-            // 松手收尾只处理「本来就深度重叠」的老配置，而且只推很小的距离 ——
-            // 扫掠已经保证拖动过程不会产生新的重叠，这里再做大范围搬运只会让盒子瞬移。
-            SnapOutOfOverlap();
+            // 松手不再「把重叠的盒子推开」：以前那一步会让盒子在松开的一瞬间
+            // 跳一下（用户以为卡了）。现在拖动过程只吸附不阻挡，想叠就叠着，
+            // 位置完全由用户决定。
             if (onGeometryChanged) onGeometryChanged();
             Redraw();
             return 0;
@@ -1971,7 +1973,16 @@ void FenceWindow::EnsureBackbuffer(int w, int h) {
     }
 }
 
-void FenceWindow::RefreshBackdrop() {
+// pad：往四周多抓一圈。
+//
+// 为什么要多抓一圈：以前只在「创建 / 改设置」时抓一次，盒子一拖动，磨砂里
+// 的画面就冻在那儿不动（松开才跳一下）；改尺寸更糟 —— 缓冲变大了，
+// 底图尺寸对不上，整块直接退回「只有半透明底色」，看起来就是「变透明了」。
+//
+// 截下的这一圈存成 backdrop_，同时还记着抓的时候的屏幕坐标（backdropX_/Y_）。
+// 之后盒子在这个圈里怎么挪，绘制时按偏移「取子窗口」就行 —— 不用每帧重新
+// 抓屏 + 模糊（那一步是几十毫秒的量级，拖动时每帧做必然卡）。
+void FenceWindow::RefreshBackdrop(int pad) {
     backdrop_.clear();
     backdropW_ = backdropH_ = 0;
     if (!cfg_ || !cfg_->acrylic || !hwnd_) return;
@@ -1979,24 +1990,76 @@ void FenceWindow::RefreshBackdrop() {
     if (r.right <= r.left || r.bottom <= r.top) return;
 
     // 一律按「展开尺寸」抓：收起时只用到上面一段（行距仍是 width_，可直接裁）
-    const int w = width_;
-    const int h = height_ > 0 ? height_ : (r.bottom - r.top);
+    int w = width_ + pad * 2;
+    int h = (height_ > 0 ? height_ : (r.bottom - r.top)) + pad * 2;
+    int x = (int)r.left - pad;
+    int y = (int)r.top - pad;
 
-    // 抓屏兜底路径要把自己排除掉，避免"抓到上一帧的自己"形成回授
+    // 别抓到屏幕外：BitBlt 越界的那一圈会是黑的，模糊之后整块底图偏暗。
+    // 夹到虚拟桌面范围内（不是工作区 —— 盒子可能压到任务栏那一块）。
+    {
+        const RECT vs = ScreenUtil::VirtualScreen();
+        const int x0 = std::max(x, (int)vs.left);
+        const int y0 = std::max(y, (int)vs.top);
+        const int x1 = std::min(x + w, (int)vs.right);
+        const int y1 = std::min(y + h, (int)vs.bottom);
+        if (x1 - x0 < 16 || y1 - y0 < 16) {
+            backdrop_.clear();
+            return;
+        }
+        x = x0;
+        y = y0;
+        w = x1 - x0;
+        h = y1 - y0;
+    }
+
+    // 抓屏前把自己排除掉，避免"抓到上一帧的自己"形成回授；
+    // 顺便把别的自家窗口（其他盒子 / 桌面图标层）也排除，否则磨砂里会出现它们
+    // 的一团团鬼影 —— 拖动经过别的盒子时特别明显。
+    const bool hook = s_captureExcluder != nullptr;
+    if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, true);
     SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE);
     wchar_t mode[32]{};
     GetEnvironmentVariableW(L"MEOW_BACKDROP", mode, 32);
     const bool preferDesktop = _wcsicmp(mode, L"desktop") == 0;
-    const bool ok = CaptureBlurredBackdrop(r.left, r.top, w, h, 20, backdrop_, preferDesktop);
+    const bool ok = CaptureBlurredBackdrop(x, y, w, h, 20, backdrop_, preferDesktop);
     SetWindowDisplayAffinity(hwnd_, WDA_NONE);
+    if (hook) s_captureExcluder(RECT{x, y, x + w, y + h}, false);
     if (!ok) {
         backdrop_.clear();
         return;
     }
     backdropW_ = w;
     backdropH_ = h;
-    backdropX_ = r.left;
-    backdropY_ = r.top;
+    backdropX_ = x;
+    backdropY_ = y;
+    backdropCoverT_ = GetTickCount();
+}
+
+// 拖动 / 改尺寸期间：底图盖不住当前矩形了就补抓一圈。
+//
+// 限频 70ms：抓屏 + 模糊是最贵的一步（几百 k 像素），每帧做会让拖动变成幻灯片。
+// 正常情况下开头抓的那一圈够用很久（挪出圈外才需要补），所以这条路径很少走到。
+void FenceWindow::EnsureBackdropCover() {
+    if (!cfg_ || !cfg_->acrylic || !hwnd_ || backdrop_.empty()) return;
+    RECT r = rect();
+    const int needW = width_ > 0 ? width_ : (int)(r.right - r.left);
+    const int needH = height_ > 0 ? height_ : (int)(r.bottom - r.top);
+    const int sx = (int)r.left - backdropX_;
+    const int sy = (int)r.top - backdropY_;
+    const bool covered = sx >= 0 && sy >= 0 && sx + needW <= backdropW_ &&
+                         sy + needH <= backdropH_;
+    if (covered) return;
+    // 比屏幕还大 / 坐标跑到虚拟桌面外的老配置：永远补不全，别每 70ms 抓一次屏
+    {
+        const RECT vs = ScreenUtil::VirtualScreen();
+        if (needW + 4 > (int)(vs.right - vs.left) || needH + 4 > (int)(vs.bottom - vs.top))
+            return;
+    }
+    const DWORD now = GetTickCount();
+    if (now - backdropCoverT_ < 70) return;
+    backdropCoverT_ = now;
+    RefreshBackdrop(128);
 }
 
 void FenceWindow::Paint() {
@@ -2019,9 +2082,17 @@ void FenceWindow::Paint() {
     const bool light = IsLight(base);
 
     const BYTE r = GetRValue(base), g = GetGValue(base), b = GetBValue(base);
-    const bool hasBackdrop =
-        cfg_->acrylic && backdropW_ == bufW_ && backdropH_ >= bufH_ &&
-        backdrop_.size() >= (size_t)bufW_ * (size_t)bufH_ * 4;
+
+    // 底图不必和缓冲等大：拖动 / 改尺寸时抓的是一圈更大的区域，这里按
+    // 「当前窗口相对抓取原点」的偏移取子矩形。尺寸对不上不再等于「没有底图」——
+    // 以前正是这条要求让改尺寸的整个过程都退回纯半透明（看着像变透明了）。
+    RECT cur{};
+    if (hwnd_) GetWindowRect(hwnd_, &cur);
+    const int bsx = (int)cur.left - backdropX_;   // 底图里对应的左上角
+    const int bsy = (int)cur.top - backdropY_;
+    const bool hasBackdrop = cfg_->acrylic && !backdrop_.empty() && backdropW_ > 0 &&
+                             backdropH_ > 0 &&
+                             backdrop_.size() >= (size_t)backdropW_ * (size_t)backdropH_ * 4;
 
     {
         Bitmap target(bufW_, bufH_, bufW_ * 4, PixelFormat32bppPARGB,
@@ -2037,11 +2108,22 @@ void FenceWindow::Paint() {
 
         // ---- 卡片底 ----
         if (hasBackdrop) {
-            // 亚克力：模糊壁纸打底 + 半透明着色，整体不透明
-            Bitmap blur(bufW_, bufH_, bufW_ * 4, PixelFormat32bppPARGB, backdrop_.data());
-            gfx.SetClip(&shape);
-            gfx.DrawImage(&blur, Rect(0, 0, bufW_, bufH_));
-            gfx.ResetClip();
+            // 亚克力：模糊壁纸打底 + 半透明着色，整体不透明。
+            // 底图只覆盖「抓取时那一圈」，窗口挪到圈外时超出部分就只剩着色 ——
+            // 此时 EnsureBackdropCover 会补抓（限频），所以露出来的机会不多。
+            Bitmap blur(backdropW_, backdropH_, backdropW_ * 4, PixelFormat32bppPARGB,
+                        backdrop_.data());
+            int dx = std::max(0, -bsx);          // 目标里第一块有效像素
+            int dy = std::max(0, -bsy);
+            int cx = std::max(0, bsx);           // 底图里对应的起点
+            int cy = std::max(0, bsy);
+            const int cw = std::min(bufW_ - dx, backdropW_ - cx);
+            const int chh = std::min(bufH_ - dy, backdropH_ - cy);
+            if (cw > 0 && chh > 0) {
+                gfx.SetClip(&shape);
+                gfx.DrawImage(&blur, Rect(dx, dy, cw, chh), cx, cy, cw, chh, UnitPixel);
+                gfx.ResetClip();
+            }
             SolidBrush tint{Color((BYTE)std::min(255, (int)(alpha * 0.58)), r, g, b)};
             gfx.FillPath(&tint, &shape);
         } else {
@@ -2166,6 +2248,13 @@ void FenceWindow::Paint() {
             const bool on = locked();
             const Color lc = on ? Color(255, 0, 120, 215)
                                 : (light ? Color(130, 96, 96, 102) : Color(140, 210, 210, 216));
+            // 优先用图标字体里的「锁定 / 解锁」（iconfont：e635 / e616）：
+            // 手搓的挂锁在 18px 里能表达的状态差异很有限（只有锁梁抬不抬起来），
+            // 图标字体的解锁是另一张图，一眼就能分清。
+            if (IconFont::Ready()) {
+                IconFont::Draw(gfx, on ? IconCode::kLock : IconCode::kUnlock, cx, cy, 15.0f,
+                               lc.GetValue());
+            } else {
             // 锁体：宽 11、高 9，底边贴着 cy+5
             const RectF body(cx - 5.5f, cy - 1.0f, 11.0f, 9.0f);
             GraphicsPath bp;
@@ -2184,6 +2273,7 @@ void FenceWindow::Paint() {
             } else {
                 Pen pen(lc, 1.3f);
                 gfx.DrawPath(&pen, &bp);
+            }
             }
         }
 
@@ -2389,7 +2479,8 @@ void FenceWindow::Paint() {
                              iconX, iconY, ga, gd);
             }
 
-            if (e->name.empty()) continue;
+            // 正在原地改名：名字由输入框代替（见 DesktopIconView::renaming）
+            if (e->name.empty() || e->renaming) continue;
 
             // 和桌面图标标题保持一致：白字 + 柔和黑光晕，光晕受「文字阴影」开关控制
             if (detailMode) {

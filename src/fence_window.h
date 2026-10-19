@@ -65,6 +65,14 @@ public:
     // 传 this 进来排除自己，永远不会错。
     static void SetObstacleProvider(std::function<std::vector<RECT>(const FenceWindow*)> fn);
 
+    // 抓磨砂底图时，让「我们自己的窗口」暂时从抓屏里消失。
+    //
+    // 不这么做的话，拖着盒子经过别的盒子时，磨砂里会出现那块盒子的一团鬼影
+    // （被抓屏抓进去了）；桌面图标层同理。参数 rect 是这次要抓的区域，
+    // 实现方只需要处理跟它相交的窗口 —— 一次改十几个窗口的显示亲和性会让
+    // DWM 重新合成，看起来像闪一下。
+    static void SetCaptureExcluder(std::function<void(const RECT& rect, bool exclude)> fn);
+
     // 屏幕坐标是否落在盒子矩形内（含收起后的头部）
     bool HitTest(POINT screenPt) const;
 
@@ -184,7 +192,11 @@ private:
     void EnsureBackbuffer(int w, int h);
     void Paint();
     void Present();
-    void RefreshBackdrop();
+    // pad > 0：多抓一圈（拖动/改尺寸期间用）。之后盒子在这个圈里挪动时，
+    // 底图直接按偏移「取子窗口」就够了 —— 不用每帧重新抓屏+模糊。
+    void RefreshBackdrop(int pad = 0);
+    // 底图还盖得住当前矩形吗？盖不住就（限频）重抓一圈
+    void EnsureBackdropCover();
 
     void Collect(std::vector<DesktopIconView*>& out) const;
     // 实际参与布局/绘制的图标（排除正在被拖出的那个）
@@ -286,18 +298,12 @@ private:
     int minW() const;
     int minH() const;
 
-    // 拖动位置夹取：把盒子从 from 往 (wantX,wantY) 推，遇到屏幕边 / 别的盒子就停。
+    // 拖动位置夹取：只跟「屏幕」硬夹（屏幕边必须挡住），别的盒子不再是墙 ——
+    // 靠得够近就把边缘吸过去（磁吸），再用力就能从它上面拖过去。
     //
-    // 这里必须是「扫掠」而不是「先算出目标再推开」：
-    // 一帧跳几百像素时，目标点已经在障碍另一侧，「最低穿透量的方向」恰好是穿出去，
-    // 于是看起来只有屏幕边挡得住。扫掠只认「前进方向上、起点还没越过的那条边」，
-    // 物理上不可能跨过去。
+    // 以前这里是「扫掠 + 硬阻挡」：盒子永远无法越过另一个盒子，想把两个盒子
+    // 换个左右位置得先绕一大圈。现在改成吸附，越过别的盒子变成一次普通拖动。
     void ResolveDragMove(RECT from, int wantX, int wantY, int& outX, int& outY) const;
-
-    // 松手后收尾：只处理「起点就重叠」的老配置，推出去的距离超过
-    // kSnapOutMax 就不动（宁可留着重叠，也不能让盒子在松手瞬间瞬移）。
-    // 返回是否真的移动了。
-    bool SnapOutOfOverlap();
 
     LabelDib* LabelOf(DesktopIconView* e, int boxW, int boxH, int glow, int maxLines);
     HWND hwnd_ = nullptr;
@@ -322,6 +328,7 @@ private:
 
     std::vector<DesktopIconView*>* all_ = nullptr;
     static std::function<std::vector<RECT>(const FenceWindow*)> s_obstacleProvider;
+    static std::function<void(const RECT&, bool)> s_captureExcluder;
     // 拖动夹取的最后一次实况（只给 DragDebug 用）
     mutable int dbgObstacles_ = -1;
     mutable RECT dbgWant_{};
@@ -341,6 +348,8 @@ private:
     std::vector<uint8_t> backdrop_;
     int backdropW_ = 0, backdropH_ = 0;   // 抓取时的尺寸（总是展开尺寸）
     int backdropX_ = 0, backdropY_ = 0;
+    // 上一次「因为盖不住而重新抓」的时刻（限频用；拖动时每帧抓一次会卡）
+    DWORD backdropCoverT_ = 0;
 
     DropHint drop_;
 

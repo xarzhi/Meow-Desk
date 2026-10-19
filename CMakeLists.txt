@@ -25,6 +25,7 @@ add_executable(meow-desk WIN32
     src/storage.cpp
     src/zorder.cpp
     src/tray.cpp
+    src/screen_util.cpp
     src/settings_window.cpp
     src/search_window.cpp
     src/popup_menu.cpp

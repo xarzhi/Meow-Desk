@@ -26,8 +26,6 @@ const int kShadow = 10;   // 阴影留白：客户区比输入格每边大这么
 const int kRound = 4;     // 圆角（贴着图标，比卡片小一号）
 const int kPadX = 6;      // 输入格左右内缩：EDIT 比底槽窄，字不贴边框
 const int kPadY = 3;      // 输入格上下内边距
-const int kMinW = 72;     // 再窄就没法打字了
-const int kMaxW = 320;    // 长名字最多撑这么宽，别盖住旁边的图标
 
 // 「焦点跑掉了没有」的延迟检查（见 EditProc 的 WM_KILLFOCUS）
 const UINT kMsgCheckFocus = WM_APP + 12;
@@ -114,16 +112,8 @@ HFONT FieldFont() {
     return cached;
 }
 
-int MeasureTextW(const std::wstring& s) {
-    HDC dc = CreateCompatibleDC(nullptr);
-    if (!dc) return 80;
-    HGDIOBJ of = SelectObject(dc, FieldFont());
-    SIZE sz{};
-    GetTextExtentPoint32W(dc, s.c_str(), (int)s.size(), &sz);
-    SelectObject(dc, of);
-    DeleteDC(dc);
-    return (int)sz.cx;
-}
+// （原来这里有个 MeasureTextW：靠量文字宽来决定输入框多宽。现在输入框宽度恒等于
+//  图标名那一格的宽度，不再需要量文字了。）
 
 // ---------------------------------------------------------------------------
 // 配色：和确认框 / 弹出菜单 / 盒子同一套，切深色主题时不出戏
@@ -167,24 +157,21 @@ void AddRoundRect(GraphicsPath& p, const RectF& r, float rad) {
 // 布局
 // ---------------------------------------------------------------------------
 void Layout(const RECT& target, const std::wstring& name) {
+    (void)name;   // 不再按名字长短改尺寸：输入框永远和名字那一格一样宽、一行高
     g_lineH = IconLabelLineHeight();
     g_editH = g_lineH + 2;
 
-    const int targetH = (int)(target.bottom - target.top);
     const int targetW = (int)(target.right - target.left);
 
-    // 高度只取「这个名字真的要占几行」：
-    //   · 名字量出来比标签盒还宽 → 标签会折成两行，输入框也得占两行，
-    //     否则选中态展开的第二行会从输入框底下露出来；
-    //   · 名字短、一行放得下 → 就算标签盒预留了两行，也只给一行高的输入框
-    //     （否则一个三个字的名字顶着一个两行高的大框，很怪）。
-    const int textW = MeasureTextW(name);
-    const bool wraps = textW > targetW - 2;
-    g_textH = (wraps && targetH >= g_lineH * 2 - 2) ? g_lineH * 2 : g_lineH;
+    // 高度恒为一行：改名时原标签是不画的（DesktopIconView::renaming），
+    // 所以不用再考虑「两行高的大框」或者「第二行从框下面露出来」。
+    g_textH = g_lineH;
 
-    // 宽度：至少盖住原来的名字，长名字可以再宽一点（最多 kMaxW）
-    int want = std::max(targetW, textW + kPadX * 2 + 8);
-    g_fieldW = std::max(kMinW, std::min(want, kMaxW));
+    // 宽度 = 图标名的文字盒宽度，**不超过它**。
+    // 以前是 max(标签宽, 文字宽+边距) 再夹到 320：长名字会把输入框撑到盖住
+    // 旁边两个图标，用户看不出自己在改哪一个。现在输入框永远和名字一样宽，
+    // 名字太长就在框里横向滚动（ES_AUTOHSCROLL，和资源管理器一致）。
+    g_fieldW = std::max(24, targetW);
     g_fieldH = g_textH + kPadY * 2;
 
     g_bufW = g_fieldW + kShadow * 2;
@@ -192,9 +179,13 @@ void Layout(const RECT& target, const std::wstring& name) {
 
     g_rcField = RECT{kShadow, kShadow, kShadow + g_fieldW, kShadow + g_fieldH};
 
-    // EDIT 只有一行高，摆在第一行文字的位置上（不是输入格正中）：
-    // 标签允许两行时，输入格是两行高，但光标得停在原来那行字上。
-    const int innerTop = kPadY + std::max(0, (targetH - g_textH) / 2);
+    // EDIT 永远压在第一行文字上：标签是从文字区顶部开始排的（DrawText 的 DT_TOP），
+    // 名字折成两行时输入框也不该跟着往下挪半行 —— 光标要停在原来那行字上。
+    //
+    // 为什么是 kPadY - 1：单行 EDIT 会把文字在自己的客户高度里居中，
+    // EDIT 比行高高 2px（免得降部被切）→ 文字顶部下移 1px，这里先扣掉这 1px，
+    // 最终文字行顶正好落在 fieldTop + kPadY 上，和标签的墨迹对齐。
+    const int innerTop = kPadY - 1;
     g_rcEdit = RECT{kShadow + kPadX, kShadow + innerTop, kShadow + g_fieldW - kPadX,
                     kShadow + innerTop + g_editH};
 }
@@ -463,10 +454,14 @@ void ShowInPlace(const RECT& rect, const std::wstring& currentName,
         return;
     }
 
-    // 摆位：水平居中于目标矩形，上沿对齐第一行文字；夹进所在显示器的工作区
-    const int targetH = (int)(rect.bottom - rect.top);
-    int x = (int)rect.left + ((int)(rect.right - rect.left) - g_fieldW) / 2;
-    int y = (int)rect.top + std::max(0, (targetH - g_textH) / 2) - kPadY;
+    // 摆位：输入格**正好盖住名字那一块**（宽 = 图标名的文字盒宽），
+    // 左边贴 rect 左边、上边比第一行字高 kPadY（格子自己有 kPadY 内边距），
+    // 再往上让出 kShadow 的阴影留白。
+    //
+    // 以前漏了 kShadow：位图里格子是从 kShadow 处开始的，而窗口是按格子位置摆的，
+    // 于是整个输入框比名字低了 10px —— 就是用户说的「有点偏下」。
+    int x = (int)rect.left - kShadow;
+    int y = (int)rect.top - kPadY - kShadow;
 
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);

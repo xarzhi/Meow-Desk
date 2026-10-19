@@ -40,6 +40,10 @@ struct DesktopIconView {
     int group = 0;           // 所属分组（盒子内标签页下标，owner >= 0 时有效）
     bool selected = false;   // 选中
     bool hover = false;      // 鼠标悬停（画一层半透明底）
+    // 正在原地改名：名字由输入框代替，这一格不再画标题。
+    // 输入框的底色已经盖住文字区，但它只占一行高；名字折行时第二行会从框下面
+    // 露出来 —— 看起来像「新旧两个名字叠在一起」。留个开关直接不画最干净。
+    bool renaming = false;
     void* pidl = nullptr;    // 资源管理器的 PIDL（写回位置用），由调用方持有
 
     bool OnDesktop() const { return owner < 0; }

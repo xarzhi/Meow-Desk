@@ -15,6 +15,7 @@
 #include "app_icon.h"
 #include "icon_font.h"
 #include "icon_render.h"
+#include "screen_util.h"
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -172,8 +173,11 @@ LRESULT CALLBACK SettingsWindow::WndProcStatic(HWND h, UINT m, WPARAM w, LPARAM 
 // ---------------------------------------------------------------------------
 void SettingsWindow::Layout() {
     // 导航
+    // 顶部的「设置 / meow-desk」那两行标题删掉了，导航项跟着上移，
+    // 第一项和右侧页面标题（y=26）对齐，不然上面会空一大块。
+    const int kNavTop = 26;
     for (int i = 0; i < 5; ++i) {
-        rcNav_[i] = RECT{12, 104 + i * 48, kNavW - 12, 104 + i * 48 + 42};
+        rcNav_[i] = RECT{12, kNavTop + i * 48, kNavW - 12, kNavTop + i * 48 + 42};
     }
 
     // ---- 常规页 ----
@@ -322,8 +326,6 @@ void SettingsWindow::PaintNav(Graphics& g, const SettingsTheme& t) {
     g.FillRectangle(&navBg, Rect(0, 0, kNavW, kClientH));
 
     FontFamily family(L"Microsoft YaHei UI");
-    Font fTitle(&family, 22.0f, FontStyleBold, UnitPixel);
-    Font fSub(&family, 12.0f, FontStyleRegular, UnitPixel);
     Font fItem(&family, 14.0f, FontStyleRegular, UnitPixel);
 
     StringFormat sf;
@@ -333,10 +335,8 @@ void SettingsWindow::PaintNav(Graphics& g, const SettingsTheme& t) {
     SolidBrush brText(C(t.text));
     SolidBrush brSub(C(t.sub));
 
-    g.DrawString(L"\u8bbe\u7f6e", -1, &fTitle, RectF(24.0f, 26.0f, 160.0f, 32.0f), &sf,
-                 &brText);
-    g.DrawString(L"meow-desk", -1, &fSub, RectF(26.0f, 60.0f, 160.0f, 18.0f), &sf, &brSub);
-
+    // 导航上方原本有「设置 / meow-desk」两行标题，已按用户要求删掉：
+    // 窗口标题栏已经写着程序名，导航自己不需要再报一遍名字。
     for (int i = 0; i < 5; ++i) {
         const RECT& r = rcNav_[i];
         const bool sel = ((int)page_ == i);
@@ -754,7 +754,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
     case Page::About: {
         g.DrawString(L"\u5173\u4e8e", -1, &fPage, RectF((float)kContentX, 26.0f, 300.0f, 30.0f),
                      &sf, &brText);
-        g.DrawString(L"meow-desk \u00b7 \u8f7b\u91cf\u684c\u9762\u5206\u533a\u5de5\u5177", -1,
+        g.DrawString(L"Meow Desk \u00b7 \u8f7b\u91cf\u684c\u9762\u5206\u533a\u5de5\u5177", -1,
                      &fSub, RectF((float)kContentX + 2, 56.0f, 460.0f, 18.0f), &sf, &brSub);
 
         const int c1 = 100;
@@ -774,7 +774,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
             g.SetInterpolationMode(old);
         }
 
-        g.DrawString(L"meow-desk", -1, &fSection,
+        g.DrawString(L"Meow Desk", -1, &fSection,
                      RectF((float)textX, (float)c1 + 18.0f, 300.0f, 24.0f), &sf, &brText);
 
         Font fAbout(&family, 12.5f, FontStyleRegular, UnitPixel);
@@ -1431,10 +1431,12 @@ bool SettingsWindow::Create(HWND owner) {
     const int w = wr.right - wr.left;
     const int h = wr.bottom - wr.top;
 
-    int sx = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
-    int sy = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+    // 居中到「光标所在的那块屏」：以前用主屏尺寸算，副屏上点开会跑到主屏去
+    const RECT wa = ScreenUtil::WorkAreaForCursor();
+    int sx = (int)wa.left + ((int)(wa.right - wa.left) - w) / 2;
+    int sy = (int)wa.top + ((int)(wa.bottom - wa.top) - h) / 2;
 
-    hwnd_ = CreateWindowExW(WS_EX_APPWINDOW, kClass, L"meow-desk \u8bbe\u7f6e",
+    hwnd_ = CreateWindowExW(WS_EX_APPWINDOW, kClass, L"Meow Desk \u8bbe\u7f6e",
                             kStyle,
                             sx, sy, w, h, owner, nullptr, inst, this);
     if (!hwnd_) return false;
