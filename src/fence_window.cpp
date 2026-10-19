@@ -99,8 +99,11 @@ bool LooksLikeSameBackdrop(const std::vector<uint8_t>& a, const std::vector<uint
 void UpscaleBackdrop(BYTE* dst, int dstW, int dstH, const BYTE* src, int srcW,
                      int srcH, int sx0, int sy0, int scale) {
     if (!dst || !src || srcW <= 0 || srcH <= 0) return;
-    const int spanW = (srcW - 1) * scale;   // 最后一个源像素覆盖到的屏幕坐标
-    const int spanH = (srcH - 1) * scale;
+    // 源像素 i 覆盖屏幕 [i*scale, (i+1)*scale)，所以最后一个有效屏幕坐标是
+    // srcW*scale-1。以前写成 (srcW-1)*scale，白白把最后 scale-1 像素也夹回上一列 ——
+    // 1/4 缩放时那是 3 个像素宽的边缘重复，虽然糊过看不出来，但没必要。
+    const int spanW = srcW * scale - 1;
+    const int spanH = srcH * scale - 1;
     for (int y = 0; y < dstH; ++y) {
         int qy = sy0 + y;
         if (qy < 0) qy = 0;
@@ -670,6 +673,8 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     const Edge e = HitEdgeForPress(pt);
     if (e != Edge::None) {
         resizing_ = true;
+        // 从这一刻起整屏帧泵停手：接下来每一帧都要跟手，不能让 BitBlt 抢 GDI 锁
+        SetBackdropFramePaused(true);
         resizeCaptured_ = false;   // 第一次真正拉动时才抓底图（见 ApplyResize）
         resizeEdge_ = e;
         resizeStartRect_ = dragStartRect_;
@@ -1904,6 +1909,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if ((pressHeader_ || pressArrow_) && !itemDragging_) {
                 if (!dragging_ && (std::abs(dx) > 2 || std::abs(dy) > 2)) {
                     dragging_ = true;
+                    // 整屏帧泵停手：拖动是唯一「每帧都要跟手」的时刻。
+                    // 底图不会因此变旧 —— 拖动中照样能从已经抓好的一帧里重裁。
+                    SetBackdropFramePaused(true);
                     // 从这一刻起按「每帧鼠标位移」跟手，而不是「按下点 + 总位移」。
                     // 用总位移的话，被夹住的那段距离会一直欠着 —— 鼠标得原路
                     // 退回被夹住的距离盒子才重新动，拖到边上就像卡死了。
@@ -2153,6 +2161,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         pressHeader_ = false;
         pressBody_ = false;
         marquee_ = false;
+        // 松手：帧泵恢复。放在最前面、且不依赖 wasDragging —— 只有一处「开始」，
+        // 却有好几条「结束」分支，任何一个提前 return 漏掉都会让磨砂永远冻住。
+        SetBackdropFramePaused(false);
         // 按下时抓的那张暂存图到此为止：拖动的话已经在 mousemove 里换上了，
         // 没拖的话（点标签 / 点空白 / 点一下头部）就是白抓，直接丢掉释放内存。
         DropPreBackdrop();
@@ -2163,8 +2174,14 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         if (wasResizing) {
-            // 拉完了：现在盒子不动了，可以补抓一张真正对得上的底图
-            if (cfg_ && cfg_->acrylic) RequestBackdropAsync(0);
+            // 拉完了：盒子不动了，补一张真正对得上的底图。
+            // 有共享帧就是一次 memcpy（亚毫秒），没有才退回后台抓。
+            if (cfg_ && cfg_->acrylic) {
+                if (CurrentBackdropFrame())
+                    CropBackdropFromFrame(0, true);
+                else
+                    RequestBackdropAsync(0);
+            }
             if (onGeometryChanged) onGeometryChanged();
             Redraw();
             return 0;
@@ -2174,9 +2191,15 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             // 跳一下（用户以为卡了）。现在拖动过程只吸附不阻挡，想叠就叠着，
             // 位置完全由用户决定。
             //
-            // 拖完补一张贴合的底图：拖动全程用的是开局那一圈（为了不卡），
-            // 挪得远的话画面和真实壁纸已经对不上了，这里一次性校正。
-            if (cfg_ && cfg_->acrylic) RequestBackdropAsync(0);
+            // 拖完校正底图：拖动期间帧泵是停着的（为了跟手），帧可能已经旧了，
+            // 但至少能从它里面裁一块和当前位置对齐的（以前是让整块磨砂平移）。
+            // 松手后帧泵立刻恢复，150ms 内会送来新的一帧。
+            if (cfg_ && cfg_->acrylic) {
+                if (CurrentBackdropFrame())
+                    CropBackdropFromFrame(0, true);
+                else
+                    RequestBackdropAsync(0);
+            }
             if (onGeometryChanged) onGeometryChanged();
             Redraw();
             return 0;
@@ -2393,6 +2416,47 @@ void FenceWindow::RefreshBackdrop(int pad, bool defer) {
         h = y1 - y0;
     }
 
+    // ---- 优先从共享整屏帧里裁一块 ----
+    //
+    // 整屏那一帧由后台线程按 150ms 一直在更新，这里只是把盒子那块 memcpy 出来：
+    // 亚毫秒级、不 BitBlt、不抢 win32k 的 GDI 锁。
+    // 以前这个函数是**同步抓屏**，而它会在「按下开始拖动 / 开始改尺寸 / 换壁纸 /
+    // 改设置」时被调到 —— UI 线程每次停 7~9ms，那就是按下去黏一下的来源。
+    {
+        const RECT want{x, y, x + w, y + h};
+        std::vector<uint8_t> px;
+        RECT cov{};
+        auto f = CurrentBackdropFrame();
+        if (f && CropBackdropFrame(*f, want, px, cov)) {
+            const int s = f->scale > 0 ? f->scale : kBackdropScale;
+            const int nw = (int)(cov.right - cov.left);
+            const int nh = (int)(cov.bottom - cov.top);
+            bdFrameSerial_ = f->serial;
+            if (defer) {
+                // 「按下只抓不换」的语义照旧：点一下分组标签不该让背景跳一下
+                bdPre_ = std::move(px);
+                bdPreW_ = nw;
+                bdPreH_ = nh;
+                bdPreX_ = (int)cov.left;
+                bdPreY_ = (int)cov.top;
+                bdPreScale_ = s;
+                bdPreValid_ = true;
+                return;
+            }
+            bdPlainArea_ = NearlyUniform(px, (nw + s - 1) / s, (nh + s - 1) / s);
+            bdPreValid_ = false;
+            std::vector<uint8_t>().swap(bdPre_);
+            backdrop_.swap(px);
+            backdropScale_ = s;
+            backdropW_ = nw;
+            backdropH_ = nh;
+            backdropX_ = (int)cov.left;
+            backdropY_ = (int)cov.top;
+            backdropCoverT_ = GetTickCount();
+            return;
+        }
+    }
+
     wchar_t mode[32]{};
     GetEnvironmentVariableW(L"MEOW_BACKDROP", mode, 32);
     const bool preferDesktop = _wcsicmp(mode, L"desktop") == 0;
@@ -2434,10 +2498,12 @@ void FenceWindow::RefreshBackdrop(int pad, bool defer) {
         bdPreH_ = h;
         bdPreX_ = x;
         bdPreY_ = y;
+        bdPreScale_ = kBackdropScale;
         bdPreValid_ = true;
         return;
     }
     backdrop_.swap(px);
+    backdropScale_ = kBackdropScale;
     backdropW_ = w;
     backdropH_ = h;
     backdropX_ = x;
@@ -2450,6 +2516,7 @@ void FenceWindow::RefreshBackdrop(int pad, bool defer) {
 void FenceWindow::ApplyPreBackdrop() {
     if (!bdPreValid_) return;
     backdrop_.swap(bdPre_);
+    backdropScale_ = bdPreScale_;
     backdropW_ = bdPreW_;
     backdropH_ = bdPreH_;
     backdropX_ = bdPreX_;
@@ -2486,6 +2553,54 @@ void FenceWindow::RequestBackdropAsync(int pad) {
     if (bdJob_ && hwnd_) SetTimer(hwnd_, kAnimTimer, 16, nullptr);
 }
 
+// 从「当前这一帧」裁一块当底图（见 fence_window.h 的注释）。
+//
+// 这一版的核心：**底图不再各自抓屏**。整屏帧由 backdrop.cpp 的泵线程按
+// 150ms 抓一次并模糊好，盒子只是把它那块 memcpy 出来 —— 纯内存、亚毫秒。
+bool FenceWindow::CropBackdropFromFrame(int pad, bool force) {
+    if (!cfg_ || !cfg_->acrylic || !hwnd_) return false;
+    auto f = CurrentBackdropFrame();
+    if (!f) return false;
+    if (!force && f->serial == bdFrameSerial_) return false;   // 这一帧已经用过了
+
+    RECT r = rect();
+    if (r.right <= r.left || r.bottom <= r.top) return false;
+    const int w = width_ > 0 ? width_ : (int)(r.right - r.left);
+    const int h = height_ > 0 ? height_ : (int)(r.bottom - r.top);
+    const RECT want{(int)r.left - pad, (int)r.top - pad, (int)r.left + w + pad,
+                    (int)r.top + h + pad};
+
+    std::vector<uint8_t> px;
+    RECT cov{};
+    if (!CropBackdropFrame(*f, want, px, cov)) return false;
+    bdFrameSerial_ = f->serial;
+
+    const int s = f->scale > 0 ? f->scale : kBackdropScale;
+    const int nw = (int)(cov.right - cov.left);
+    const int nh = (int)(cov.bottom - cov.top);
+    // 新帧到了但盒子这块像素**完全一样**（静止时几乎每次都这样）：
+    // 不换图、也不重画。每 150ms 白刷一帧分层窗口是白白和游戏抢合成时间。
+    const bool same = !backdrop_.empty() && nw == backdropW_ && nh == backdropH_ &&
+                      (int)cov.left == backdropX_ && (int)cov.top == backdropY_ &&
+                      backdropScale_ == s && LooksLikeSameBackdrop(px, backdrop_);
+    if (same) return false;
+
+    bdPlainArea_ = NearlyUniform(px, (nw + s - 1) / s, (nh + s - 1) / s);
+    backdrop_.swap(px);
+    backdropScale_ = s;
+    backdropW_ = nw;
+    backdropH_ = nh;
+    backdropX_ = (int)cov.left;
+    backdropY_ = (int)cov.top;
+    backdropCoverT_ = GetTickCount();
+    // 共享帧时代「按下才换上」的暂存区没有意义了：手上这张永远是最新的
+    if (bdPreValid_ || !bdPre_.empty()) {
+        bdPreValid_ = false;
+        std::vector<uint8_t>().swap(bdPre_);
+    }
+    return true;
+}
+
 // 补磨砂底图。
 //
 // 【这一版最重要的约束】拖动 / 改尺寸期间**一次都不许抓屏**。
@@ -2495,13 +2610,21 @@ void FenceWindow::RequestBackdropAsync(int pad) {
 // 那把锁；而且「拖到一半突然换一张底图」本身就让背景一跳一跳的，比卡还难看。
 // 上一版就是边拖边在后台抓，用户反馈「背景变的更卡了」。
 //
-// 所以只在真正安全的时候抓：
-//   · 拖动 / 改尺寸**开始**那一刻（盒子还没动，同步抓一圈带余量的，用户看不见）
-//   · 松手之后（WM_LBUTTONUP）、改设置、换壁纸（都是静止状态）
-// 移动过程中底图不够用时，Paint 会把取样原点夹回底图内（整块磨砂跟着盒子平移几像素，
-// 模糊过的画面看不出来），绝不为了「跟准」去抓屏。
+// 【但「不抓屏」不等于「底图跟不上」】自从有了共享整屏帧（见 backdrop.h），
+// 拖动期间要做的事情只剩「从**已经抓好的一帧**里按新位置重新裁一块」，
+// 纯 memcpy、不碰 GDI 锁，所以磨砂现在能真的跟着盒子走，而不是整块平移。
+// 抓屏本身由帧泵负责，它在 busy 期间被 SetBackdropFramePaused 停掉。
 bool FenceWindow::EnsureBackdropCover() {
     if (!cfg_ || !cfg_->acrylic || !hwnd_) return false;
+
+    // 【2026-10 起的主路径】有整屏帧就只做裁剪，不抓屏。
+    //   · 静止时：只有新帧（serial 变了）才重裁，像素没变连重画都不做；
+    //   · 拖动 / 改尺寸：**绝不抓屏**，但每次都从已经抓好的一帧里按新位置重裁 ——
+    //     盒子挪多远磨砂都跟得上（以前底图不够用就让整块画面跟着平移）。
+    if (CurrentBackdropFrame()) {
+        const bool force = dragging_ || resizing_;
+        return CropBackdropFromFrame(force ? 128 : 0, force);
+    }
 
     // 先看后台那一单有没有回来
     if (bdJob_) {
@@ -2522,10 +2645,12 @@ bool FenceWindow::EnsureBackdropCover() {
             // 这时候**不换图也不重画** —— 否则每个盒子每两秒白刷一帧分层窗口，
             // 白白和鼠标/游戏抢 DWM 的合成时间。
             const bool same = nw == backdropW_ && nh == backdropH_ && nx == backdropX_ &&
-                              ny == backdropY_ && LooksLikeSameBackdrop(tiny, backdrop_);
+                              ny == backdropY_ && backdropScale_ == kBackdropScale &&
+                              LooksLikeSameBackdrop(tiny, backdrop_);
             bdJob_.reset();
             if (same) return false;
             backdrop_.swap(tiny);
+            backdropScale_ = kBackdropScale;
             backdropW_ = nw;
             backdropH_ = nh;
             backdropX_ = nx;
@@ -2639,7 +2764,7 @@ void FenceWindow::Paint() {
             // 整块磨砂相对盒子平移几个像素，模糊过的画面看不出来，
             // 也不会像以前那样在拉大后退回「只有半透明着色」。
             UpscaleBackdrop(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, backdrop_.data(),
-                            BdPixW(), BdPixH(), bsx, bsy, kBackdropScale);
+                            BdPixW(), BdPixH(), bsx, bsy, backdropScale_);
             // 放大铺的是矩形，四个圆角外面那点得清掉，否则卡片变成直角
             ClearOutsideRoundCorners(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, rad);
             SolidBrush tint{Color((BYTE)std::min(255, (int)(alpha * 0.58)), r, g, b)};
@@ -3242,40 +3367,73 @@ bool CoveredByOther(HWND hwnd, const RECT& r) {
 
 }  // namespace
 
-// 底图多久无条件重抓一次（每个盒子各自的节奏，彼此错开）。
+// 这个盒子现在需不需要「整屏帧」：开着磨砂 + 可见 + 没被别人盖住。
+// 主程序每个心跳用它决定帧泵要不要干活、抓哪一块 —— 游戏全屏的时候一分钱都不该花。
+bool FenceWindow::NeedsBackdropFrame(RECT* out) const {
+    if (!hwnd_ || !cfg_ || !cfg_->acrylic) return false;
+    if (!IsWindowVisible(hwnd_)) return false;
+    const RECT r = rect();
+    if (r.right <= r.left || r.bottom <= r.top) return false;
+    if (CoveredByOther(hwnd_, r)) return false;
+    if (out) {
+        // 展开尺寸 + 一圈余量：拖动期间不抓屏，全靠这一圈余量给盒子「挪动的空间」
+        const int w = width_ > 0 ? width_ : (int)(r.right - r.left);
+        const int h = height_ > 0 ? height_ : (int)(r.bottom - r.top);
+        const int pad = 160;
+        out->left = (int)r.left - pad;
+        out->top = (int)r.top - pad;
+        out->right = (int)r.left + w + pad;
+        out->bottom = (int)r.top + h + pad;
+    }
+    return true;
+}
+
+// 没有整屏帧时的兜底节奏（帧泵没起来 / 系统一直拒绝抓屏）。
 //
 // 为什么不能只等广播：SPI_SETDESKWALLPAPER 只有「换壁纸」才发。动态壁纸、
-// 幻灯片轮播、以及「盒子背后开了个窗口」都不会发 —— 后者尤其明显：磨砂里本该
-// 糊着那个窗口，结果永远是张壁纸。
+// 幻灯片轮播、以及「盒子背后开了个窗口」都不会发。
 //
 // 以前这里还有一条「壁纸指纹」：在盒子外面采 16×16 的均值，变了才重抓。
 // 那条路**从根上就不可能对**：不带 CAPTUREBLT 的 StretchBlt 一样会把我们自己的
 // 分层窗口（整屏的桌面图标层）抓进来（见 backdrop.cpp 的实测记录），量到的是
 // 自己画出来的静态画面，永远不会变 —— 用户看到的正是「后面变八百年了它也不变」。
-// 而且 7 个盒子每个 500ms 一次 StretchBlt，每次固定 ~6.6ms 的全在 UI 线程上，
-// 一轮 46ms 直接吃掉三帧。
-//
-// 现在改成：定频重抓（走后台线程）+ 抓回来的图真的变了才重画。
 static constexpr DWORD kBackdropAutoMs = 2000;
 
 void FenceWindow::PollBackdropChange() {
     if (!hwnd_ || !cfg_ || !cfg_->acrylic) return;
-    if (dragging_ || resizing_ || bdJob_) return;   // 忙的时候不插队（拖动时绝不抓屏）
 
-    const DWORD now = GetTickCount();
+    // 换壁纸广播那条路：延后到点再重裁一次（广播比画面先到，当场裁还是旧壁纸）
     if (bdRefreshPending_) {
-        if ((int)(now - bdDue_) < 0) return;   // 还没到点
+        if ((int)(GetTickCount() - bdDue_) < 0) return;   // 还没到点
         bdRefreshPending_ = false;
-        RecaptureBackdrop();
+        bdPlainArea_ = false;   // 壁纸变了，「这块是纯色」的结论也要重来
+        bdFrameSerial_ = 0;     // 逼着重新裁，哪怕帧的 serial 没变
+        if (CropBackdropFromFrame(dragging_ || resizing_ ? 128 : 0, true)) Redraw();
         return;
     }
 
+    if (dragging_ || resizing_) {
+        // 拖 / 改尺寸：允许重裁（跟着盒子走），但绝不抓屏 ——
+        // 抓屏由帧泵负责，这段时间它被 SetBackdropFramePaused 停着。
+        if (CropBackdropFromFrame(128, true)) Redraw();
+        return;
+    }
+
+    // 【主路径】有新的一帧就裁一块。裁剪是纯 memcpy，像素没变连重画都不做，
+    // 所以这里可以每 150ms 走一次。
+    if (!IsWindowVisible(hwnd_)) return;
+    if (CoveredByOther(hwnd_, rect())) return;   // 看不见就别花钱重画
+    if (CropBackdropFromFrame(0, false)) {
+        Redraw();
+        return;
+    }
+
+    // 一帧都没有（帧泵还没抓到 / 系统不给抓）：退回原来的「每盒各自定频后台抓」，
+    // 至少还能靠换壁纸 / 拖完补一张。有帧的时候这条路径完全不参与。
+    if (CurrentBackdropFrame() || bdJob_) return;
+    const DWORD now = GetTickCount();
     if ((int)(now - bdAutoDue_) < 0) return;
     bdAutoDue_ = now + kBackdropAutoMs;
-    if (!IsWindowVisible(hwnd_)) return;
-    if (CoveredByOther(hwnd_, rect())) return;
-    // 走后台抓（不是同步 RecaptureBackdrop）：抓屏 + 模糊要 10ms 上下，
-    // 放在 UI 线程上就是每个盒子每两秒掉一帧，玩游戏时最不能要这个。
     RequestBackdropAsync(0);
 }
 

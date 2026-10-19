@@ -105,6 +105,70 @@ bool CaptureBlurredBackdropFast(int x, int y, int w, int h, std::vector<uint8_t>
                                 bool* uniform = nullptr, HWND self = nullptr);
 
 // ---------------------------------------------------------------------------
+// 共享磨砂帧（2026-10）
+//
+// 为什么要有它：抓屏那 6ms 是 GPU 回读的**固定**成本，和抓多大面积几乎无关。
+// 本机实测（2560×1440）：
+//     16×16        6.45 ms
+//     444×401      6.42 ms
+//     2560×1440   20.65 ms      ← 全屏只比一小块贵 3 倍
+//     加一次排除/还原自身   6.30 ms（WDA 免费）
+//     每次重建 DIB / GetDC  6.20 ms（也可以忽略）
+// 所以「每个盒子各抓一次」等于把同一份固定成本付了 7 遍（≈45ms），这才是
+// 「只能两秒刷一次」的真正原因 —— **不是不能实时，是抓的次数太多**。
+// 改成「抓一张、所有盒子从里面裁自己那块」之后，固定成本只付一次。
+//
+// 实现上：一个后台线程按 interval（默认 150ms ≈ 6.5Hz）抓一块区域
+// （主程序给的所有可见磨砂盒子的并集）、降采样 + 模糊，结果放进一个带 serial 的
+// BackdropFrame。盒子在自己的局部坐标里裁一块带走（纯 memcpy，实测 0.03ms），
+// 完全不需要各自 BitBlt。
+//
+// 注意：裁剪都在**屏幕坐标**上算，scale 只影响像素密度。
+// px 存的是「已经模糊过」的图，裁剪后可以直接当底图用。
+// ---------------------------------------------------------------------------
+struct BackdropFrame {
+    int x = 0, y = 0, w = 0, h = 0;   // 覆盖的屏幕坐标范围（≠ 一定是整屏，见上）
+    int scale = 2;                     // 像素边长 = 屏幕边长 / scale
+    unsigned long long serial = 0;     // 每抓一帧 +1：盒子靠它判断「有没有新帧」
+    std::vector<uint8_t> px;           // 1/scale 缩放的模糊图，BGRA
+
+    int pixW() const { return w > 0 ? (w + scale - 1) / scale : 0; }
+    int pixH() const { return h > 0 ? (h + scale - 1) / scale : 0; }
+};
+
+// 启动帧泵。抓到新帧时会 PostThreadMessage(uiThreadId, wakeMsg, 0, 0)
+// 叫醒 UI 线程（和缩略图那条线程用的是同一套办法）。
+void InitBackdropFramePump(DWORD uiThreadId, UINT wakeMsg);
+
+// 告诉帧泵「这些区域需要磨砂」（屏幕坐标，一般是所有可见磨砂盒子的并集）。
+// 传 nullptr = 现在没人需要，泵彻底停手：不 BitBlt、不占 CPU、也不占那十几 MB
+// 整屏 DIB —— 玩游戏 / 全部盒子被盖住 / 没开磨砂的时候就该这样。
+//
+// 【为什么不是整屏】整屏抓一次要 14.7MB 的 DIB（2560×1440）和 20.65ms，
+// 而 BitBlt 的成本基本随面积走（固定 ~6ms + 每 MB 约 1.4ms）。盒子通常只占
+// 屏幕一角，按并集抓就既是 3~10ms、又只占 1~4MB。区域变化（挪盒子）会让
+// 盒子重新裁一次，那本来就是该重画的时刻。
+void SetBackdropFrameRegion(const RECT* region);
+
+// 拖动 / 改尺寸期间暂停抓屏。
+//
+// 【为什么拖的时候要停】BitBlt 要抢 win32k 的全局 GDI 锁，而 UI 线程每帧的
+// SetWindowPos / UpdateLayeredWindow 也要那把锁；拖拽是唯一「每帧都要跟手」的时刻，
+// 这段时间宁可让背景冻住（反正可以从已经抓好的一帧里重新裁），也绝不抓屏。
+void SetBackdropFramePaused(bool paused);
+
+// 抓一帧的间隔（毫秒），默认 150。环境变量 MEOW_BD_MS 可覆盖（调试用）。
+void SetBackdropFrameInterval(DWORD ms);
+
+// 当前最新的一帧。可能为空（还没抓过 / 没开），也可能是旧的 —— 调用方自己看 serial。
+std::shared_ptr<const BackdropFrame> CurrentBackdropFrame();
+
+// 从帧里裁一块（want 是屏幕坐标），输出 1/scale 缩放的像素，covered 写回真正覆盖的范围。
+// 覆盖范围一定是 scale 对齐的，所以「屏幕宽 / scale」和像素宽严格相等。
+bool CropBackdropFrame(const BackdropFrame& f, const RECT& want, std::vector<uint8_t>& out,
+                       RECT& covered);
+
+// ---------------------------------------------------------------------------
 // 后台抓取（拖动时不卡的关键）
 //
 // 一次「抓屏 + 模糊」实测 18ms 上下（抓屏 8~11ms 是 GPU 回读，压不下去；

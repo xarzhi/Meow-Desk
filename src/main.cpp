@@ -887,6 +887,10 @@ static void RequestIconReload() { PostMessageW(nullptr, kMsgReloadIcons, 0, 0); 
 // 后台缩略图出来了（见 thumb_loader.h）。工作线程 PostThreadMessage 叫醒消息循环。
 static const UINT kMsgThumbReady = WM_APP + 11;
 
+// 整屏帧泵抓到新的一帧（见 backdrop.h）。盒子在这条消息里重新裁磨砂底图，
+// 变了才重画 —— 这就是「亚克力背景跟得上了」的驱动源。
+static const UINT kMsgBackdropReady = WM_APP + 12;
+
 // 松手点下面的图标：先看盒子（盒子盖在桌面层上面），再看桌面层
 static DesktopIconView* IconAtScreen(POINT pt) {
     for (auto& f : g_fences) {
@@ -2424,6 +2428,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 缩略图队列要知道「结果回来说给谁听」：UI 线程 + 一条自定义消息。
     // 必须赶在第一批图标加载之前 —— 它同时也是「GDI+ 已经起来了」的保证。
     InitThumbnailLoader(GetCurrentThreadId(), kMsgThumbReady);
+    // 整屏磨砂帧泵：同样要 UI 线程 id + 唤醒消息。这里只是把线程挂好，
+    // 真正开始抓由心跳里的 SetBackdropFrameWanted 决定（没开磨砂就一分钱不花）。
+    InitBackdropFramePump(GetCurrentThreadId(), kMsgBackdropReady);
     auto items = EnumerateDesktopIcons();
     LogStep("enum icons: " + std::to_string(items.size()) + " diag: " + LastEnumDiag());
     // 诊断用：跳过位图加载，用来分离「图标数据」占的内存
@@ -2762,11 +2769,34 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         RestoreZOrder();
         CheckAutoOrganize();
         PollDesktopWatch();
-        // 壁纸指纹轮询：动态壁纸 / 幻灯片轮播不会发 SPI_SETDESKWALLPAPER，
-        // 只能靠像素差分发现。一次采样是 16×16 的 StretchBlt（微秒级），
-        // 只有真的变了才会去重抓；延后的重抓也在这里落地。
-        for (auto& f : g_fences)
-            if (f) f->PollBackdropChange();
+        // 整屏帧泵的「需求区域」：有盒子真的要看磨砂（开着 + 可见 + 没被盖住）
+        // 才让它抓，抓的范围也只是这些盒子的并集。抓一次是 GPU 回读，游戏全屏 /
+        // 全部盒子被盖住时白花这份钱最不值 —— 所以每个心跳都重算一次。
+        RECT want{};
+        bool have = false;
+        bool busy = false;
+        for (auto& f : g_fences) {
+            if (!f) continue;
+            RECT r{};
+            if (f->NeedsBackdropFrame(&r)) {
+                if (!have) {
+                    want = r;
+                    have = true;
+                } else {
+                    want.left = std::min(want.left, r.left);
+                    want.top = std::min(want.top, r.top);
+                    want.right = std::max(want.right, r.right);
+                    want.bottom = std::max(want.bottom, r.bottom);
+                }
+            }
+            if (f->IsGeometryBusy()) busy = true;
+            // 延后的重抓（换壁纸广播那条路）在这里落地；平时是新帧叫醒的，
+            // 这里只是兜底，避免「没新帧就永远不处理」。
+            f->PollBackdropChange();
+        }
+        SetBackdropFrameRegion(have ? &want : nullptr);
+        // busy（拖动 / 改尺寸）期间一律不抓屏：那几帧要和鼠标赛跑，绝不能抢 GDI 锁
+        SetBackdropFramePaused(busy);
     };
 
     RestoreZOrder();
@@ -2792,6 +2822,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         // 后台缩略图回来了：把类型图标换成真缩略图（图片 / 视频 / 音乐封面）
         if (msg.message == kMsgThumbReady) {
             DrainThumbnails();
+            continue;
+        }
+        // 整屏帧泵抓到新的一帧：所有盒子重新裁一次磨砂底图，真的变了才重画。
+        // 这就是「后面的东西一变，磨砂跟着变」的驱动源（约 6.7Hz，见 backdrop.h）。
+        if (msg.message == kMsgBackdropReady) {
+            for (auto& f : g_fences)
+                if (f) f->PollBackdropChange();
             continue;
         }
         TranslateMessage(&msg);

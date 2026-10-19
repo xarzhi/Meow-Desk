@@ -77,12 +77,31 @@ public:
     // 交给 PollBackdropChange 统一处理（等一小会儿再抓）。
     void ScheduleBackdropRefresh();
 
-    // 心跳里轮询（主程序每 500ms 叫一次）：
-    //   · 到点的延后重抓 → 现在就抓（换壁纸广播那条路）
-    //   · 否则定频（kBackdropAutoMs）让后台线程重抓一次，**抓回来的图真的变了才重画**
-    // 定时重抓是唯一可靠的信号：动态壁纸、幻灯片轮播不发 SPI_SETDESKWALLPAPER，
-    // 「盒子背后开了个窗口」更是没有任何通知。
+    // 心跳里轮询（主程序每 150ms 左右叫一次，由整屏帧泵叫醒）：
+    //   · 有比「我正在用的那一帧」更新的整屏帧 → 裁一块换上，真的变了才重画
+    //   · 到点的延后重抓（换壁纸广播那条路）也在这里落地
+    //
+    // 【为什么不再「每个盒子各自定频抓屏」】抓一次的成本几乎全是固定开销
+    // （16×16 也要 6.45ms，全屏 20.65ms），七个盒子各抓一遍就是 45ms 的
+    // 固定成本，只能靠「两秒一次」来摊。改成共享整屏帧之后整屏只抓一次，
+    // 每个盒子只做一次 memcpy（亚毫秒），于是可以做到 ~6.7Hz。
     void PollBackdropChange();
+
+    // 从「当前这一帧」裁一块当底图。
+    //   force = false：帧没换过（serial 相同）就什么都不做
+    //   force = true ：不管 serial，按当前窗口位置重新裁（拖动 / 改尺寸时用：
+    //                 底图要跟着盒子走，但仍然不抓屏）
+    // 返回 true = 底图真的换了，调用方该重画。
+    bool CropBackdropFromFrame(int pad, bool force);
+
+    // 这个盒子现在需不需要整屏帧（开着磨砂 + 可见 + 没被别人盖住）。
+    // out 非空时写回「它需要磨砂的那块屏幕区域」（展开尺寸 + 一圈余量）。
+    // 主程序把所有盒子的这些区域并起来交给帧泵 —— 只抓需要的那一块，
+    // 游戏全屏 / 盖住时一分钱都不花。
+    bool NeedsBackdropFrame(RECT* out = nullptr) const;
+
+    // 正在拖 / 改尺寸。这段时间帧泵要停（见 SetBackdropFramePaused）。
+    bool IsGeometryBusy() const { return dragging_ || resizing_; }
 
     void Redraw();
     void SetCollapsed(bool collapsed);
@@ -449,7 +468,7 @@ private:
     // 亚克力底图
     std::vector<uint8_t> backdrop_;
     int backdropW_ = 0, backdropH_ = 0;   // 抓取时的尺寸（总是展开尺寸）
-    // 底图按 1/kBackdropScale 分辨率存。
+    // 底图按 1/backdropScale_ 分辨率存。
     //
     // 磨砂底图先被模糊过（半径 20），本身几乎没有高频细节，降到 1/2 边
     // （内存 1/4）再放大回来肉眼分辨不出，但七个盒子合计能省 8MB 上下。
@@ -457,16 +476,24 @@ private:
     // 基本一样 —— **千万别改成 GDI+ 的 DrawImage 缩放**，同一张图它要 26ms
     // （GDI+ 的插值缩放走的是慢路径），拖动会当场卡成 PPT。
     //
-    // backdropW_/H_ 仍然是**屏幕坐标下的覆盖范围**，除以 kBackdropScale 才是
+    // backdropW_/H_ 仍然是**屏幕坐标下的覆盖范围**，除以 backdropScale_ 才是
     // 像素尺寸，所以取样、覆盖判断这些几何代码一行都不用改。
+    //
+    // 取值来源有两种，密度不同但都统一走 BdPixW()/UpscaleBackdrop：
+    //   · 从共享整屏帧裁下来的 → 4（帧本身就是 1/4 缩放，见 backdrop.h）
+    //   · 自己同步抓的（兜底路径）→ 2（DownsampleBackdrop 只做 2x2 平均）
     static constexpr int kBackdropScale = 2;
-    int BdPixW() const { return (backdropW_ + kBackdropScale - 1) / kBackdropScale; }
-    int BdPixH() const { return (backdropH_ + kBackdropScale - 1) / kBackdropScale; }
+    int backdropScale_ = kBackdropScale;
+    int BdPixW() const { return (backdropW_ + backdropScale_ - 1) / backdropScale_; }
+    int BdPixH() const { return (backdropH_ + backdropScale_ - 1) / backdropScale_; }
     int backdropX_ = 0, backdropY_ = 0;
     // 上一次提交后台补抓的时刻（限频用）
     DWORD backdropCoverT_ = 0;
-    // 下一次「定频自动重抓」的时刻。各盒子按 index 错开，避免同一帧里
-    // 七个盒子一起抓屏（那一下的 GPU 回读是肉眼可见的）。
+    // 当前底图是从哪一帧（BackdropFrame::serial）裁出来的。
+    // 和帧的 serial 一致 = 「这一帧我已经用过了」，不用重复裁。
+    unsigned long long bdFrameSerial_ = 0;
+    // 没有整屏帧时的兜底节奏（帧泵没起来 / 一直被系统拒绝）。
+    // 正常路径已经不用它了：共享帧按 150ms 自己送上门。
     DWORD bdAutoDue_ = 0;
     // bdRefreshPending_ = 「有一单延后的重抓排着」（收到壁纸广播后等 DWM 合成完再抓）
     bool bdRefreshPending_ = false;
@@ -481,6 +508,7 @@ private:
     std::vector<uint8_t> bdPre_;
     int bdPreW_ = 0, bdPreH_ = 0;
     int bdPreX_ = 0, bdPreY_ = 0;
+    int bdPreScale_ = kBackdropScale;
     bool bdPreValid_ = false;
 
     DropHint drop_;

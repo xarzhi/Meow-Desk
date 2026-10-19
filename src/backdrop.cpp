@@ -1,7 +1,11 @@
 #include "backdrop.h"
 
+#include "screen_util.h"
+
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -52,7 +56,7 @@ struct ExclGuard {
             g_excludeHook(rc, true);
             hooked = true;
         }
-        if (!selfOk) {
+        if (self && !selfOk) {
             LogOnce("backdrop: WDA_EXCLUDEFROMCAPTURE failed -> PaintDesktop fallback");
         }
     }
@@ -473,4 +477,257 @@ std::shared_ptr<BackdropCaptureJob> BackdropCaptureAsync(const RECT& rect, HWND 
         job->finished.store(true, std::memory_order_release);
     }
     return job;
+}
+
+// ---------------------------------------------------------------------------
+// 磨砂帧泵
+//
+// 一次抓取的成本几乎全是「从 DWM 合成表面回读」的开销（见头文件实测表），
+// 所以：所有盒子共用一张，各自从里面裁。7 个盒子各自抓 = 7 × 6.4ms ≈ 45ms，
+// 共用一张 = 一次 8~20ms，**总量反而更少**，而且不用排队、不用每个盒子等一帧。
+// 抓多大由主程序给（所有可见磨砂盒子的并集），不是无脑整屏。
+// ---------------------------------------------------------------------------
+namespace {
+
+// 帧的像素密度：1/4。和 BlurFastRgba 内部那一步是同一个刻度
+// （缩小 4 倍之后半径 / 4 就是同样的视觉效果），所以内容一致、内存只剩 1/16。
+constexpr int kFrameScale = kBlurScale;
+constexpr int kFrameBlurR = 20 / kFrameScale;   // 5
+
+struct FramePump {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::shared_ptr<const BackdropFrame> cur;
+    unsigned long long serial = 0;
+    RECT want{};              // 需要磨砂的屏幕区域（所有磨砂盒子的并集）
+    bool wantValid = false;   // false = 没人需要，泵彻底停手
+    bool paused = false;      // 正在拖 / 改尺寸
+    bool started = false;
+    DWORD intervalMs = 150;
+    // MEOW_BACKDROP=desktop 的调试口子：只要壁纸、不要窗口（某些动态壁纸自己
+    // 也是分层窗口，排除不掉，抓回来是它下面那一层 —— 那就只能退回 PaintDesktop）
+    bool preferDesktop = false;
+    DWORD uiTid = 0;
+    UINT wake = 0;
+    // 只给泵线程用的复用缓冲：抓取区域的原图（按并集大小）。
+    // 每帧重新 new 一次是纯粹的内存抖动，没必要 —— 但也不主动留着，
+    // 区域缩小 / 需求消失时要放掉。
+    //
+    // 【只归泵线程用】rawBuf 只能由泵线程读写：UI 线程要它释放时只置
+    // releaseBuf，由泵线程在下一轮开头自己 swap 掉。否则就是
+    // 「UI 线程正在 swap、泵线程正在往里 BitBlt」的悬空指针。
+    std::vector<uint8_t> rawBuf;
+    bool releaseBuf = false;
+};
+
+FramePump& Pump() {
+    static FramePump* p = new FramePump();   // 有意泄漏，理由同 Worker
+    return *p;
+}
+
+// 抓取区域的原图 → 1/4 缩放 + 三次盒式模糊（≈ 全分辨率半径 20 的高斯）。
+// 直接写进 out（也就是帧自己的 px），中间不落第二份 1/4 图。
+void MakeFramePixels(const std::vector<uint8_t>& raw, int w, int h, std::vector<uint8_t>& out,
+                     int& ow, int& oh) {
+    Downsample4(raw.data(), w, h, out, ow, oh);
+    if (ow <= 0 || oh <= 0) {
+        out.clear();
+        return;
+    }
+    for (int p = 0; p < 3; ++p) {
+        BoxBlurH(out.data(), ow, oh, kFrameBlurR);
+        BoxBlurV(out.data(), ow, oh, kFrameBlurR);
+    }
+}
+
+// 只在泵线程里调用。region 是「需要磨砂的区域」，按 4 对齐向外取整后抓取。
+std::shared_ptr<BackdropFrame> GrabRegion(FramePump& p, const RECT& region) {
+    const RECT vs = ScreenUtil::VirtualScreen();
+    // 按 scale 对齐（floor left/top，ceil right/bottom），这样帧的原点不会因为
+    // 盒子挪了 1px 就变，缓存判断才稳。C++ 的 % 对负数给负余数，这里统一掰成正的。
+    auto floorTo = [](int v, int s) { return v - ((v % s) + s) % s; };
+    auto ceilTo = [](int v, int s) { return v + ((s - v % s) % s); };
+
+    int x0 = std::max((int)vs.left, floorTo((int)region.left, kFrameScale));
+    int y0 = std::max((int)vs.top, floorTo((int)region.top, kFrameScale));
+    int x1 = std::min((int)vs.right, ceilTo((int)region.right, kFrameScale));
+    int y1 = std::min((int)vs.bottom, ceilTo((int)region.bottom, kFrameScale));
+    if (x1 - x0 < 32 || y1 - y0 < 32) return nullptr;
+
+    // 需求区域比屏幕还大（盒子摊得很开）就干脆整屏，少一次边界判断
+    const long long fullArea = (long long)(vs.right - vs.left) * (vs.bottom - vs.top);
+    const long long area = (long long)(x1 - x0) * (y1 - y0);
+    if (area * 10 >= fullArea * 7) {
+        x0 = (int)vs.left;
+        y0 = (int)vs.top;
+        x1 = (int)vs.right;
+        y1 = (int)vs.bottom;
+    }
+
+    const int w = x1 - x0, h = y1 - y0;
+    const RECT rc{x0, y0, x1, y1};
+    bool ok = false;
+    {
+        // self 为空 = 一次抓一片区域（没有「某一个盒子」可以排除，
+        // 靠排除钩子把自家窗口全从画面里摘掉）
+        ExclGuard g(rc, nullptr);
+        ok = (!p.preferDesktop && g.hooked) ? CaptureScreenRegionFast(x0, y0, w, h, p.rawBuf)
+                                            : CaptureDesktopRegion(x0, y0, w, h, p.rawBuf);
+    }
+    if (!ok || p.rawBuf.size() < (size_t)w * (size_t)h * 4) return nullptr;
+
+    auto f = std::make_shared<BackdropFrame>();
+    f->x = x0;
+    f->y = y0;
+    f->w = w;
+    f->h = h;
+    f->scale = kFrameScale;
+    int ow = 0, oh = 0;
+    MakeFramePixels(p.rawBuf, w, h, f->px, ow, oh);
+    // 区域缩小了很多（比如从整屏变成一个小盒子）：别一直占着那块大缓冲
+    if (p.rawBuf.capacity() > (size_t)w * (size_t)h * 4 * 2) {
+        std::vector<uint8_t>().swap(p.rawBuf);
+    }
+    if (f->px.size() != (size_t)f->pixW() * (size_t)f->pixH() * 4 || ow != f->pixW() ||
+        oh != f->pixH())
+        return nullptr;
+    return f;
+}
+
+void PumpLoop() {
+    FramePump& p = Pump();
+    for (;;) {
+        RECT region{};
+        {
+            std::unique_lock<std::mutex> lk(p.mu);
+            // 释放缓冲只在泵线程做（rawBuf 是泵线程的私有工作区）
+            if (p.releaseBuf) {
+                p.releaseBuf = false;
+                std::vector<uint8_t>().swap(p.rawBuf);
+            }
+            p.cv.wait(lk, [&p] { return p.wantValid && !p.paused; });
+            region = p.want;
+        }
+        auto f = GrabRegion(p, region);   // 3~20ms，全程不持锁
+        DWORD tid = 0;
+        UINT msg = 0;
+        if (f) {
+            std::lock_guard<std::mutex> lk(p.mu);
+            f->serial = ++p.serial;
+            p.cur = f;
+            tid = p.uiTid;
+            msg = p.wake;
+        }
+        if (tid && msg) PostThreadMessageW(tid, msg, 0, 0);
+        // 节流。被「不需要了 / 暂停」唤醒就立刻回去等，不白抓。
+        std::unique_lock<std::mutex> lk(p.mu);
+        p.cv.wait_for(lk, std::chrono::milliseconds(p.intervalMs),
+                      [&p] { return !p.wantValid || p.paused; });
+    }
+}
+
+}  // namespace
+
+void InitBackdropFramePump(DWORD uiThreadId, UINT wakeMsg) {
+    FramePump& p = Pump();
+    {
+        std::lock_guard<std::mutex> lk(p.mu);
+        p.uiTid = uiThreadId;
+        p.wake = wakeMsg;
+        if (p.started) return;
+        p.started = true;
+    }
+    // 调试口子：MEOW_BD_MS=1000 把刷新放慢，方便数到底刷了几帧 / 对比卡不卡
+    wchar_t v[32]{};
+    if (GetEnvironmentVariableW(L"MEOW_BD_MS", v, 32) > 0) {
+        const long ms = wcstol(v, nullptr, 10);
+        if (ms >= 30 && ms <= 5000) p.intervalMs = (DWORD)ms;
+    }
+    // 和 RefreshBackdrop 里那条 MEOW_BACKDROP=desktop 保持同一语义
+    wchar_t mode[32]{};
+    if (GetEnvironmentVariableW(L"MEOW_BACKDROP", mode, 32) > 0) {
+        p.preferDesktop = _wcsicmp(mode, L"desktop") == 0;
+    }
+    std::thread th(PumpLoop);
+    th.detach();   // 同 Worker：故意不 join，进程退出时由系统收尾
+}
+
+void SetBackdropFrameRegion(const RECT* region) {
+    FramePump& p = Pump();
+    {
+        std::lock_guard<std::mutex> lk(p.mu);
+        if (!region) {
+            if (!p.wantValid) return;
+            p.wantValid = false;
+            // 需求没了就把那块原图放掉（整屏时是 14.7MB，凭这一点不能留着）。
+            // 不能在这里直接 swap：rawBuf 归泵线程所有，它可能正在往里 BitBlt。
+            p.releaseBuf = true;
+        } else {
+            if (p.wantValid && EqualRect(&p.want, region)) return;
+            p.want = *region;
+            p.wantValid = true;
+        }
+    }
+    p.cv.notify_all();
+}
+
+void SetBackdropFramePaused(bool paused) {
+    FramePump& p = Pump();
+    {
+        std::lock_guard<std::mutex> lk(p.mu);
+        if (p.paused == paused) return;
+        p.paused = paused;
+    }
+    p.cv.notify_all();
+}
+
+void SetBackdropFrameInterval(DWORD ms) {
+    if (ms < 30 || ms > 5000) return;
+    FramePump& p = Pump();
+    {
+        std::lock_guard<std::mutex> lk(p.mu);
+        if (p.intervalMs == ms) return;
+        p.intervalMs = ms;
+    }
+    p.cv.notify_all();
+}
+
+std::shared_ptr<const BackdropFrame> CurrentBackdropFrame() {
+    FramePump& p = Pump();
+    std::lock_guard<std::mutex> lk(p.mu);
+    return p.cur;
+}
+
+bool CropBackdropFrame(const BackdropFrame& f, const RECT& want, std::vector<uint8_t>& out,
+                       RECT& covered) {
+    out.clear();
+    const int s = f.scale > 0 ? f.scale : 2;
+    const int pw = f.pixW(), ph = f.pixH();
+    if (pw <= 0 || ph <= 0 || f.px.size() < (size_t)pw * (size_t)ph * 4) return false;
+
+    const int x0 = std::max((int)want.left, f.x);
+    const int y0 = std::max((int)want.top, f.y);
+    const int x1 = std::min((int)want.right, f.x + f.w);
+    const int y1 = std::min((int)want.bottom, f.y + f.h);
+    if (x1 - x0 < 8 || y1 - y0 < 8) return false;
+
+    // 按 s 对齐切整块：源图是按 s 分块的，切半块等于错位半像素
+    const int cx0 = (x0 - f.x) / s;
+    const int cy0 = (y0 - f.y) / s;
+    const int cx1 = std::min(pw, (x1 - f.x + s - 1) / s);
+    const int cy1 = std::min(ph, (y1 - f.y + s - 1) / s);
+    if (cx1 <= cx0 || cy1 <= cy0) return false;
+
+    const int cw = cx1 - cx0, ch = cy1 - cy0;
+    out.resize((size_t)cw * (size_t)ch * 4);
+    for (int y = 0; y < ch; ++y) {
+        std::memcpy(out.data() + (size_t)y * (size_t)cw * 4,
+                    f.px.data() + ((size_t)(cy0 + y) * (size_t)pw + cx0) * 4,
+                    (size_t)cw * 4);
+    }
+    covered.left = f.x + cx0 * s;
+    covered.top = f.y + cy0 * s;
+    covered.right = f.x + cx1 * s;
+    covered.bottom = f.y + cy1 * s;
+    return true;
 }
