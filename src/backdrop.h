@@ -118,10 +118,11 @@ bool CaptureBlurredBackdropFast(int x, int y, int w, int h, std::vector<uint8_t>
 // 「只能两秒刷一次」的真正原因 —— **不是不能实时，是抓的次数太多**。
 // 改成「抓一张、所有盒子从里面裁自己那块」之后，固定成本只付一次。
 //
-// 实现上：一个后台线程按 interval（默认 150ms ≈ 6.5Hz）抓一块区域
+// 实现上：一个后台线程按 interval（默认 30ms ≈ 33fps）抓一块区域
 // （主程序给的所有可见磨砂盒子的并集）、降采样 + 模糊，结果放进一个带 serial 的
 // BackdropFrame。盒子在自己的局部坐标里裁一块带走（纯 memcpy，实测 0.03ms），
-// 完全不需要各自 BitBlt。
+// 完全不需要各自 BitBlt。动态壁纸 / 视频在动时磨砂背景能跟着走，而不是
+// 以前 150ms（6.5Hz）那种一顿一顿的样子。
 //
 // 注意：裁剪都在**屏幕坐标**上算，scale 只影响像素密度。
 // px 存的是「已经模糊过」的图，裁剪后可以直接当底图用。
@@ -157,7 +158,7 @@ void SetBackdropFrameRegion(const RECT* region);
 // 这段时间宁可让背景冻住（反正可以从已经抓好的一帧里重新裁），也绝不抓屏。
 void SetBackdropFramePaused(bool paused);
 
-// 抓一帧的间隔（毫秒），默认 150。环境变量 MEOW_BD_MS 可覆盖（调试用）。
+// 抓一帧的间隔（毫秒），默认 30（约 33fps）。环境变量 MEOW_BD_MS 可覆盖（调试用）。
 void SetBackdropFrameInterval(DWORD ms);
 
 // 当前最新的一帧。可能为空（还没抓过 / 没开），也可能是旧的 —— 调用方自己看 serial。

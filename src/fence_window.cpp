@@ -2193,7 +2193,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             //
             // 拖完校正底图：拖动期间帧泵是停着的（为了跟手），帧可能已经旧了，
             // 但至少能从它里面裁一块和当前位置对齐的（以前是让整块磨砂平移）。
-            // 松手后帧泵立刻恢复，150ms 内会送来新的一帧。
+            // 松手后帧泵立刻恢复，30ms 内会送来新的一帧。
             if (cfg_ && cfg_->acrylic) {
                 if (CurrentBackdropFrame())
                     CropBackdropFromFrame(0, true);
@@ -2418,7 +2418,7 @@ void FenceWindow::RefreshBackdrop(int pad, bool defer) {
 
     // ---- 优先从共享整屏帧里裁一块 ----
     //
-    // 整屏那一帧由后台线程按 150ms 一直在更新，这里只是把盒子那块 memcpy 出来：
+    // 整屏那一帧由后台线程按 30ms 一直在更新，这里只是把盒子那块 memcpy 出来：
     // 亚毫秒级、不 BitBlt、不抢 win32k 的 GDI 锁。
     // 以前这个函数是**同步抓屏**，而它会在「按下开始拖动 / 开始改尺寸 / 换壁纸 /
     // 改设置」时被调到 —— UI 线程每次停 7~9ms，那就是按下去黏一下的来源。
@@ -2556,7 +2556,7 @@ void FenceWindow::RequestBackdropAsync(int pad) {
 // 从「当前这一帧」裁一块当底图（见 fence_window.h 的注释）。
 //
 // 这一版的核心：**底图不再各自抓屏**。整屏帧由 backdrop.cpp 的泵线程按
-// 150ms 抓一次并模糊好，盒子只是把它那块 memcpy 出来 —— 纯内存、亚毫秒。
+// 30ms 抓一次并模糊好，盒子只是把它那块 memcpy 出来 —— 纯内存、亚毫秒。
 bool FenceWindow::CropBackdropFromFrame(int pad, bool force) {
     if (!cfg_ || !cfg_->acrylic || !hwnd_) return false;
     auto f = CurrentBackdropFrame();
@@ -2579,7 +2579,7 @@ bool FenceWindow::CropBackdropFromFrame(int pad, bool force) {
     const int nw = (int)(cov.right - cov.left);
     const int nh = (int)(cov.bottom - cov.top);
     // 新帧到了但盒子这块像素**完全一样**（静止时几乎每次都这样）：
-    // 不换图、也不重画。每 150ms 白刷一帧分层窗口是白白和游戏抢合成时间。
+    // 不换图、也不重画。每 30ms 白刷一帧分层窗口是白白和游戏抢合成时间。
     const bool same = !backdrop_.empty() && nw == backdropW_ && nh == backdropH_ &&
                       (int)cov.left == backdropX_ && (int)cov.top == backdropY_ &&
                       backdropScale_ == s && LooksLikeSameBackdrop(px, backdrop_);
@@ -3420,7 +3420,7 @@ void FenceWindow::PollBackdropChange() {
     }
 
     // 【主路径】有新的一帧就裁一块。裁剪是纯 memcpy，像素没变连重画都不做，
-    // 所以这里可以每 150ms 走一次。
+    // 所以这里可以每 30ms 走一次。
     if (!IsWindowVisible(hwnd_)) return;
     if (CoveredByOther(hwnd_, rect())) return;   // 看不见就别花钱重画
     if (CropBackdropFromFrame(0, false)) {

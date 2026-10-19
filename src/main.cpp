@@ -1242,7 +1242,7 @@ static void ApplyCellSize() {
 // 重算磨砂帧泵的「需求区域」并立即同步给它。
 //
 // 心跳里每 500ms 会调一次（正常兜底），但设置里「切到亚克力」这种时刻不能等
-// 下一次心跳 —— 那时帧泵是停着的（纯色/透明档不抓屏），等 500ms 心跳 + 150ms
+// 下一次心跳 —— 那时帧泵是停着的（纯色/透明档不抓屏），等 500ms 心跳 + 30ms
 // 泵周期，用户会看到「开了亚克力背景却没立刻出来」。所以这里抽成独立函数，
 // 设置变化时立即调一次，帧泵马上抓出第一帧。
 static void UpdateBackdropDemand() {
@@ -2863,7 +2863,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             continue;
         }
         // 整屏帧泵抓到新的一帧：所有盒子重新裁一次磨砂底图，真的变了才重画。
-        // 这就是「后面的东西一变，磨砂跟着变」的驱动源（约 6.7Hz，见 backdrop.h）。
+        // 这就是「后面的东西一变，磨砂跟着变」的驱动源（约 33fps，见 backdrop.h）。
         if (msg.message == kMsgBackdropReady) {
             for (auto& f : g_fences)
                 if (f) f->PollBackdropChange();

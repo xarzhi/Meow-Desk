@@ -503,7 +503,11 @@ struct FramePump {
     bool wantValid = false;   // false = 没人需要，泵彻底停手
     bool paused = false;      // 正在拖 / 改尺寸
     bool started = false;
-    DWORD intervalMs = 150;
+    // 默认 30ms ≈ 33fps：动态壁纸 / 视频在动时磨砂背景要「跟手」。
+    // 以前是 150ms（6.5Hz），一顿一顿的，用户明确要求实时。抓屏成本是按并集
+    // 区域抓（小区域 ~6ms），30ms 一帧完全跟得上；只有盒子铺满屏才退化到整屏
+    // （~20ms），那时 30fps 会掉帧，但那种布局本来也没几块「后面」可透。
+    DWORD intervalMs = 30;
     // MEOW_BACKDROP=desktop 的调试口子：只要壁纸、不要窗口（某些动态壁纸自己
     // 也是分层窗口，排除不掉，抓回来是它下面那一层 —— 那就只能退回 PaintDesktop）
     bool preferDesktop = false;
@@ -554,10 +558,13 @@ std::shared_ptr<BackdropFrame> GrabRegion(FramePump& p, const RECT& region) {
     int y1 = std::min((int)vs.bottom, ceilTo((int)region.bottom, kFrameScale));
     if (x1 - x0 < 32 || y1 - y0 < 32) return nullptr;
 
-    // 需求区域比屏幕还大（盒子摊得很开）就干脆整屏，少一次边界判断
+    // 需求区域比屏幕还大（盒子摊得很开）就干脆整屏，少一次边界判断。
+    // 但整屏抓一次要 ~20ms（GPU 回读），在 30ms 的刷新节奏下会掉帧；而盒子
+    // 并集通常只占屏幕一角（~6ms）。所以把「整屏」的门槛抬到 95%：只有盒子
+    // 真的几乎铺满屏才整屏，否则宁可按并集抓 —— 30fps 的跟手比省一次边界判断重要。
     const long long fullArea = (long long)(vs.right - vs.left) * (vs.bottom - vs.top);
     const long long area = (long long)(x1 - x0) * (y1 - y0);
-    if (area * 10 >= fullArea * 7) {
+    if (area * 100 >= fullArea * 95) {
         x0 = (int)vs.left;
         y0 = (int)vs.top;
         x1 = (int)vs.right;
