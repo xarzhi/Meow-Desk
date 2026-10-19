@@ -785,13 +785,30 @@ static DesktopIconView* IconAtScreen(POINT pt) {
     return g_surface.ItemAtScreen(pt);
 }
 
-// 回收站是虚拟项（解析名是 ::{645FF040-…}），没有文件系统路径，只能比解析名
+// 回收站是虚拟项（解析名是 ::{645FF040-…}），没有文件系统路径，只能比解析名。
+//
+// **不能**拿 SHGetKnownFolderPath(FOLDERID_RecycleBinFolder) 当对照值：
+// 实测这台机器上它直接返回 E_FAIL(0x80004005)，于是这里永远为假 ——
+// 两个用户可见的后果：
+//   · 拖文件到回收站 → 认不出目标 → 只把文件挪到回收站旁边
+//   · 拖我们的图标到回收站 → 认不出目标 → 图标回到原位，什么都没发生
+// 所以 GUID 字面量写死：回收站的 FOLDERID 在所有系统上都是这一个，
+// 只有「解析名」的写法（::{GUID}）是稳定的。
 static bool IsRecycleBinPath(const std::wstring& p) {
+    static const wchar_t kBin[] = L"::{645FF040-5081-101B-9F08-00AA002F954E}";
+    if (p.empty()) return false;
+    std::wstring s = p;
+    while (!s.empty() && s.back() == L'\\') s.pop_back();   // 个别地方会带尾反斜杠
+    if (CompareStringOrdinal(s.c_str(), -1, kBin, -1, TRUE) == CSTR_EQUAL) return true;
+
+    // 兜底：万一某些系统给的是别的形式，再跟已知文件夹路径比一次
     PWSTR rb = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_RecycleBinFolder, 0, nullptr, &rb)) || !rb) return false;
-    const bool same = CompareStringOrdinal(p.c_str(), -1, rb, -1, TRUE) == CSTR_EQUAL;
-    CoTaskMemFree(rb);
-    return same;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RecycleBinFolder, 0, nullptr, &rb)) && rb) {
+        const bool same = CompareStringOrdinal(s.c_str(), -1, rb, -1, TRUE) == CSTR_EQUAL;
+        CoTaskMemFree(rb);
+        return same;
+    }
+    return false;
 }
 
 static DWORD DeleteFilesToRecycleBin(const std::vector<std::wstring>& paths) {
@@ -809,8 +826,10 @@ static DWORD DeleteFilesToRecycleBin(const std::vector<std::wstring>& paths) {
     op.pFrom = from.c_str();
     // FOF_ALLOWUNDO = 进回收站（和桌面拖到回收站一样，还能还原）
     op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
-    const bool ok = SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
-    LogStep(std::string("drop -> recycle bin: ") + (ok ? "ok" : "FAILED"));
+    const int rc = SHFileOperationW(&op);
+    const bool ok = rc == 0 && !op.fAnyOperationsAborted;
+    LogStep("drop -> recycle bin: rc=" + std::to_string(rc) + " aborted=" +
+            std::to_string(op.fAnyOperationsAborted ? 1 : 0) + (ok ? " ok" : " FAILED"));
     return ok ? DROPEFFECT_MOVE : DROPEFFECT_NONE;
 }
 
@@ -914,7 +933,10 @@ static DWORD DropFilesOntoIcon(const std::vector<std::wstring>& paths, DesktopIc
     }
     if (IsProgramTarget(tgt)) return OpenFilesWithIcon(paths, tgt->path);
 
-    // 不认识的目标（普通文件图标）：让调用方按普通落点处理
+    // 不认识的目标（普通文件图标）：让调用方按普通落点处理。
+    // 这里必须留一行日志 —— 「松手以后什么都没发生」这种问题，有这行就能立刻
+    // 分清是「没命中图标」还是「命中了但不认识它」。
+    LogStep("drop -> target ignored: " + Narrow(tgt->path));
     return DROPEFFECT_NONE;
 }
 
@@ -2188,6 +2210,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     // 盒子建好之后才能校验盒号 → 在这里还原上次的图标布局
     ApplyIconLayout();
+    // 自检：回收站到底认没认出来。它认不出来的话，「拖到回收站」会静默变成
+    // 「拖到旁边」（这一条曾经藏了两轮反馈才被定位），所以每次启动都留个记录。
+    {
+        int bins = 0;
+        for (auto* e : g_icons)
+            if (e && IsRecycleBinPath(e->path)) ++bins;
+        LogStep("recycle bin icons detected: " + std::to_string(bins));
+    }
     // 还原完归属才知道哪些图标在盒子里，这时再把它们换成「查看」档位对应的尺寸
     for (int i = 0; i < (int)g_fences.size(); ++i) EnsureFenceIconSize(i);
     // 自动整理只认「启动之后新出现的」项目，先把现有的都记下来
