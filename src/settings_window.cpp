@@ -445,6 +445,8 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
     StringFormat sfRight;
     sfRight.SetAlignment(StringAlignmentFar);
     sfRight.SetLineAlignment(StringAlignmentCenter);
+    // 不换行：右边对齐的都是「版本号 / 一句话」这种短文本，折行反而会顶到下一行去
+    sfRight.SetFormatFlags(StringFormatFlagsNoWrap);
     StringFormat sfCenter;
     sfCenter.SetAlignment(StringAlignmentCenter);
     sfCenter.SetLineAlignment(StringAlignmentCenter);
@@ -853,13 +855,19 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
              L"\u754c\u9762\u98ce\u683c\u4e0e\u4ea4\u4e92\u53c2\u8003"},
         };
         float oy = (float)c2 + 54.0f;
+        // 名字在左，版本和用途描述都靠右 —— 整块说明贴在每一行的右下角。
+        // 以前 meta 从 kRowLeft+190 起（差不多在卡片正中），描述又从最左边起，
+        // 两段文字都被挤在中间，右边一大片空白，看着很散。
+        const float kOsRight = (float)(kClientW - kCardR - 20);   // 卡片内右边界
         for (const OsItem& it : kOs) {
             g.DrawString(it.name, -1, &fBody, RectF((float)kRowLeft, oy, 200.0f, 20.0f), &sf,
                          &brText);
-            g.DrawString(it.meta, -1, &fSub, RectF((float)kRowLeft + 190.0f, oy, 360.0f, 20.0f),
-                         &sf, &brSub);
-            g.DrawString(it.use, -1, &fSub, RectF((float)kRowLeft, oy + 21.0f, 460.0f, 18.0f),
-                         &sf, &brSub);
+            g.DrawString(it.meta, -1, &fSub,
+                         RectF((float)kRowLeft, oy, kOsRight - (float)kRowLeft, 20.0f),
+                         &sfRight, &brSub);
+            g.DrawString(it.use, -1, &fSub,
+                         RectF((float)kRowLeft, oy + 21.0f, kOsRight - (float)kRowLeft, 18.0f),
+                         &sfRight, &brSub);
             oy += 58.0f;
         }
         break;
