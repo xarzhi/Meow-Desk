@@ -11,6 +11,7 @@
 //       owner == -1 → 桌面；owner == i → 第 i 个盒子
 //     "拖进盒子""盒子间互拖""拖回桌面"都只是改这个整数
 //   · 启动时隐藏资源管理器的桌面图标视图，退出时恢复
+#include "backdrop.h"
 #include "config.h"
 #include "confirm_dialog.h"
 #include "desktop_icons.h"
@@ -62,6 +63,14 @@ static std::vector<std::unique_ptr<FenceWindow>> g_fences;
 // 抓磨砂背景的那几毫秒里，被临时排除出抓屏的自家窗口（抓完立刻还原）。
 // 见盒子创建处注册的 SetCaptureExcluder。
 static std::vector<HWND> g_captureExcluded;
+// 本进程可见窗口的缓存（窗口 + 矩形）。排除钩子每抓一次屏就要算「谁跟抓取区域相交」，
+// 每次都 EnumWindows 太浪费 —— 缓 2 秒，只有新建/删除盒子才会变。
+struct OwnWin {
+    HWND hwnd;
+    RECT rc;
+};
+static std::vector<OwnWin> g_ownWins;
+static DWORD g_ownWinsT = 0;
 
 static TrayIcon g_tray;
 static SettingsWindow g_settings;
@@ -2544,9 +2553,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     });
 
     // 抓磨砂背景时，把「我们自己的窗口」暂时从抓屏里排除掉。
-    // 不排除的话：拖着 A 盒子经过 B 盒子，A 的磨砂里会出现 B 的鬼影（被抓进去了）；
-    // 桌面图标层同理（那一片图标会被糊进卡片里）。只处理跟抓取区域相交的窗口 ——
-    // 一次改十几个窗口的显示亲和性会让 DWM 重新合成，看起来像闪一下。
+    //
+    // 【这一条是整个亚克力能不能对的关键】实测（见 backdrop.h 里的记录）：分层窗口
+    // **照样会被 BitBlt 抓进来**，带不带 CAPTUREBLT 一样。而我们的盒子、桌面图标层
+    // 全是 per-pixel alpha 的分层窗口 —— 不排除，抓回来的就是自己上一帧的画面：
+    // 磨砂自我回授，越糊越暗，外面变了永远传不进来。
+    //
+    // 这个函数会被**后台抓图线程**调用（不是 UI 线程），所以：
+    //   · 用不带捕获的裸函数指针（SetCaptureExcluder 的参数类型），不能拿 std::function；
+    //   · g_captureExcluded / g_ownWins 只能在这里面读写，序列化由 backdrop.cpp
+    //     里那把锁保证（所有调用都必须经过它的 ExclGuard）。
     FenceWindow::SetCaptureExcluder([](const RECT& rc, bool exclude) {
         if (!exclude) {
             for (HWND h : g_captureExcluded) SetWindowDisplayAffinity(h, WDA_NONE);
@@ -2554,27 +2570,40 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             return;
         }
         g_captureExcluded.clear();
-        const DWORD me = GetCurrentProcessId();
-        struct Ctx {
-            const RECT* rc;
-            DWORD pid;
-        } ctx{&rc, me};
-        EnumWindows(
-            [](HWND h, LPARAM lp) -> BOOL {
-                auto* c = reinterpret_cast<Ctx*>(lp);
-                DWORD pid = 0;
-                GetWindowThreadProcessId(h, &pid);
-                if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
-                RECT r{};
-                if (!GetWindowRect(h, &r)) return TRUE;
-                if (r.right <= c->rc->left || c->rc->right <= r.left) return TRUE;
-                if (r.bottom <= c->rc->top || c->rc->bottom <= r.top) return TRUE;
-                if (SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE))
-                    g_captureExcluded.push_back(h);
-                return TRUE;
-            },
-            reinterpret_cast<LPARAM>(&ctx));
+
+        // 自家窗口列表缓存 2 秒：每次抓屏都 EnumWindows + 每个窗口一次 GetWindowRect，
+        // 七个盒子每两秒各抓一次，全扫一遍是白花钱。窗口增删本来就只有「新建/删除
+        // 盒子 → 主线程会重建」这一种情况，2 秒的滞后完全够。
+        const DWORD now = GetTickCount();
+        if (g_ownWins.empty() || now - g_ownWinsT > 2000) {
+            g_ownWins.clear();
+            g_ownWinsT = now;
+            const DWORD me = GetCurrentProcessId();
+            struct Ctx {
+                DWORD pid;
+            } ctx{me};
+            EnumWindows(
+                [](HWND h, LPARAM lp) -> BOOL {
+                    auto* c = reinterpret_cast<Ctx*>(lp);
+                    DWORD pid = 0;
+                    GetWindowThreadProcessId(h, &pid);
+                    if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
+                    RECT r{};
+                    if (!GetWindowRect(h, &r)) return TRUE;
+                    g_ownWins.push_back(OwnWin{h, r});
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(&ctx));
+        }
+        for (const OwnWin& w : g_ownWins) {
+            if (w.rc.right <= rc.left || rc.right <= w.rc.left) continue;
+            if (w.rc.bottom <= rc.top || rc.bottom <= w.rc.top) continue;
+            if (SetWindowDisplayAffinity(w.hwnd, WDA_EXCLUDEFROMCAPTURE))
+                g_captureExcluded.push_back(w.hwnd);
+        }
     });
+    // 抓屏诊断：写进日志，下次「磨砂不对」时先看这一行。
+    SetCaptureLogHook([](const char* msg) { LogStep(msg ? msg : ""); });
     for (int i = 0; i < (int)g_config.fences.size(); ++i) AddFenceWindow(i);
     LogStep("fences created: " + std::to_string(g_fences.size()));
 

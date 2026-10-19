@@ -77,11 +77,11 @@ public:
     // 交给 PollBackdropChange 统一处理（等一小会儿再抓）。
     void ScheduleBackdropRefresh();
 
-    // 心跳里轮询（主程序每 500ms 叫一个盒子，转着圈来）：
-    //   · 到点的延后重抓 → 现在就抓
-    //   · 否则采样盒子外面一小块屏幕的均值，和上次比变了就重抓
-    // 动态壁纸 / 幻灯片轮播根本不发 SPI_SETDESKWALLPAPER，只能靠像素差分发现。
-    // 采样一次是一块 16×16 的 StretchBlt，微秒级；重抓只在真的变了时发生。
+    // 心跳里轮询（主程序每 500ms 叫一次）：
+    //   · 到点的延后重抓 → 现在就抓（换壁纸广播那条路）
+    //   · 否则定频（kBackdropAutoMs）让后台线程重抓一次，**抓回来的图真的变了才重画**
+    // 定时重抓是唯一可靠的信号：动态壁纸、幻灯片轮播不发 SPI_SETDESKWALLPAPER，
+    // 「盒子背后开了个窗口」更是没有任何通知。
     void PollBackdropChange();
 
     void Redraw();
@@ -109,11 +109,14 @@ public:
 
     // 抓磨砂底图时，让「我们自己的窗口」暂时从抓屏里消失。
     //
-    // 不这么做的话，拖着盒子经过别的盒子时，磨砂里会出现那块盒子的一团鬼影
-    // （被抓屏抓进去了）；桌面图标层同理。参数 rect 是这次要抓的区域，
-    // 实现方只需要处理跟它相交的窗口 —— 一次改十几个窗口的显示亲和性会让
-    // DWM 重新合成，看起来像闪一下。
-    static void SetCaptureExcluder(std::function<void(const RECT& rect, bool exclude)> fn);
+    // 不这么做的话，抓回来的底图**就是盒子自己上一帧的画面**（实测：分层窗口
+    // 照样会被 BitBlt 抓进来），磨砂自我回授、越糊越暗，外面变了也传不进来。
+    // 参数 rect 是这次要抓的区域，实现方只需要处理跟它相交的窗口。
+    //
+    // 钩子会被**后台抓图线程**调用（不是 UI 线程），实现方自己保证线程安全；
+    // 序列化由 backdrop.cpp 里那把锁负责。用裸函数指针而不是 std::function：
+    // 后台线程不能持有捕获了栈上状态的 std::function。
+    static void SetCaptureExcluder(void (*fn)(const RECT& rect, bool exclude));
 
     // 屏幕坐标是否落在盒子矩形内（含收起后的头部）
     bool HitTest(POINT screenPt) const;
@@ -271,7 +274,9 @@ private:
     // 把「抓一块」丢给工作线程（pad：四周多抓一圈）。已有在途请求时直接返回。
     void RequestBackdropAsync(int pad);
     // 底图还盖得住当前矩形吗？盖不住就提交一次后台补抓
-    void EnsureBackdropCover();
+    // 补磨砂底图（后台那一单回来了就在这里换上）。
+    // 返回值：底图真的换了（调用方据此决定要不要重画一帧）。
+    bool EnsureBackdropCover();
 
     void Collect(std::vector<DesktopIconView*>& out) const;
     // 实际参与布局/绘制的图标（排除正在被拖出的那个）
@@ -426,7 +431,6 @@ private:
 
     std::vector<DesktopIconView*>* all_ = nullptr;
     static std::function<std::vector<RECT>(const FenceWindow*)> s_obstacleProvider;
-    static std::function<void(const RECT&, bool)> s_captureExcluder;
     // 拖动夹取的最后一次实况（只给 DragDebug 用）
     mutable int dbgObstacles_ = -1;
     mutable RECT dbgWant_{};
@@ -461,19 +465,12 @@ private:
     int backdropX_ = 0, backdropY_ = 0;
     // 上一次提交后台补抓的时刻（限频用）
     DWORD backdropCoverT_ = 0;
-    // 壁纸指纹：定期采样盒子外面一小块屏幕的均值，变了就说明壁纸动了。
+    // 下一次「定频自动重抓」的时刻。各盒子按 index 错开，避免同一帧里
+    // 七个盒子一起抓屏（那一下的 GPU 回读是肉眼可见的）。
+    DWORD bdAutoDue_ = 0;
     // bdRefreshPending_ = 「有一单延后的重抓排着」（收到壁纸广播后等 DWM 合成完再抓）
     bool bdRefreshPending_ = false;
     DWORD bdDue_ = 0;
-    bool probeValid_ = false;
-    int probeR_ = 0, probeG_ = 0, probeB_ = 0;
-    // 上一次采样用的屏幕坐标（采样块左上角）。
-    // 展开/收起/拖动/改尺寸都会让采样点换地方，不同位置的均值没有可比性 ——
-    // 换了位置就重新立基线，不能当成「壁纸变了」。
-    int probeX_ = 0, probeY_ = 0;
-    // 连续几次采样都和基线不同。要求连续两次才动手：别的窗口扫过采样点
-    // （或者那附近有个图标被 hover 高亮）也会让均值变一点，一次就信会误抓。
-    int probeHits_ = 0;
     // 已经确认过「这块地方的壁纸就是一片纯色」：之后快路径抓到纯色也直接用，
     // 不再走慢路径反复确认（纯色壁纸 + 反复确认 = 拖动时一直闪）。
     bool bdPlainArea_ = false;

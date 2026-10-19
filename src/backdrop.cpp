@@ -9,6 +9,61 @@
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// 抓屏排除自家窗口
+//
+// 【血的教训】以前这里写着「不带 CAPTUREBLT 时分层窗口天然不进画面」，据此做了一条
+// 「快路径」：不碰任何窗口的 WDA，直接 BitBlt。这句话在本机（Win11 22621）上是错的，
+// 用一个 8×8 的分层小红块验证过：普通 BitBlt 抓到的均值 R = 164（壁纸 152，
+// 红块面积按比例算出来 163.4），也就是**分层窗口照样被抓进来**；而带上
+// WDA_EXCLUDEFROMCAPTURE 之后回到 152，CAPTUREBLT 与否结果逐字节相同。
+//
+// 于是「快路径」抓到的全是自己：盒子的 per-pixel alpha 缓冲、桌面图标层（整屏）
+// 全在里面。磨砂底图 = 把上一帧的自己再糊一遍，越糊越暗，而且盒子以外的东西
+// 变化根本传不进来 —— 用户看到的就是「亚克力永远不对、后面变八百年了它也不变」。
+//
+// 所以现在只有一条抓屏路径：先排除，再抓，再还原。WDA 只对调用进程自己的窗口有效
+// （别的进程调会返回 FALSE），这也是为什么排除必须做在本进程里。
+// ---------------------------------------------------------------------------
+CaptureExcludeFn g_excludeHook = nullptr;
+CaptureLogFn g_logHook = nullptr;
+bool g_loggedNoWda = false;
+// 一把锁把整段「排除 → 抓屏 → 还原」串起来：后台线程和 UI 线程都会抓，
+// 交错的话 A 的还原会把 B 排除掉的窗口又放回画面里。
+std::mutex g_exclMu;
+
+void LogOnce(const char* msg) {
+    if (!g_logHook || g_loggedNoWda) return;
+    g_loggedNoWda = true;
+    g_logHook(msg);
+}
+
+// 作用域内把自家窗口从抓屏画面里摘掉。
+struct ExclGuard {
+    std::unique_lock<std::mutex> lk{g_exclMu};
+    RECT rc{};
+    HWND self = nullptr;
+    bool hooked = false;
+    bool selfOk = false;
+
+    ExclGuard(const RECT& r, HWND s) : rc(r), self(s) {
+        if (self) selfOk = SetWindowDisplayAffinity(self, WDA_EXCLUDEFROMCAPTURE) != 0;
+        if (g_excludeHook) {
+            g_excludeHook(rc, true);
+            hooked = true;
+        }
+        if (!selfOk) {
+            LogOnce("backdrop: WDA_EXCLUDEFROMCAPTURE failed -> PaintDesktop fallback");
+        }
+    }
+    ~ExclGuard() {
+        if (hooked) g_excludeHook(rc, false);
+        if (self && selfOk) SetWindowDisplayAffinity(self, WDA_NONE);
+    }
+    // 抓屏能不能用：排除不掉自己（老系统 / 特殊会话）就只能走 PaintDesktop。
+    bool ok() const { return selfOk; }
+};
+
 // 单趟水平盒式模糊（滑动窗口求和）
 void BoxBlurH(uint8_t* px, int w, int h, int r) {
     if (r <= 0) return;
@@ -238,42 +293,6 @@ bool CaptureScreenRegionFast(int x, int y, int w, int h, std::vector<uint8_t>& o
     return true;
 }
 
-bool SampleScreenMean(int x, int y, int w, int h, int& r, int& g, int& b) {
-    r = g = b = 0;
-    if (w <= 0 || h <= 0) return false;
-
-    // 16×16 就够了：当指纹只关心「这块地方整体变色没有」，
-    // 分辨率再高也只会把噪点和抗锯齿抖动一起放大。
-    const int dw = 16, dh = 16;
-    MemDib m;
-    if (!MakeMemDib(dw, dh, m)) return false;
-
-    HDC screen = GetDC(nullptr);
-    if (!screen) return false;
-    // COLORONCOLOR（近邻取样）而不是 HALFTONE：后者每次调用都要建一张半色调表，
-    // 这一路是「每 500ms 每个盒子一次」的常驻开销，不能用慢模式。
-    // 当指纹只关心均值，近邻取样的 256 个点完全够。
-    SetStretchBltMode(m.dc, COLORONCOLOR);
-    // 不带 CAPTUREBLT：分层窗口不进画面（和我们抓底图的快路径保持同一层视角，
-    // 否则量到的是我们自己画出来的东西，永远量不出「壁纸变了」）
-    const BOOL ok = StretchBlt(m.dc, 0, 0, dw, dh, screen, x, y, w, h, SRCCOPY);
-    ReleaseDC(nullptr, screen);
-    if (!ok) return false;
-
-    const auto* p = reinterpret_cast<const uint8_t*>(m.bits);
-    long long sr = 0, sg = 0, sb = 0;
-    for (int i = 0; i < dw * dh; ++i) {
-        sb += p[i * 4 + 0];
-        sg += p[i * 4 + 1];
-        sr += p[i * 4 + 2];
-    }
-    const int n = dw * dh;
-    r = (int)(sr / n);
-    g = (int)(sg / n);
-    b = (int)(sb / n);
-    return true;
-}
-
 void BlurRgba(std::vector<uint8_t>& px, int w, int h, int radius, int passes) {
     if (w <= 0 || h <= 0 || radius <= 0) return;
     if (px.size() < (size_t)w * h * 4) return;
@@ -321,16 +340,21 @@ bool NearlyUniform(const std::vector<uint8_t>& px, int w, int h) {
 }
 
 bool CaptureBlurredBackdrop(int x, int y, int w, int h, int blurRadius,
-                            std::vector<uint8_t>& out, bool preferDesktop) {
+                            std::vector<uint8_t>& out, bool preferDesktop, HWND self) {
     bool ok = false;
-    if (preferDesktop) {
-        ok = CaptureDesktopRegion(x, y, w, h, out);
-        if (!ok) ok = CaptureScreenRegion(x, y, w, h, out);
-    } else {
-        // 首选抓屏：动态壁纸（Wallpaper Engine 等）只有这条路能拿到真实画面，
-        // 调用方需先把本窗口 SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) 排除掉
-        ok = CaptureScreenRegion(x, y, w, h, out);
-        if (!ok) ok = CaptureDesktopRegion(x, y, w, h, out);
+    {
+        // 先排除、再抓、出作用域还原（见 ExclGuard 的注释）。模糊放在锁外面：
+        // 那是纯内存运算，占着锁会让另一个线程的抓屏白等。
+        ExclGuard g(RECT{x, y, x + w, y + h}, self);
+        const bool canBlit = g.ok();
+        if (preferDesktop || !canBlit) {
+            ok = CaptureDesktopRegion(x, y, w, h, out);
+            if (!ok && canBlit) ok = CaptureScreenRegion(x, y, w, h, out);
+        } else {
+            // 首选抓屏：动态壁纸（Wallpaper Engine 等）只有这条路能拿到真实画面
+            ok = CaptureScreenRegion(x, y, w, h, out);
+            if (!ok) ok = CaptureDesktopRegion(x, y, w, h, out);
+        }
     }
     if (!ok) return false;
     BlurFastRgba(out, w, h, blurRadius);
@@ -338,11 +362,19 @@ bool CaptureBlurredBackdrop(int x, int y, int w, int h, int blurRadius,
 }
 
 bool CaptureBlurredBackdropFast(int x, int y, int w, int h, std::vector<uint8_t>& out,
-                                bool* uniform) {
+                                bool* uniform, HWND self) {
     if (uniform) *uniform = false;
-    if (!CaptureScreenRegionFast(x, y, w, h, out)) return false;
-    // 分层窗口画的壁纸（某些动态壁纸）在不带 CAPTUREBLT 的抓屏里是「空的」，
-    // 拿到的是一片纯色甚至全黑 —— 但也可能壁纸本身就是纯色。这里只报事实。
+    bool ok = false;
+    {
+        ExclGuard g(RECT{x, y, x + w, y + h}, self);
+        // 排除不掉自己就别抓了：那抓回来的必然是我们自己上一帧的画面，
+        // 还不如只要壁纸（PaintDesktop 天生看不见窗口）。
+        ok = g.ok() ? CaptureScreenRegionFast(x, y, w, h, out)
+                    : CaptureDesktopRegion(x, y, w, h, out);
+    }
+    if (!ok) return false;
+    // 除了我们自己之外，整块画面是一片纯色 —— 可能是壁纸本来就纯色，也可能是
+    // 壁纸画在别人家的分层窗口上（我们排除不掉它，抓到的是它下面那层）。只报事实。
     const bool uni = NearlyUniform(out, w, h);
     if (uniform) *uniform = uni;
     BlurFastRgba(out, w, h, 20);
@@ -359,6 +391,7 @@ namespace {
 
 struct JobRequest {
     RECT rect{};
+    HWND self = nullptr;
     std::shared_ptr<BackdropCaptureJob> job;
 };
 
@@ -395,7 +428,7 @@ struct Worker {
             j.w = w;
             j.h = h;
             bool uni = false;
-            j.ok = CaptureBlurredBackdropFast(x, y, w, h, j.px, &uni);
+            j.ok = CaptureBlurredBackdropFast(x, y, w, h, j.px, &uni, req.self);
             j.uniform = uni;
             j.finished.store(true, std::memory_order_release);
         }
@@ -419,13 +452,23 @@ Worker& GetWorker() {
 
 }  // namespace
 
-std::shared_ptr<BackdropCaptureJob> BackdropCaptureAsync(const RECT& rect) {
+void SetCaptureExcludeHook(CaptureExcludeFn fn) {
+    std::lock_guard<std::mutex> lk(g_exclMu);
+    g_excludeHook = fn;
+}
+
+void SetCaptureLogHook(CaptureLogFn fn) {
+    std::lock_guard<std::mutex> lk(g_exclMu);
+    g_logHook = fn;
+}
+
+std::shared_ptr<BackdropCaptureJob> BackdropCaptureAsync(const RECT& rect, HWND self) {
     if (rect.right - rect.left < 16 || rect.bottom - rect.top < 16) return nullptr;
     Worker& w = GetWorker();
     w.Start();
     auto job = std::make_shared<BackdropCaptureJob>();
     job->rect = rect;
-    if (!w.Push(JobRequest{rect, job})) {
+    if (!w.Push(JobRequest{rect, self, job})) {
         // 队列积压：直接当作「这次没抓成」，调用方下一帧会重新提交最近的矩形
         job->finished.store(true, std::memory_order_release);
     }
