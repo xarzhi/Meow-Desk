@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """从 logo.png 生成程序图标：res/meow-desk.ico + res/logo-256.png + res/logo-128.png
 
-原则：**原图怎么画就怎么用，只做等比缩放。不裁、不重新合成、不改构图。**
+原则：**原图怎么画就怎么用，只做等比缩放。不抠图、不重绘、不改构图、不缩紧包围盒。**
 
-logo.png 本身是 512x512 RGBA 的标准图标稿：圆角底板铺满整块画布、四角透明，
-所以每个尺寸都是「整张图缩到 N×N」就完事。
+logo.png 是一张 512x512 的设计稿，里面是 **2x2 四张图**：
+  · 左上 = 白底圆角砖 + 猫头（正式图标）
+  · 其余三张 = 只有紫色渐变底的空位（设计稿里预留的位置）
+所以直接把整张 512 缩成图标，exe / 托盘 / 关于页看到的就是「四个小格」，
+等于把 logo 切成四块 —— 之前就是这么错的。
 
-（早期版本量出猫的墨迹包围盒、贴着裁掉空白、再在自绘底板上正片叠底重画 ——
+现在改成：先把左上那张**整块取出来**（156x156，像素原样，不描边不重绘），
+再从这张砖缩放到各个尺寸。
+
+（更早的版本量出猫的墨迹包围盒、贴着裁掉空白、再在自绘底板上正片叠底重画 ——
 那会改变猫在底板里的占比，还会丢掉原图的描边和内阴影，等于擅自改了设计稿。
 已废弃，别再写回来。）
 
@@ -30,6 +36,16 @@ CORE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(CORE, "logo.png")
 RES = os.path.join(CORE, "res")
 TMP = os.path.join(CORE, "_tmp_ico")
+
+# 四宫格里「左上那张猫」的位置：x, y, 边长。
+#
+# 不是拍脑袋量的：另外三张是纯紫底，很好认，扫出来三块分别是
+#   (286,75) (78,283) (286,283)，边长 ~156，横向间距 209、纵向 208
+# 反推左上的落点就是 (77,76)。同一套稿子的四张砖边长一致。
+# 换 logo.png 之后如果尺寸/排版变了，改这三个数（或者把整张图直接当图标用，
+# 把 TILE 设成 None）。
+TILE = (77, 76, 156)
+SHEET_SIZE = 512   # 只有原图正好是这张设计稿尺寸时才取砖，否则整张缩
 
 # 这台机器上 ffmpeg 不在 PATH，几个程序自带的副本都能用
 FFMPEG_CANDIDATES = [
@@ -71,6 +87,13 @@ def raw_rgba(path):
     return bytearray(out), w, h
 
 
+def png_size(path):
+    """只读 PNG 头里的宽高，不解码。"""
+    with open(path, "rb") as f:
+        head = f.read(24)
+    return struct.unpack(">II", head[16:24])
+
+
 def scale(src, dst, size):
     """整张图等比缩放到 size×size，保留 alpha。"""
     ff("-i", src, "-vf", f"scale={size}:{size}:flags={SCALE_FLAGS}", dst)
@@ -104,11 +127,21 @@ def main():
     os.makedirs(RES, exist_ok=True)
     os.makedirs(TMP, exist_ok=True)
 
-    # 每个尺寸 = 整张原图的等比缩放，不做任何裁切 / 重排
+    # 从哪张图缩：默认整张；如果原图就是 512 的四宫格设计稿，先取左上那块猫
+    # （整块取，像素原样 —— 既不是抠图也不是缩紧包围盒，猫在砖里的占比一点没动）
+    src = SRC
+    sw, sh = png_size(SRC)
+    if TILE and (sw, sh) == (SHEET_SIZE, SHEET_SIZE):
+        x, y, side = TILE
+        src = os.path.join(TMP, "tile.png")
+        ff("-i", SRC, "-vf", f"crop={side}:{side}:{x}:{y}", src)
+        print(f"四宫格设计稿：取左上那块猫 {side}x{side} @({x},{y})", flush=True)
+
+    # 每个尺寸 = 等比缩放，不做任何重新构图
     scaled = {}
     for s in SIZES:
         p = os.path.join(TMP, f"s{s}.png")
-        scale(SRC, p, s)
+        scale(src, p, s)
         scaled[s] = p
     print("scaled", " ".join(str(s) for s in SIZES), flush=True)
 
