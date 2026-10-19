@@ -9,17 +9,18 @@ setlocal
 cd /d "%~dp0"
 
 set "PY="
-where python >nul 2>&1 && set "PY=python"
-if not defined PY (
-  where py >nul 2>&1 && set "PY=py -3"
-)
-if not defined PY (
-  echo [ERROR] Python 3 not found. Install it or add python.exe to PATH.
+rem Python is only the driver here. See tools\find-python.bat for why a plain
+rem "where python" is not enough on this machine (Store redirector stub).
+call "%~dp0tools\find-python.bat"
+if not defined PYC (
+  echo [ERROR] Python 3 not found.
+  echo         Install Python 3 from https://www.python.org/downloads/
+  echo         and tick "Add python.exe to PATH" during setup.
   pause
   exit /b 1
 )
 
-%PY% "tools\icon.py" %*
+%PYC% "tools\icon.py" %*
 if errorlevel 1 (
   echo.
   echo [FAILED] see the output above.
