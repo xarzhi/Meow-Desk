@@ -33,6 +33,15 @@
 
 namespace {
 
+// 装完之后主程序叫这个（用户要求：MeowPlayer.exe）。
+// 打包里带的那份已经叫 MeowPlayer.exe；也认老名字，方便直接拿 build 里的产物测。
+const wchar_t* kAppExe = L"MeowPlayer.exe";
+const wchar_t* kLegacyExe = L"meow-desk.exe";
+
+// 数据目录 / 便携标记沿用老名字：主程序 storage::Dir() 里是写死的，
+// 改名会让老用户「布局全没了」，所以这里一个字符都不动。
+const wchar_t* kPortableMarker = L"meow-desk.portable";
+
 // ---- 控件 ----
 enum : int {
     IDC_TITLE = 100,
@@ -206,9 +215,11 @@ std::wstring DirOfPath(const std::wstring& p) {
 
 PrevInstall DetectPrevInstall() {
     PrevInstall p;
+    // 目录里有没有主程序：新名字优先，也认老的 meow-desk.exe（升级上来的用户）
     auto hasExe = [](const std::wstring& d) {
-        return !d.empty() &&
-               GetFileAttributesW((d + L"\\meow-desk.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (d.empty()) return false;
+        if (GetFileAttributesW((d + L"\\" + kAppExe).c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+        return GetFileAttributesW((d + L"\\" + kLegacyExe).c_str()) != INVALID_FILE_ATTRIBUTES;
     };
 
     std::wstring dir = RegGetStr(L"InstallDir");
@@ -233,7 +244,7 @@ PrevInstall DetectPrevInstall() {
     // 便携与否以标记文件为准 —— 主程序 storage::Dir() 就是看这个文件，
     // 注册表里那一份只是顺手记的，用户手动删标记时不能骗自己。
     p.portable =
-        GetFileAttributesW((dir + L"\\meow-desk.portable").c_str()) != INVALID_FILE_ATTRIBUTES;
+        GetFileAttributesW((dir + L"\\" + kPortableMarker).c_str()) != INVALID_FILE_ATTRIBUTES;
     return p;
 }
 
@@ -303,11 +314,14 @@ void DoInstall(HWND hwnd) {
         return;
     }
 
-    const std::wstring src = ExeDir() + L"\\meow-desk.exe";
+    // 安装包里带的主程序：新名字优先，也认 build 里那个 meow-desk.exe
+    std::wstring src = ExeDir() + L"\\" + kAppExe;
+    if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES)
+        src = ExeDir() + L"\\" + kLegacyExe;
     if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES) {
         MessageBoxW(hwnd,
-                    L"\u627e\u4e0d\u5230 meow-desk.exe\u3002\n\n"
-                    L"\u8bf7\u628a\u5b89\u88c5\u7a0b\u5e8f\u548c meow-desk.exe "
+                    L"\u627e\u4e0d\u5230 MeowPlayer.exe\u3002\n\n"
+                    L"\u8bf7\u628a\u5b89\u88c5\u7a0b\u5e8f\u548c MeowPlayer.exe "
                     L"\u653e\u5728\u540c\u4e00\u4e2a\u6587\u4ef6\u5939\u91cc\u518d\u8fd0\u884c\u3002",
                     L"meow-desk", MB_ICONERROR);
         return;
@@ -328,7 +342,7 @@ void DoInstall(HWND hwnd) {
     }
 
     SetStatus(L"\u6b63\u5728\u590d\u5236\u7a0b\u5e8f\u6587\u4ef6\u2026", 35);
-    const std::wstring dst = dir + L"\\meow-desk.exe";
+    const std::wstring dst = dir + L"\\" + kAppExe;
     if (!CopyFileW(src.c_str(), dst.c_str(), FALSE)) {
         SetStatus(L"\u590d\u5236\u5931\u8d25", 0);
         MessageBoxW(hwnd,
@@ -343,7 +357,7 @@ void DoInstall(HWND hwnd) {
     }
 
     // 数据位置：便携模式写标记文件，否则确保没有标记（回到 %APPDATA%）
-    const std::wstring marker = dir + L"\\meow-desk.portable";
+    const std::wstring marker = dir + L"\\" + kPortableMarker;
     if (PortableSelected()) {
         SetStatus(L"\u6b63\u5728\u5207\u6362\u5230\u4fbf\u643a\u6a21\u5f0f\u2026", 55);
         HANDLE f = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -351,7 +365,7 @@ void DoInstall(HWND hwnd) {
         if (f != INVALID_HANDLE_VALUE) {
             const char* note =
                 "meow-desk portable mode\r\n"
-                "config.ini / meow-desk.db are stored next to meow-desk.exe.\r\n"
+                "config.ini / meow-desk.db are stored next to MeowPlayer.exe.\r\n"
                 "Delete this file to go back to %APPDATA%\\meow-desk.\r\n";
             DWORD wrote = 0;
             WriteFile(f, note, (DWORD)strlen(note), &wrote, nullptr);
@@ -373,6 +387,12 @@ void DoInstall(HWND hwnd) {
 
     SetStatus(L"\u6b63\u5728\u521b\u5efa\u5feb\u6377\u65b9\u5f0f\u2026", 80);
     {
+        // 老版本装的是同目录的 meow-desk.exe：新版复制完就把它删掉，
+        // 免得目录里两个 exe、用户不知道该点哪个。正在运行删不掉就算了。
+        const std::wstring legacy = dir + L"\\" + kLegacyExe;
+        if (GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES)
+            DeleteFileW(legacy.c_str());
+
         const std::wstring menu = KnownFolder(FOLDERID_Programs);   // 开始菜单\程序
         if (!menu.empty() && EnsureDir(menu))
             CreateShortcut(dst, menu + L"\\meow-desk.lnk");
