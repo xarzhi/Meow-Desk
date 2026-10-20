@@ -3820,8 +3820,10 @@ void FenceWindow::Paint() {
 }
 
 LabelDib* FenceWindow::LabelOf(DesktopIconView* e, int boxW, int boxH, int glow, int maxLines) {
-    if (maxLines < 1) maxLines = 1;
-    // maxLines 必须进 key：选中/取消选中会切换单行↔两行，不进 key 就会一直用旧的
+    // maxLines 原样传给 LabelDib::Build —— **别在这里夹成 >= 1**。
+    // 0 表示「不限行」（聚焦时名字要完整显示），夹成 1 就是「点了图标名字永远
+    // 只有一行」，桌面那边走的是另一条路径，所以看着像「只有盒子里坏了」。
+    // maxLines 必须进 key：选中/取消选中会切换单行↔不限行，不进 key 就会一直用旧的
     std::wstring key = e->name + L"\x1|" + std::to_wstring(boxW) + L"x" +
                        std::to_wstring(boxH) + L"g" + std::to_wstring(glow) + L"m" +
                        std::to_wstring(maxLines);
