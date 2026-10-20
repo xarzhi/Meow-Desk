@@ -3435,10 +3435,15 @@ void FenceWindow::Paint() {
         // 待办盒不画这一层：它的 hot_ 是**行号**，套进 ItemHighlightRect 会算出
         // 一个图标格的矩形 —— 待办盒里凭空多出一块格子高亮（行高亮在
         // PaintTodoBody 里自己画，形状是整行的圆角条）。
+        //
+        // 悬停和选中（active）**共用同一块底色** —— 用户要求「active 高亮和鼠标
+        // hover 的背景颜色一致」，两个状态只靠那圈描边区分。以前深色卡片上
+        // 悬停是 52、选中是 44，选中的那块反而比悬停还淡，看着像两种颜色。
+        const Color iconHlFill = light ? Color(26, 0, 0, 0) : Color(52, 255, 255, 255);
         if (!collapsed_ && hot_ >= 0 && !itemDragging_ && !isTodo()) {
             RECT ir = ItemHighlightRect(hot_);
             if (ir.right > ir.left) {
-                SolidBrush hl{light ? Color(26, 0, 0, 0) : Color(52, 255, 255, 255)};
+                SolidBrush hl{iconHlFill};
                 gfx.FillRectangle(&hl, Rect(ir.left + 2, ir.top + 2, ir.right - ir.left - 4,
                                             cellH() - 4));
             }
@@ -3467,25 +3472,28 @@ void FenceWindow::Paint() {
             }
             const bool gridLabels = !IsListView() && showLabels_;
             const int glow = g_config.textShadow ? 2 : 0;
-            SolidBrush fill{light ? Color(34, 0, 0, 0) : Color(44, 255, 255, 255)};
+            // 底色和上面悬停那块完全一样（iconHlFill），选中只多一圈描边
+            SolidBrush fill{iconHlFill};
             Pen pen{light ? Color(70, 0, 0, 0) : Color(80, 255, 255, 255), 1.0f};
             for (size_t i = 0; i < mineSel.size(); ++i) {
                 if (!mineSel[i] || !mineSel[i]->selected) continue;
                 RECT sr = ItemHighlightRect((int)i);
                 if (sr.right <= sr.left) continue;
-                int h = cellH() - 6;
+                // 内缩和悬停那块保持一致（2px），这样两态除了描边之外完全重合
+                int bottom = sr.top + cellH() - 2;
                 if (gridLabels && mineSel[i] == expandOne) {
                     const IconBitmap& bm = mineSel[i]->bmp;
                     int lw = 0, lh = 0, topRel = 0;
                     ItemLabelMetrics((int)i, bm.valid() ? bm.height : 32, lw, lh, topRel);
                     if (LabelDib* lab = LabelOf(mineSel[i], lw, lh, glow, 0)) {
                         if (lab->valid()) {
-                            const int bottom = sr.top + topRel - lab->pad + lab->h + 3;
-                            if (bottom - sr.top - 6 > h) h = bottom - sr.top - 6;
+                            const int lb = sr.top + topRel - lab->pad + lab->h + 2;
+                            if (lb > bottom) bottom = lb;
                         }
                     }
                 }
-                const Rect rc(sr.left + 3, sr.top + 3, sr.right - sr.left - 6, h);
+                const Rect rc(sr.left + 2, sr.top + 2, sr.right - sr.left - 4,
+                              bottom - sr.top - 2);
                 // 浅色卡片上用暗一点的高亮，深色卡片上用亮一点的
                 gfx.FillRectangle(&fill, rc);
                 gfx.DrawRectangle(&pen, rc);

@@ -1144,6 +1144,17 @@ bool DesktopSurface::EnsureBackbuffer(int w, int h) {
     return true;
 }
 
+// 图标高亮（悬停 / 选中）的统一数值。
+// 用户明确要求「active 高亮和鼠标 hover 的背景颜色一致」—— 所以两个状态共用
+// 同一块底色（kHlFill），只靠边框深浅区分。以前选中是 48、悬停是 26，同一块
+// 蓝色深浅不同，看着像两种颜色。分层和不透明两条路径都从这里取值，别再写字面量。
+namespace {
+constexpr int kHlFill = 26;         // 底色 alpha（悬停 / 选中一样）
+constexpr int kHlEdgeHover = 72;    // 悬停：淡边
+constexpr int kHlEdgeSelect = 150;  // 选中：实边
+constexpr COLORREF kHlColor = RGB(0, 120, 215);
+}  // namespace
+
 void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghost) {
     int x = (dragging ? e->dragPos.x : e->pos.x) - origin_.x;
     int y = (dragging ? e->dragPos.y : e->pos.y) - origin_.y;
@@ -1160,14 +1171,14 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghos
     if (e->hover && !e->selected && !dragging) {
         RECT hf{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
         auto* b = reinterpret_cast<BYTE*>(bits_);
-        FillRectAlpha(b, bufW_, bufH_, hf, 26, RGB(0, 120, 215));
+        FillRectAlpha(b, bufW_, bufH_, hf, kHlFill, kHlColor);
         RECT edge[4] = {
             {hf.left, hf.top, hf.right, hf.top + 1},
             {hf.left, hf.bottom - 1, hf.right, hf.bottom},
             {hf.left, hf.top, hf.left + 1, hf.bottom},
             {hf.right - 1, hf.top, hf.right, hf.bottom},
         };
-        for (const auto& r : edge) FillRectAlpha(b, bufW_, bufH_, r, 72, RGB(0, 120, 215));
+        for (const auto& r : edge) FillRectAlpha(b, bufW_, bufH_, r, kHlEdgeHover, kHlColor);
     }
 
     // 选中高亮（填充 + 1px 边框）
@@ -1180,7 +1191,7 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghos
             if (ext.bottom - 2 > hb) hb = ext.bottom - 2;
         }
         RECT fill{x + 2, y + 2, x + cellW_ - 2, hb};
-        FillRectAlpha(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, fill, 48, RGB(0, 120, 215));
+        FillRectAlpha(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, fill, kHlFill, kHlColor);
         RECT edge[4] = {
             {fill.left, fill.top, fill.right, fill.top + 1},
             {fill.left, fill.bottom - 1, fill.right, fill.bottom},
@@ -1188,7 +1199,8 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghos
             {fill.right - 1, fill.top, fill.right, fill.bottom},
         };
         for (const auto& r : edge)
-            FillRectAlpha(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, r, 150, RGB(0, 120, 215));
+            FillRectAlpha(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, r, kHlEdgeSelect,
+                          kHlColor);
     }
 
     // 搜索「定位」的闪烁：亮相比选中态更亮更粗，保证一眼能找到
@@ -1444,14 +1456,14 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging, bool
     //（两套渲染路径的观感必须一样，否则换 MEOW_SURFACE 就成了两个程序）
     if (e->hover && !e->selected && !dragging) {
         RECT hf{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
-        FillRectBlend(hdc, hf, 26, RGB(0, 120, 215));
+        FillRectBlend(hdc, hf, kHlFill, kHlColor);
         RECT hedge[4] = {
             {hf.left, hf.top, hf.right, hf.top + 1},
             {hf.left, hf.bottom - 1, hf.right, hf.bottom},
             {hf.left, hf.top, hf.left + 1, hf.bottom},
             {hf.right - 1, hf.top, hf.right, hf.bottom},
         };
-        for (const auto& r : hedge) FillRectBlend(hdc, r, 72, RGB(0, 120, 215));
+        for (const auto& r : hedge) FillRectBlend(hdc, r, kHlEdgeHover, kHlColor);
     }
 
     if (e->selected) {
@@ -1462,14 +1474,14 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging, bool
             if (ext.bottom - 2 > hb) hb = ext.bottom - 2;
         }
         RECT fill{x + 2, y + 2, x + cellW_ - 2, hb};
-        FillRectBlend(hdc, fill, 48, RGB(0, 120, 215));
+        FillRectBlend(hdc, fill, kHlFill, kHlColor);
         RECT edge[4] = {
             {fill.left, fill.top, fill.right, fill.top + 1},
             {fill.left, fill.bottom - 1, fill.right, fill.bottom},
             {fill.left, fill.top, fill.left + 1, fill.bottom},
             {fill.right - 1, fill.top, fill.right, fill.bottom},
         };
-        for (const auto& r : edge) FillRectBlend(hdc, r, 150, RGB(0, 120, 215));
+        for (const auto& r : edge) FillRectBlend(hdc, r, kHlEdgeSelect, kHlColor);
     }
 
     // 搜索「定位」的闪烁（和分层路径同一套观感）
