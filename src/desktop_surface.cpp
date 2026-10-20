@@ -1088,9 +1088,14 @@ bool DesktopSurface::EnsureBackbuffer(int w, int h) {
     return true;
 }
 
-void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging) {
+void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghost) {
     int x = (dragging ? e->dragPos.x : e->pos.x) - origin_.x;
     int y = (dragging ? e->dragPos.y : e->pos.y) - origin_.y;
+
+    // 被拖走的原件留在原位的「灰占位」：变淡 + 变暗（盒子里是同一套数值，
+    // 见 fence_window.cpp 的 BlendIntoDim(ga=110, gd=120)）。
+    const int ga = ghost ? 110 : 255;   // 不透明度
+    const int gd = ghost ? 120 : 255;   // 额外压暗
 
     // 悬停：一层很淡的半透明底 + 更淡的描边（选中态另有一套，颜色更深还带实边，
     // 两者一眼能分开）。拖动中的图标不画，否则跟着鼠标跑一块色斑。
@@ -1146,8 +1151,9 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging) {
         // 直接用 IconBitmap 的像素（已经是预乘 BGRA），不再多占一份 IconDib 副本
         int ix = x + (cellW_ - iw) / 2;
         int iy = y + kIconTopPad;
-        BlendInto(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_,
-                  reinterpret_cast<const BYTE*>(e->bmp.pixels.data()), iw, ih, ix, iy);
+        BlendIntoDim(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_,
+                     reinterpret_cast<const BYTE*>(e->bmp.pixels.data()), iw, ih, ix, iy,
+                     ga, gd);
     }
 
     // 正在原地改名：名字由那个输入框代替（见 DesktopIconView::renaming）
@@ -1167,9 +1173,9 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging) {
     if (lab && lab->valid()) {
         int contentW = lab->w - lab->pad * 2;   // DIB 已按实际文字宽度收窄，按内容居中
         int left = x + (cellW_ - contentW) / 2 - lab->pad;
-        BlendInto(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_,
-                  reinterpret_cast<const BYTE*>(lab->bits), lab->w, lab->h,
-                  left, textTop - lab->pad);
+        BlendIntoDim(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_,
+                     reinterpret_cast<const BYTE*>(lab->bits), lab->w, lab->h,
+                     left, textTop - lab->pad, ga, gd);
     }
 }
 
@@ -1182,13 +1188,11 @@ void DesktopSurface::PaintLayered() {
     // 整屏重画前按当前光标位置同步一次悬停（图标可能刚搬过家）
     SyncHoverToCursor();
 
-    // 先画不动的，再画正在拖的，让拖动的图标压在上面
+    // 拖动中的图标在**原位**留一份灰的当占位，跟手的那张由拖拽浮层画在最上面。
+    // 以前是「拖走的直接跳过、原位什么都不画」，多选拖动时看不出原来占了哪几格。
     for (auto* e : *icons_) {
         if (!e || !e->OnDesktop()) continue;
-        // 只有真的拖动起来（moved_）才交给浮层画。
-        // 否则「按下鼠标还没动」的那一瞬间图标会从桌面层消失，看起来像是点一下图标就没了。
-        bool inDrag = mode_ == Mode::Move && moved_ && e->selected;
-        if (!inDrag) DrawOneLayered(e, false);
+        DrawOneLayered(e, false, IsDragGhost(e));
     }
     // 正在拖的图标交给拖拽浮层画（桌面层在所有盒子下面，不然会被盒子挡住）
 
@@ -1308,9 +1312,8 @@ void DesktopSurface::PaintOpaque(HDC hdc) {
         SyncHoverToCursor();
         for (auto* e : *icons_) {
             if (!e || !e->OnDesktop()) continue;
-            // 拖动中的图标交给拖拽浮层画（桌面层在所有盒子下面，会被挡住）
-            if (mode_ == Mode::Move && moved_ && e->selected) continue;
-            DrawOneGdi(hdc, e, false);
+            // 拖动中的图标：原位画灰占位（跟手的那张在拖拽浮层上）
+            DrawOneGdi(hdc, e, false, IsDragGhost(e));
         }
     }
 
@@ -1355,7 +1358,7 @@ void DesktopSurface::DrawSeamGdi(HDC hdc) {
     FillRectBlend(hdc, r, 235, RGB(0, 120, 215));
 }
 
-void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging) {
+void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging, bool ghost) {
     int x = (dragging ? e->dragPos.x : e->pos.x) - origin_.x;
     int y = (dragging ? e->dragPos.y : e->pos.y) - origin_.y;
 
@@ -1405,7 +1408,10 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging) {
 
     BLENDFUNCTION bf{};
     bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = 255;
+    // 灰占位：AlphaBlend 只有「整体不透明度」这一根旋钮，没有逐像素压暗，
+    // 所以这条路径只做变淡（分层路径会连变暗一起做）。这条路要用 MEOW_SURFACE
+    // 显式打开才会走，日常观感以分层路径为准。
+    bf.SourceConstantAlpha = ghost ? 110 : 255;
     bf.AlphaFormat = AC_SRC_ALPHA;   // 源是预乘 alpha → 边缘不会泛白
 
     if (iw > 0) {
@@ -1645,7 +1651,7 @@ void DesktopSurface::RepaintCells(const RECT& rect) {
         if (ex + cellW_ <= c.left || ex >= c.right || ey + cellH_ <= c.top ||
             ey >= c.bottom)
             continue;
-        DrawOneLayered(e, false);
+        DrawOneLayered(e, false, IsDragGhost(e));
     }
     UploadLayered();
 }

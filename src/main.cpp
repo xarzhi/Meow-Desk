@@ -446,7 +446,7 @@ static void SendIconsToDesktop(int fi, const std::vector<DesktopIconView*>& list
 // 改完再让受影响的盒子播一次位移动画（和「改排序」用的是同一套 StartFlip）。
 //
 // 为什么必须在改之前 Capture：槽位是「改之后」算不出来的。
-// 为什么只包住真正改动的那一句：别的分支里 DropIconOntoIcon 可能触发图标重载，
+// 为什么只包住真正改动的那一句：别的分支里 DropIconsOntoIcon 可能触发图标重载，
 // 那会把 g_icons 整个重建，先前记下的指针就成了野指针。
 // ---------------------------------------------------------------------------
 static std::vector<int> g_flipFences;
@@ -1088,10 +1088,32 @@ static DWORD DropFilesOntoIcon(const std::vector<std::wstring>& paths, DesktopIc
 }
 
 // 我们自己的图标拖到另一个图标上（内部拖拽）的语义，和上面完全一致。
+// 接受一整批 —— 框选 / Ctrl 多选之后一起拖，落到回收站/文件夹上也必须整批生效
+// （以前只认单个，多选拖动落在别的图标上就变成「在旁边摆开」，看着像完全没反应）。
 // 返回 DROPEFFECT_NONE = 「这个目标不认」，调用方照原来的「摆到这儿」处理。
-static DWORD DropIconOntoIcon(DesktopIconView* src, DesktopIconView* tgt) {
-    if (!src || !tgt || src == tgt || src->path.empty()) return DROPEFFECT_NONE;
-    return DropFilesOntoIcon({src->path}, tgt);
+static DWORD DropIconsOntoIcon(const std::vector<DesktopIconView*>& list,
+                               DesktopIconView* tgt) {
+    if (!tgt || list.empty()) return DROPEFFECT_NONE;
+    std::vector<std::wstring> paths;
+    paths.reserve(list.size());
+    for (auto* e : list) {
+        if (!e) continue;
+        if (e == tgt) return DROPEFFECT_NONE;   // 落在自己身上：按普通落点处理
+        if (e->path.empty()) continue;
+        paths.push_back(e->path);
+    }
+    if (paths.empty()) return DROPEFFECT_NONE;
+    return DropFilesOntoIcon(paths, tgt);
+}
+
+// 这个桌面图标能不能「接手」被拖来的东西（回收站 / 文件夹 / 可执行程序）。
+// 拖拽时用来判断「光标底下算不算有效落点」：算的话才把松手交给我们处理，
+// 不算（普通文件图标、快捷方式的空白区）就照旧按「摆到那一格」走。
+static bool IconAcceptsDrop(const DesktopIconView* e) {
+    if (!e || e->path.empty()) return false;
+    if (IsRecycleBinPath(e->path)) return true;
+    if (IsContainerTarget(e)) return true;
+    return IsProgramTarget(e);
 }
 
 // ---------------------------------------------------------------------------
@@ -2206,8 +2228,9 @@ static void AddFenceWindow(int i, bool startCollapsed) {
         ClearAllDropHints();
 
         if (fi >= 0) {
-            // 「拖到某个图标的正中间」只对单张有意义：目标是文件夹/回收站就
-            // 移进去/删掉，是程序就用它打开；目标不认才当插入位置处理。
+            // 「拖到某个图标的正中间」：目标是文件夹/回收站就移进去/删掉，是程序就用它
+            // 打开；目标不认才当插入位置处理。整批都交给同一个目标（多选拖到回收站
+            // 就整批删掉），不再只认单张。
             //
             // 目标必须按「光标正下方是哪个图标」直接取，**不能**拿 dropHint 的
             // 下标去 FenceItemAt 反查：h.item 是 HitItem 在「含被拖图标」的完整
@@ -2220,8 +2243,7 @@ static void AddFenceWindow(int i, bool startCollapsed) {
                     tgt = g_fences[fi]->ItemAtScreen(pt);
                 if (!tgt) tgt = FenceItemAt(fi, h.item);   // 兜底：光标压在两格之间
             }
-            DWORD eff = DROPEFFECT_NONE;
-            if (batch.size() == 1) eff = DropIconOntoIcon(batch[0], tgt);
+            const DWORD eff = DropIconsOntoIcon(batch, tgt);
             if (eff != DROPEFFECT_NONE) {
                 // MOVE = 文件被搬走了（进文件夹 / 进回收站），图标要跟着消失
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
@@ -2233,9 +2255,8 @@ static void AddFenceWindow(int i, bool startCollapsed) {
             }
         } else {
             // 盒子 → 桌面：先看落点有没有压在桌面图标上（文件夹 / 回收站 / 程序），
-            // 是的话交给它处理，而不是把图标摆到那个图标旁边。
-            DWORD eff = DROPEFFECT_NONE;
-            if (batch.size() == 1) eff = DropIconOntoIcon(batch[0], IconAtScreen(pt));
+            // 是的话交给它处理，而不是把图标摆到那个图标旁边。整批一起交。
+            const DWORD eff = DropIconsOntoIcon(batch, IconAtScreen(pt));
             if (eff != DROPEFFECT_NONE) {
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
             } else {
@@ -2611,7 +2632,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             PopupMenuItem(L"\u521b\u5efa\u76d2\u5b50", kCmdFenceFromMarquee));   // 创建盒子
         g_fenceMenu.Show(sp, std::move(items));
     };
-    g_surface.overTarget = [](POINT pt) { return FenceIndexAt(pt) >= 0; };
+    // 拖拽时「光标底下算不算有效落点」：盒子算；桌面上的回收站 / 文件夹 / 可执行
+    // 图标也算（它们能接手被拖来的东西）。只有这些是真的目标，其余照旧按
+    // 「摆到那一格」处理 —— 所以普通文件图标上不会丢掉缝隙线提示。
+    g_surface.overTarget = [](POINT pt) {
+        if (FenceIndexAt(pt) >= 0) return true;
+        return IconAcceptsDrop(g_surface.ItemAtScreen(pt));
+    };
     g_surface.onDragHover = [](POINT pt) {
         UpdateAllDropHints(pt);
         // 压到别的程序窗口上 → 交棒给系统级拖放（必须放在这一帧的最后）
@@ -2623,25 +2650,29 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         // 落在桌面上的某个图标上（文件夹移进去 / 回收站删除 / 程序用它打开）：
         // 交给它处理，而不是「摆到它旁边」。以前只有文件夹/回收站这条，程序图标
         // 会被当成普通落点，于是「拖 md 到 Typora 图标上」看起来毫无反应。
-        if (fi < 0 && list.size() == 1 && list[0]) {
-            const DWORD eff = DropIconOntoIcon(list[0], g_surface.ItemAtScreen(pt));
+        // 多选拖动同样走这里 —— 整批交给目标（拖到回收站就整批删掉）。
+        if (fi < 0) {
+            const DWORD eff = DropIconsOntoIcon(list, g_surface.ItemAtScreen(pt));
             if (eff != DROPEFFECT_NONE) {
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
                 SaveIconLayout();
                 RedrawAll();
                 return true;
             }
+            return false;
         }
-
-        if (fi < 0) return false;
 
         FenceWindow::DropHint h;
         if (g_fences[fi]) h = g_fences[fi]->dropHint();
         ClearAllDropHints();
 
-        // 中间区域 + 单个文件 → 交给目标图标（文件夹移进去 / 回收站删 / 程序打开）
-        if (h.openWith() && list.size() == 1) {
-            const DWORD eff = DropIconOntoIcon(list[0], FenceItemAt(fi, h.item));
+        // 中间区域 → 交给目标图标（文件夹移进去 / 回收站删 / 程序打开）。
+        // 目标按「光标正下方是哪个图标」直接取，不要拿 h.item 下标去反查：
+        // h.item 是含被拖图标的下标，FenceItemAt 还会再跳一次，会整体错一格。
+        if (h.openWith()) {
+            DesktopIconView* tgt = g_fences[fi] ? g_fences[fi]->ItemAtScreen(pt) : nullptr;
+            if (!tgt) tgt = FenceItemAt(fi, h.item);   // 兜底：光标压在两格之间
+            const DWORD eff = DropIconsOntoIcon(list, tgt);
             if (eff != DROPEFFECT_NONE) {
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
                 SaveIconLayout();

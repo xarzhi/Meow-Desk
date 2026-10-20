@@ -221,8 +221,15 @@ private:
     bool EnsureBackbuffer(int w, int h);
     void PaintLayered();                                  // 旧路径：整屏 32bpp DIB + UpdateLayeredWindow
     void PaintOpaque(HDC hdc);                            // 新路径：PaintDesktop 壁纸兜底 + AlphaBlend 图标
-    void DrawOneLayered(DesktopIconView* e, bool dragging);
-    void DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging);
+    // ghost = 这个图标正被拖着：原位仍然画一份，但「变淡 + 变暗」当空位占位
+    // （观感和盒子里拖图标时一模一样：那边是 BlendIntoDim 的 ga=110 / gd=120）。
+    void DrawOneLayered(DesktopIconView* e, bool dragging, bool ghost = false);
+    void DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging, bool ghost = false);
+    // 这个图标此刻是不是「被拖走的原件」。只有真的拖起来了（moved_）才算 ——
+    // 按下鼠标还没动的那一瞬间要原样显示，否则点一下图标就变成灰的。
+    bool IsDragGhost(const DesktopIconView* e) const {
+        return mode_ == Mode::Move && moved_ && e && e->selected;
+    }
     void FillRectBlend(HDC hdc, const RECT& r, int a, COLORREF color);
     void InvalidateCell(const DesktopIconView* e, POINT pos);
     // 桌面空白处的点击也要能收到：per-pixel alpha 分层窗口里 alpha==0 的像素
