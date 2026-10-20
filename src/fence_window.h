@@ -382,6 +382,13 @@ private:
     RECT ItemHighlightRect(int index) const;
     // 第 index 个图标下方的文字盒（已夹在卡片内边距之内，相邻两列不会重叠）
     void ItemLabelBox(int index, int& left, int& w) const;
+    // 网格模式下第 index 个图标的标签盒几何：
+    //   labW   = 文字盒宽度（同 ItemLabelBox）
+    //   labH   = 可用文字高度（已夹到两行）
+    //   topRel = 文字区顶部相对「格子上沿」的偏移
+    // 画标签和「聚焦时选中高亮跟着变高」都从这里取 —— 两处口径必须一致，
+    // 各写一套的话高亮迟早会跟文字错开一截。
+    void ItemLabelMetrics(int index, int iconH, int& labW, int& labH, int& topRel) const;
     // 第 index 个格子的客户区原点（图标左上角）；放不下返回 false
     bool ItemOrigin(int index, int& x, int& y) const;
 

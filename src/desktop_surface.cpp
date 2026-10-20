@@ -1172,7 +1172,14 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghos
 
     // 选中高亮（填充 + 1px 边框）
     if (e->selected) {
-        RECT fill{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
+        // 聚焦（唯一选中）时标签不限行、会往下长好几行 —— 高亮必须跟着一起长，
+        // 否则名字从框里冒出来，看着像画错了。IconExtent 给的就是「格子 ∪ 标签」。
+        int hb = y + cellH_ - 2;
+        if (!dragging) {
+            const RECT ext = IconExtent(e);
+            if (ext.bottom - 2 > hb) hb = ext.bottom - 2;
+        }
+        RECT fill{x + 2, y + 2, x + cellW_ - 2, hb};
         FillRectAlpha(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_, fill, 48, RGB(0, 120, 215));
         RECT edge[4] = {
             {fill.left, fill.top, fill.right, fill.top + 1},
@@ -1215,7 +1222,7 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghos
     // 正在原地改名：名字由那个输入框代替（见 DesktopIconView::renaming）
     if (e->name.empty() || !showLabels_ || e->renaming) return;
 
-    // 平时只画一行（超出用省略号）；单击选中（聚焦，且只有它一个被选中）后行数
+    // 平时两行（超出用省略号）；单击选中（聚焦，且只有它一个被选中）后行数
     // **不限**，名字整段显示出来 —— 宽度仍然是格子宽，高度由 LabelDib 自己往下撑开。
     // textH 只是给「不选中」那一档的最小盒子，展开时它会被 Build 顶大。
     const int lineH = IconLabelLineHeight();
@@ -1223,7 +1230,7 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghos
     int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);
     if (textH > lineH * 2) textH = lineH * 2;
     if (textH < 14) textH = 14;
-    const int maxLines = IsLabelExpand(e) ? 0 : 1;
+    const int maxLines = IsLabelExpand(e) ? 0 : 2;
 
     if (!impl_) return;
     LabelDib* lab = impl_->Label(e, cellW_ - kLabelInset, textH, textShadow_ ? 2 : 0, maxLines);
@@ -1448,7 +1455,13 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging, bool
     }
 
     if (e->selected) {
-        RECT fill{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
+        // 和分层路径同一套：聚焦时高亮跟着展开的标签一起长
+        int hb = y + cellH_ - 2;
+        if (!dragging) {
+            const RECT ext = IconExtent(e);
+            if (ext.bottom - 2 > hb) hb = ext.bottom - 2;
+        }
+        RECT fill{x + 2, y + 2, x + cellW_ - 2, hb};
         FillRectBlend(hdc, fill, 48, RGB(0, 120, 215));
         RECT edge[4] = {
             {fill.left, fill.top, fill.right, fill.top + 1},
@@ -1499,13 +1512,13 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging, bool
     // 正在原地改名：名字由那个输入框代替（见 DesktopIconView::renaming）
     if (e->name.empty() || !showLabels_ || e->renaming) return;
 
-    // 同上：平时一行省略，聚焦（唯一选中）后不限行（和分层路径完全一致）
+    // 同上：平时两行省略，聚焦（唯一选中）后不限行（和分层路径完全一致）
     const int lineH = IconLabelLineHeight();
     int textTop = y + kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap;
     int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);
     if (textH > lineH * 2) textH = lineH * 2;
     if (textH < 14) textH = 14;
-    const int maxLines = IsLabelExpand(e) ? 0 : 1;
+    const int maxLines = IsLabelExpand(e) ? 0 : 2;
 
     if (LabelDib* lab = impl_->Label(e, cellW_ - kLabelInset, textH, textShadow_ ? 2 : 0,
                                      maxLines)) {

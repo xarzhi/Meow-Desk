@@ -882,6 +882,18 @@ void FenceWindow::ItemLabelBox(int index, int& left, int& w) const {
     if (left + w > width_ - kPad) left = width_ - kPad - w;
 }
 
+void FenceWindow::ItemLabelMetrics(int index, int iconH, int& labW, int& labH,
+                                   int& topRel) const {
+    const int ch = cellH();
+    topRel = 4 + iconH + 2;   // 图标上方留 4px，图标和文字之间留 2px（和绘制一致）
+    labH = ch - topRel;
+    const int twoLine = LabelTextHeight() * 2;
+    if (labH > twoLine) labH = twoLine;
+    if (labH < 14) labH = 14;
+    int left = 0;
+    ItemLabelBox(index, left, labW);
+}
+
 int FenceWindow::minW() const {
     // 列表 / 详情是一行一个，右边的列会按宽度逐级隐藏，所以可以收得很窄
     // （留出「图标 + 名称」的最低宽度即可）
@@ -1132,8 +1144,9 @@ void FenceWindow::ApplyResize(POINT screenPt) {
 // 查看 / 排序（右键菜单驱动）
 // ---------------------------------------------------------------------------
 int FenceWindow::cellH() const {
-    // 标题区固定按「两行」预留：平时只画一行（超出省略），单击选中后展开成两行。
-    // 这样展开时不用改格子高度，图标不会因为「点了一下」就重新排位。
+    // 标题区固定按「两行」预留：平时就画两行（超出省略），聚焦（唯一选中）后
+    // 行数不限、往下压到后面几排上，高亮也跟着一起长。
+    // 两行这个量早在 cellH 里就留好了，所以展开时不用改格子高度、图标不会重排。
     // 行高从标题字体量出来，不能写死 —— 换系统字号 / 高 DPI 会露半个字。
     const int twoLineH = 4 + iconPx() + 2 + LabelTextHeight() * 2;
     switch (viewMode()) {
@@ -3142,6 +3155,9 @@ void FenceWindow::Paint() {
     if (!bits_ || !memDC_ || !cfg_) return;
     std::memset(bits_, 0, (size_t)bufW_ * (size_t)bufH_ * 4);
 
+    // 「聚焦」= 恰好一个图标被选中：它的标签不限行，选中高亮也要跟着一起变高。
+    // 高亮画在图标之前，两个地方都要用同一个指针，所以在函数级声明一次。
+    DesktopIconView* expandOne = nullptr;
 
     const COLORREF base = (COLORREF)cfg_->color;
     const int alpha = std::clamp(cfg_->alpha, 0, 255);
@@ -3435,16 +3451,41 @@ void FenceWindow::Paint() {
         // 判断「下面还有没有」靠的是图标被切一半的视觉效果，足够了。
 
         // ---- 选中高亮（支持多选；双击才打开，所以要有可见的选中态）----
+        // 「聚焦」= 恰好一个选中：它的标签不限行、会往下长，高亮也得跟着长到文字底部。
+        // expandOne 在函数开头声明，画图标那段复用同一个变量。
         if (!collapsed_ && !itemDragging_) {
             std::vector<DesktopIconView*> mineSel;
             CollectVisible(mineSel);
+            {
+                int selN = 0;
+                for (auto* e2 : mineSel)
+                    if (e2 && e2->selected) {
+                        ++selN;
+                        expandOne = e2;
+                    }
+                if (selN != 1) expandOne = nullptr;
+            }
+            const bool gridLabels = !IsListView() && showLabels_;
+            const int glow = g_config.textShadow ? 2 : 0;
             SolidBrush fill{light ? Color(34, 0, 0, 0) : Color(44, 255, 255, 255)};
             Pen pen{light ? Color(70, 0, 0, 0) : Color(80, 255, 255, 255), 1.0f};
             for (size_t i = 0; i < mineSel.size(); ++i) {
                 if (!mineSel[i] || !mineSel[i]->selected) continue;
                 RECT sr = ItemHighlightRect((int)i);
                 if (sr.right <= sr.left) continue;
-                const Rect rc(sr.left + 3, sr.top + 3, sr.right - sr.left - 6, cellH() - 6);
+                int h = cellH() - 6;
+                if (gridLabels && mineSel[i] == expandOne) {
+                    const IconBitmap& bm = mineSel[i]->bmp;
+                    int lw = 0, lh = 0, topRel = 0;
+                    ItemLabelMetrics((int)i, bm.valid() ? bm.height : 32, lw, lh, topRel);
+                    if (LabelDib* lab = LabelOf(mineSel[i], lw, lh, glow, 0)) {
+                        if (lab->valid()) {
+                            const int bottom = sr.top + topRel - lab->pad + lab->h + 3;
+                            if (bottom - sr.top - 6 > h) h = bottom - sr.top - 6;
+                        }
+                    }
+                }
+                const Rect rc(sr.left + 3, sr.top + 3, sr.right - sr.left - 6, h);
                 // 浅色卡片上用暗一点的高亮，深色卡片上用亮一点的
                 gfx.FillRectangle(&fill, rc);
                 gfx.DrawRectangle(&pen, rc);
@@ -3634,18 +3675,8 @@ void FenceWindow::Paint() {
         for (size_t i = 0; i < mine.size(); ++i)
             if (mine[i] && mine[i]->selected) order.push_back(i);
 
-        // 只有「恰好选中一个」时那个图标才展开标签。多选（框选 / Ctrl 加选）
-        // 全部展开会把盒子糊满文字，和桌面层同一套规则。
-        DesktopIconView* expandOne = nullptr;
-        {
-            int selN = 0;
-            for (auto* e2 : mine)
-                if (e2 && e2->selected) {
-                    ++selN;
-                    expandOne = e2;
-                }
-            if (selN != 1) expandOne = nullptr;
-        }
+        // expandOne（谁是「聚焦」的那一个）已经在上面画选中高亮时算好了 ——
+        // 那边也要用它把高亮撑高，两处必须是同一个指针。
 
         for (size_t oi = 0; oi < order.size(); ++oi) {
             const size_t i = order[oi];
@@ -3706,7 +3737,8 @@ void FenceWindow::Paint() {
                 // 网格：平时一行（超出省略），聚焦（唯一选中）后**行数不限**，
                 // 名字整段显示 —— 宽度还是格子宽，高度由 LabelDib 自己往下撑。
                 // 列表：行高固定，展开会压到下一行，所以最多两行。
-                const int maxLines = (e == expandOne) ? (listMode ? 2 : 0) : 1;
+                // 网格：平时两行（超出省略），聚焦后不限行。
+                const int maxLines = (e == expandOne) ? (listMode ? 2 : 0) : 2;
                 if (listMode) {
                     const int labW = std::max(24, (width_ - kPad * 2) - (iconX - ix) - iconW - 8);
                     // 列表行的标签盒给到「两行」的高度（图标本身就有 32px，够两行）
@@ -3722,16 +3754,14 @@ void FenceWindow::Paint() {
                                      left, top, gaLabel, gd);
                     }
                 } else {
-                    const int iconBottom = iy + 4 + iconH;
-                    const int textTop = iconBottom + 2;
-                    int th = ch - (textTop - iy);
-                    // 标题区最多两行：格子高度就是按两行预留的，
-                    // 这里再夹一次，免得「不显示标题再打开」之类的老配置把第三行画出来
-                    const int twoLine = LabelTextHeight() * 2;
-                    if (th > twoLine) th = twoLine;
-                    if (th < 14) th = 14;
-                    int labLeft = 0, labW = 0;
-                    ItemLabelBox((int)i, labLeft, labW);
+                    // 标签盒几何统一走 ItemLabelMetrics —— 上面画选中高亮时用的是
+                    // 同一份计算，各写一套的话聚焦撑高后高亮会和文字错开一截。
+                    int labW = 0, th = 0, topRel = 0;
+                    ItemLabelMetrics((int)i, iconH, labW, th, topRel);
+                    const int textTop = iy + topRel;
+                    int labLeft = 0;
+                    int dummyW = 0;
+                    ItemLabelBox((int)i, labLeft, dummyW);
                     labLeft += dxOf[i];   // 排序过渡中文字跟着图标一起滑
                     LabelDib* lab = LabelOf(e, labW, th, glow, maxLines);
                     if (lab && lab->valid()) {
