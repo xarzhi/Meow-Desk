@@ -37,6 +37,11 @@ public:
 
     // 弹出。items 会被拷贝保存，调用方不必保活。
     void Show(POINT screenPt, std::vector<PopupMenuItem> items);
+    // 贴着某个矩形弹：卡片左上角对在 rect 的**右下角**，右边放不下就翻到
+    // rect 左边，下面放不下就往上贴 rect 底边。
+    // 桌面框选之后那个「创建盒子」菜单用它 —— 菜单跟着那个蓝框走，
+    // 而不是钉在松手时的鼠标位置（手一抖菜单就飘到框外去了）。
+    void ShowAnchoredToRect(const RECT& rect, std::vector<PopupMenuItem> items);
     void Hide();
     bool visible() const { return visible_; }
     HWND hwnd() const { return hwnd_; }
@@ -53,6 +58,9 @@ private:
     void Layout();
     void Paint();
     void Present();
+    // 建好 items / 量完尺寸 / 画完之后，把窗口摆到 (x,y) 并显示出来。
+    // Show / ShowAnchoredToRect 只负责算这个坐标。
+    void PresentAt(int x, int y);
     void EnsureBuffer(int w, int h);
     int HitTest(POINT client) const;
     void OpenSub(int index);

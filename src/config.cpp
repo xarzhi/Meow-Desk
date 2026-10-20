@@ -144,7 +144,7 @@ bool ConfigFromDb(AppConfig& c) {
     {
         storage::Stmt st(
             "SELECT x,y,w,h,color,alpha,radius,acrylic,title,viewMode,sortKey,sortAsc,locked,"
-            "activeGroup,expandMode FROM fence ORDER BY id");
+            "activeGroup,expandMode,kind FROM fence ORDER BY id");
         if (!st.ok()) return false;
         while (st.step()) {
             FenceConfig f;
@@ -163,7 +163,22 @@ bool ConfigFromDb(AppConfig& c) {
             f.locked = st.colInt(12);
             f.activeGroup = st.colInt(13);
             f.expandMode = st.colInt(14);   // -1 = 老数据，下面 ConfigEnsureDefaults 补
+            f.kind = st.colInt(15);
             c.fences.push_back(std::move(f));
+        }
+    }
+    {
+        // 待办条目：一个盒子可能有 0..N 条，按 ord 排好塞回各自的 FenceConfig
+        storage::Stmt st("SELECT fence,ord,text,done FROM todo ORDER BY fence,ord");
+        if (st.ok()) {
+            while (st.step()) {
+                const int fi = st.colInt(0);
+                if (fi < 0 || fi >= (int)c.fences.size()) continue;
+                TodoItem t;
+                t.text = st.colText(2);
+                t.done = st.colInt(3);
+                c.fences[fi].todos.push_back(std::move(t));
+            }
         }
     }
     {
@@ -320,7 +335,8 @@ void AppConfig::Save() const {
     if (!storage::Begin()) return;
 
     bool ok = storage::Exec("DELETE FROM app;") && storage::Exec("DELETE FROM fence;") &&
-              storage::Exec("DELETE FROM rule;") && storage::Exec("DELETE FROM fence_group;");
+              storage::Exec("DELETE FROM rule;") && storage::Exec("DELETE FROM fence_group;") &&
+              storage::Exec("DELETE FROM todo;");
     if (ok) {
         storage::Stmt st("INSERT OR REPLACE INTO app(k,v) VALUES(?1,?2)");
         auto put = [&st](const wchar_t* k, int v) {
@@ -345,8 +361,8 @@ void AppConfig::Save() const {
 
         storage::Stmt fs(
             "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title,"
-            "viewMode,sortKey,sortAsc,locked,activeGroup,expandMode)"
-            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)");
+            "viewMode,sortKey,sortAsc,locked,activeGroup,expandMode,kind)"
+            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)");
         for (size_t i = 0; i < fences.size() && fs.ok(); ++i) {
             const FenceConfig& c = fences[i];
             fs.bindInt(1, (int)i);
@@ -366,8 +382,25 @@ void AppConfig::Save() const {
             fs.bindInt(15, c.activeGroup);
             // -1 不许写回库里：那是「还没定过」的临时值，落盘要落一个真实选择
             fs.bindInt(16, c.expandMode == 0 ? 0 : 1);
+            fs.bindInt(17, c.kind == 1 ? 1 : 0);
             ok = fs.done() && ok;
             fs.reset();
+        }
+
+        if (ok) {
+            storage::Stmt ts("INSERT INTO todo(fence,ord,text,done) VALUES(?1,?2,?3,?4)");
+            for (size_t i = 0; i < fences.size() && ts.ok(); ++i) {
+                const FenceConfig& c = fences[i];
+                if (c.kind != 1) continue;
+                for (size_t k = 0; k < c.todos.size() && ts.ok(); ++k) {
+                    ts.bindInt(1, (int)i);
+                    ts.bindInt(2, (int)k);
+                    ts.bindText(3, c.todos[k].text);
+                    ts.bindInt(4, c.todos[k].done ? 1 : 0);
+                    ok = ts.done() && ok;
+                    ts.reset();
+                }
+            }
         }
 
         if (ok) {

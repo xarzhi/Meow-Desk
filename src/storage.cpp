@@ -26,7 +26,8 @@ std::wstring g_file;
 //        icon_layout 加 grp（图标属于哪个分组）
 //   v5 — fence 表加 expandMode（展开 / 伸缩模式；-1 = 老数据，启动时按全局默认补）
 //   v6 — 把全局开关 defaultTelescope 落成 0：新建的盒子默认始终展开，不自己收起
-const int kSchemaVersion = 6;
+//   v7 — fence 表加 kind（0 = 收纳盒 / 1 = 待办盒）；新增 todo 表（待办条目）
+const int kSchemaVersion = 7;
 
 void SetError(const char* what) {
     g_lastError = what ? what : "";
@@ -66,7 +67,19 @@ bool Upgrade(int from) {
         // 展开方式：0 = 伸缩（悬停展开 / 移出收起），1 = 始终展开。
         // 默认写 -1 = 还没定过，启动时由 ConfigEnsureDefaults 按全局默认补齐
         // （和 v5 迁移给老库补的那一列保持同一套语义，免得两条路走出两种结果）。
-        "  expandMode  INTEGER NOT NULL DEFAULT -1"
+        "  expandMode  INTEGER NOT NULL DEFAULT -1,"
+        // 盒子类型：0 = 收纳盒（装图标），1 = 待办盒（To-do 清单）。
+        // 老库由 Upgrade 补这一列，默认 0 = 还是收纳盒。
+        "  kind INTEGER NOT NULL DEFAULT 0"
+        ");"
+        // 待办盒的条目。ord 是显示顺序（用户可能上下挪），done = 勾没勾掉。
+        // 和 fence_group 一样按 (fence, ord) 存，读出来按 ord 顺序塞回配置。
+        "CREATE TABLE IF NOT EXISTS todo ("
+        "  fence INTEGER NOT NULL,"
+        "  ord   INTEGER NOT NULL,"
+        "  text  TEXT NOT NULL DEFAULT '',"
+        "  done  INTEGER NOT NULL DEFAULT 0,"
+        "  PRIMARY KEY(fence, ord)"
         ");"
         // 盒子内的分组（头部那一排标签）。ord=0 就是盒子自己的标题，
         // 所以一个盒子只要有分组，第一条一定是它。
@@ -125,6 +138,11 @@ bool Upgrade(int from) {
         // 盒子头部右边的箭头也照样能单独切某一个盒子。
         sqlite3_exec(g_db, "INSERT OR REPLACE INTO app(k,v) VALUES('defaultTelescope','0');",
                      nullptr, nullptr, nullptr);
+    }
+    if (from < 7) {
+        // v7：待办盒。老库里的盒子补上 kind=0（还是收纳盒），todo 表由上面的
+        // kSchema 建好（CREATE IF NOT EXISTS，每次都会执行）。
+        AddColumn("fence", "kind", "INTEGER NOT NULL DEFAULT 0");
     }
 
     const std::string ver = "PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";";

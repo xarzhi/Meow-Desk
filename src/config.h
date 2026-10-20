@@ -13,8 +13,21 @@
 #include <string>
 #include <vector>
 
+// 待办盒子里的一条待办
+struct TodoItem {
+    std::wstring text;
+    int done = 0;   // 1 = 已勾掉（画一条删除线 + 变灰）
+};
+
 // 一个盒子的外观与位置
 struct FenceConfig {
+    // 盒子类型：0 = 收纳盒（装桌面图标，一直以来的行为）
+    //           1 = 待办盒（一个 To-do 清单，不装图标）
+    // 待办盒同样有头部的标题 / 锁 / 收起箭头，拖动改尺寸也完全一样 ——
+    // 差别只在内容区：收纳盒是图标网格，待办盒是一列可勾选的条目。
+    int kind = 0;
+    std::vector<TodoItem> todos;   // 只有 kind == 1 才有内容
+
     int x = 0;
     int y = 0;
     int w = 340;

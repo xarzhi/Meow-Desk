@@ -57,6 +57,11 @@ public:
     HWND hwnd() const { return hwnd_; }
     RECT rect() const;
 
+    // 待办盒（FenceConfig::kind == 1）：内容区是一列可勾选的条目，不装图标。
+    // 图标那一整套（Collect / HitItem / 拖拽插入 / 框选）在 isTodo() 时全部空转，
+    // 所以「拖图标进待办盒」天然不成立，也不用到处加判断。
+    bool isTodo() const { return cfg_ && cfg_->kind == 1; }
+
     // 展开时的高度（就是配置里存的那个 h）。收起状态下窗口只有 4px，
     // 拿 rect() 存配置 / 算避让会把盒子「存成一条线」，所以要用这个。
     int expandedHeight() const { return height_; }
@@ -206,7 +211,8 @@ public:
     int groupCount() const {
         return (cfg_ && !cfg_->groups.empty()) ? (int)cfg_->groups.size() : 1;
     }
-    bool hasTabs() const { return groupCount() > 1; }
+    // 待办盒没有分组标签：内容区是清单，分组的语义（一批图标）不成立。
+    bool hasTabs() const { return !isTodo() && groupCount() > 1; }
     int activeGroup() const;
     void SetActiveGroup(int g);
     // 新建一个分组并切过去，返回新分组下标
@@ -262,6 +268,8 @@ public:
     std::function<void(int item, POINT)> onContextMenu;
     // 双击分组标签 → 改这个标签的名字（0 = 盒子标题本身，SetGroupName 会转到 SetTitle）
     std::function<void(int group)> onRenameGroup;
+    // 右键待办条目（row = -1 表示点在内容区空白 / 末尾的「新建」行上）
+    std::function<void(int row, POINT)> onTodoContextMenu;
     // 「查看 / 排序 / 重命名」改完之后：外部存配置 + 存图标布局
     std::function<void()> onStateChanged;
 
@@ -270,6 +278,20 @@ public:
     // 改完再 PlayPendingFlip()。后面的图标就会从旧槽位滑到新槽位。
     void CaptureSlots();
     void PlayPendingFlip();
+
+    // ---- 待办盒（公开：右键菜单 / 外部命令要能直接改这一条）----
+    // 行高固定 34px（比图标格矮得多：一条待办就是「一个方块 + 一行字」）。
+    static constexpr int kTodoRowH = 34;
+    int TodoRowH() const { return kTodoRowH; }
+    // 条目数 + 末尾那行「+ 新建待办」
+    int TodoCount() const;
+    // 第 row 行的客户区矩形（含末尾的「新建」行）
+    RECT TodoRowRect(int row) const;
+    void ToggleTodoAt(int row);    // 勾上 / 取消勾
+    void EditTodoAt(int row);      // 就地改文字；row == TodoCount()-1 表示新增
+    void DeleteTodoAt(int row);
+    // 内容区点了一下（LBUTTONUP）：末尾那行 = 新增，其余 = 打勾
+    void ClickTodoRow(int row);
 
 private:
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
@@ -300,6 +322,9 @@ private:
     void Collect(std::vector<DesktopIconView*>& out) const;
     // 实际参与布局/绘制的图标（排除正在被拖出的那个）
     void CollectVisible(std::vector<DesktopIconView*>& out) const;
+
+    // 屏幕/客户区落点上是第几行；-1 = 没落在任何一行上（内部用）
+    int HitTodoRow(POINT clientPt) const;
 
     // ---- 内容纵向滚动（图标多到超出盒子高度时）----
     // 只做「整行滚动」：滚半行会让上下两排都只显示一半，那需要裁剪；
@@ -534,6 +559,8 @@ private:
     POINT marqueeB_{0, 0};
     int hot_ = -1;
     int pressItem_ = -1;
+    // 待办盒：按下时命中的行（TodoCount()-1 是末尾那行「新建」）
+    int pressTodoRow_ = -1;
     bool pressArrow_ = false;
     bool pressLock_ = false;
     // 点击标签：松手时（没拖动过）才切

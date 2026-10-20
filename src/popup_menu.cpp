@@ -51,6 +51,15 @@ bool SystemUsesLightTheme() {
     return v != 0;
 }
 
+// 这个点所在显示器的工作区（没有就退回主屏尺寸）
+RECT WorkAreaNear(POINT pt) {
+    RECT limit{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi)) limit = mi.rcWork;
+    return limit;
+}
+
 void AddRoundRect(GraphicsPath& p, const RectF& r, float rad) {
     if (rad <= 0.0f) {
         p.AddRectangle(r);
@@ -345,10 +354,7 @@ void PopupMenu::OpenSub(int index) {
     }
     POINT cursor{};
     GetCursorPos(&cursor);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    RECT limit{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-    if (GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi)) limit = mi.rcWork;
+    const RECT limit = WorkAreaNear(pt);
     if (pt.x + needW > limit.right) pt.x = wr.left - needW + kShadow * 2 + 2;
 
     sub_->Show(pt, it.sub);
@@ -378,12 +384,7 @@ void PopupMenu::Show(POINT screenPt, std::vector<PopupMenuItem> items) {
     Paint();
 
     // 钳制到工作区，避免菜单跑出屏幕
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    RECT limit{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-    if (GetMonitorInfoW(MonitorFromPoint(screenPt, MONITOR_DEFAULTTONEAREST), &mi))
-        limit = mi.rcWork;
-
+    const RECT limit = WorkAreaNear(screenPt);
     int x = screenPt.x;
     int y = screenPt.y;
     if (x + w_ > limit.right) x = limit.right - w_;
@@ -391,6 +392,40 @@ void PopupMenu::Show(POINT screenPt, std::vector<PopupMenuItem> items) {
     if (x < limit.left) x = limit.left;
     if (y < limit.top) y = limit.top;
 
+    PresentAt(x, y);
+}
+
+void PopupMenu::ShowAnchoredToRect(const RECT& anchor, std::vector<PopupMenuItem> items) {
+    if (!Create()) return;
+    CloseSub();
+    items_ = std::move(items);
+    hover_ = -1;
+    Layout();
+    EnsureBuffer(w_, h_);
+    if (!bufW_) return;
+    Paint();
+
+    const POINT mid{(anchor.left + anchor.right) / 2, (anchor.top + anchor.bottom) / 2};
+    const RECT limit = WorkAreaNear(mid);
+
+    // 卡片贴在 anchor 的右下角。窗口本身四周留了 kShadow 的阴影边距，
+    // 所以窗口坐标要往回让同样的距离，卡片的角才正好压框角上。
+    int x = anchor.right - kShadow;
+    int y = anchor.bottom - kShadow;
+    // 右边放不下 → 翻到框的左边（先试框外，框外也不够就贴着工作区右缘）
+    if (x + w_ > limit.right) x = anchor.left - w_ + kShadow;
+    // 下面放不下 → 往上贴框底（框很矮时再统一夹进工作区）
+    if (y + h_ > limit.bottom) y = anchor.bottom - h_ + kShadow;
+    // 阴影可以出血，卡片不能：只夹到「卡片本身还在屏幕里」
+    if (x < limit.left - kShadow) x = limit.left - kShadow;
+    if (y < limit.top - kShadow) y = limit.top - kShadow;
+    if (x + w_ > limit.right) x = limit.right - w_;
+    if (y + h_ > limit.bottom) y = limit.bottom - h_;
+
+    PresentAt(x, y);
+}
+
+void PopupMenu::PresentAt(int x, int y) {
     SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w_, h_, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     visible_ = true;
     Present();

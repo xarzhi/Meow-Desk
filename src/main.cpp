@@ -1452,7 +1452,12 @@ enum {
     kCmdRenameGroup = 4044,   // 重命名当前分组
     kCmdDeleteGroup = 4045,   // 删除当前分组（图标回桌面）
     kCmdDeleteFence = 4046,   // 删除整个盒子（图标回桌面）
-    kCmdFenceFromMarquee = 4050,   // 桌面框选松手后的菜单：按框的矩形建盒子
+    kCmdFenceFromMarquee = 4050,   // 桌面框选松手后的菜单：按框的矩形建收纳盒
+    kCmdFenceTodoFromMarquee = 4051,   // 同上，但建的是待办盒
+    kCmdNewFenceTodo = 4052,           // 右键菜单「新建盒子 ▸ 待办盒子」
+    kCmdTodoAdd = 4053,                // 待办盒：新加一条
+    kCmdTodoEdit = 4054,               // 待办盒：改这一条的文字
+    kCmdTodoDelete = 4055,             // 待办盒：删掉这一条
     kCmdMoveToGroup = 4100,   // 4100..4127：盒内图标「移动到第 N 个分组」
 };
 
@@ -1523,9 +1528,19 @@ static void EnsureFreeSpot(int& x, int& y, int w, int h, const RECT& lim) {
     }
 }
 
-static void NewFenceNear(int fi) {
-    int w = 340, h = 380;
-    InheritFenceSize(w, h);
+// kind：0 = 收纳盒（装图标），1 = 待办盒（To-do 清单）。
+// 待办盒默认窄一点、高一点：一条待办就是「勾选框 + 一行字」，太宽了句子会
+// 拉得很长、眼睛要横着扫；而且它不装图标，用不着图标格那么宽。
+static void NewFenceNear(int fi, int kind = 0) {
+    // 待办盒不继承收纳盒的尺寸：那可能是 800x120 这种「一排图标」的比例，
+    // 拿来做清单只能看见三行、还得横向拉得很长。固定一个竖长的默认值。
+    int w = 300;
+    int h = 420;
+    if (kind == 0) {
+        w = 340;
+        h = 380;
+        InheritFenceSize(w, h);
+    }
     RECT base{200, 200, 200 + w, 200 + h};
     if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) base = g_fences[fi]->rect();
 
@@ -1552,7 +1567,8 @@ static void NewFenceNear(int fi) {
     c.y = y;
     c.w = w;
     c.h = h;
-    c.title = L"新盒子";
+    c.kind = kind;
+    c.title = kind == 1 ? L"\u5f85\u529e" : L"\u65b0\u76d2\u5b50";   // 待办 / 新盒子
     InheritFenceStyle(c);
     c.expandMode = g_config.defaultTelescope ? 0 : 1;   // 新盒子用哪种展开方式
     g_config.fences.push_back(c);
@@ -1561,8 +1577,8 @@ static void NewFenceNear(int fi) {
         if (f) f->RebindConfig();
     AddFenceWindow((int)g_config.fences.size() - 1, false);   // 新建的盒子直接展开
     g_config.Save();
-    LogStep("new fence #" + std::to_string((int)g_config.fences.size() - 1) + " at " +
-            std::to_string(x) + "," + std::to_string(y));
+    LogStep("new fence #" + std::to_string((int)g_config.fences.size() - 1) +
+            (kind == 1 ? " (todo)" : "") + " at " + std::to_string(x) + "," + std::to_string(y));
 }
 
 // 框选「创建盒子」：位置和尺寸都照抄用户画出来的那个蓝框。
@@ -1572,11 +1588,12 @@ static void NewFenceNear(int fi) {
 // picked：框选时被框住、并且已经在桌面上亮着选中态的那些图标。盒子建好后
 // 直接把它们搬进去 —— 用户画框的意图就是「这一堆归这个盒子」，再让他手动
 // 一张一张拖一遍纯属白费力气。列表为空时行为和以前完全一样。
-static void NewFenceInRect(RECT r, const std::vector<DesktopIconView*>& picked) {
+static void NewFenceInRect(RECT r, const std::vector<DesktopIconView*>& picked, int kind = 0) {
     int w = (int)(r.right - r.left);
     int h = (int)(r.bottom - r.top);
+    // 待办盒要多留点高度：140px 只够三条，一出生就得滚，看着不像清单
     if (w < 180) w = 180;
-    if (h < 140) h = 140;
+    if (h < (kind == 1 ? 220 : 140)) h = (kind == 1 ? 220 : 140);
 
     RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
     MONITORINFO mi{};
@@ -1598,7 +1615,8 @@ static void NewFenceInRect(RECT r, const std::vector<DesktopIconView*>& picked) 
     c.y = y;
     c.w = w;
     c.h = h;
-    c.title = L"新盒子";
+    c.kind = kind;
+    c.title = kind == 1 ? L"\u5f85\u529e" : L"\u65b0\u76d2\u5b50";   // 待办 / 新盒子
     InheritFenceStyle(c);
     c.expandMode = g_config.defaultTelescope ? 0 : 1;
     g_config.fences.push_back(c);
@@ -1609,7 +1627,9 @@ static void NewFenceInRect(RECT r, const std::vector<DesktopIconView*>& picked) 
 
     // 框里选中的图标搬进新盒子。InsertIntoFenceMulti 会顺手把选中态清掉
     // （换盒子之后不该还带着高亮），所以这里必须先搬完再持久化。
-    if (!picked.empty() && idx >= 0 && idx < (int)g_fences.size() && g_fences[idx]) {
+    // 待办盒装不了图标：框里选中的那些留在桌面上。
+    if (kind == 0 && !picked.empty() && idx >= 0 && idx < (int)g_fences.size() &&
+        g_fences[idx]) {
         InsertIntoFenceMulti(picked, idx, -1);
         SaveIconLayout();
         RedrawAll();
@@ -1617,9 +1637,9 @@ static void NewFenceInRect(RECT r, const std::vector<DesktopIconView*>& picked) 
 
     g_config.Save();
     LogStep("new fence #" + std::to_string((int)g_config.fences.size() - 1) +
-            " from marquee at " + std::to_string(x) + "," + std::to_string(y) + " " +
-            std::to_string(w) + "x" + std::to_string(h) + " picked " +
-            std::to_string(picked.size()));
+            (kind == 1 ? " (todo)" : "") + " from marquee at " + std::to_string(x) + "," +
+            std::to_string(y) + " " + std::to_string(w) + "x" + std::to_string(h) + " picked " +
+            std::to_string(kind == 0 ? picked.size() : 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -1666,7 +1686,10 @@ static int MatchRuleIndex(const std::wstring& path, bool isDir, bool& matched) {
 
 static int FindFenceByTitle(const std::wstring& t) {
     for (size_t i = 0; i < g_fences.size() && i < g_config.fences.size(); ++i) {
-        if (g_fences[i] && g_config.fences[i].title == t) return (int)i;
+        if (!g_fences[i]) continue;
+        // 待办盒不装图标：整理规则不能把文件塞进同名的待办盒
+        if (g_config.fences[i].kind == 1) continue;
+        if (g_config.fences[i].title == t) return (int)i;
     }
     return -1;
 }
@@ -1884,9 +1907,23 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
     }
 
     std::vector<PopupMenuItem> items;
-    // 右键点在某张图标上 + 盒子有分组：给一条「把这个图标挪到别的分组」的路。
-    // （标签页只显示一个分组，拖拽没法跨分组，只能走菜单。）
-    if (item >= 0 && f->hasTabs()) {
+
+    // ---- 待办盒：右键的是「某一条待办」还是空白，先摆这一组 ----
+    // item 在这里当行号用（-1 = 点在内容区空白 / 头部）
+    const bool todo = f->isTodo();
+    const int todoN = todo && fi < (int)g_config.fences.size()
+                          ? (int)g_config.fences[fi].todos.size()
+                          : 0;
+    if (todo) {
+        items.push_back(PopupMenuItem(L"\u65b0\u5efa\u5f85\u529e", kCmdTodoAdd));   // 新建待办
+        if (item >= 0 && item < todoN) {
+            items.push_back(PopupMenuItem(L"\u7f16\u8f91\u5f85\u529e", kCmdTodoEdit));    // 编辑
+            items.push_back(PopupMenuItem(L"\u5220\u9664\u5f85\u529e", kCmdTodoDelete));  // 删除
+        }
+        items.push_back(PopupMenuItem::Sep());
+    } else if (item >= 0 && f->hasTabs()) {
+        // 右键点在某张图标上 + 盒子有分组：给一条「把这个图标挪到别的分组」的路。
+        // （标签页只显示一个分组，拖拽没法跨分组，只能走菜单。）
         std::vector<PopupMenuItem> moveSub;
         const int n = std::min(28, f->groupCount());
         for (int g = 0; g < n; ++g) {
@@ -1899,27 +1936,43 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
         items.push_back(std::move(m));
         items.push_back(PopupMenuItem::Sep());
     }
-    items.push_back(PopupMenuItem(L"\u65b0\u5efa\u76d2\u5b50", kCmdNewFence));      // 新建盒子
-    items.push_back(PopupMenuItem(L"\u65b0\u5efa\u6587\u4ef6\u5939", kCmdNewFolder));  // 新建文件夹
-    items.push_back(PopupMenuItem::Sep());
+
+    // ---- 新建盒子：二级菜单（收纳 / 待办）----
+    // 收纳盒 = 现在这种装图标的盒子；待办盒 = 一个 To-do 清单。
     {
-        PopupMenuItem m(L"\u6392\u5e8f\u65b9\u5f0f", 0);   // 排序方式
-        m.sub = std::move(sortSub);
+        std::vector<PopupMenuItem> newSub;
+        newSub.push_back(PopupMenuItem(L"\u6536\u7eb3\u76d2\u5b50", kCmdNewFence));      // 收纳盒子
+        newSub.push_back(PopupMenuItem(L"\u5f85\u529e\u76d2\u5b50", kCmdNewFenceTodo));  // 待办盒子
+        PopupMenuItem m(L"\u65b0\u5efa\u76d2\u5b50", 0);   // 新建盒子
+        m.sub = std::move(newSub);
         items.push_back(std::move(m));
     }
-    {
-        PopupMenuItem m(L"\u67e5\u770b", 0);                // 查看
-        m.sub = std::move(viewSub);
-        items.push_back(std::move(m));
+
+    // 后面这几组只对收纳盒有意义：待办盒不装图标，没有文件夹、排序、查看档位
+    if (!todo) {
+        items.push_back(PopupMenuItem(L"\u65b0\u5efa\u6587\u4ef6\u5939", kCmdNewFolder));  // 新建文件夹
+        items.push_back(PopupMenuItem::Sep());
+        {
+            PopupMenuItem m(L"\u6392\u5e8f\u65b9\u5f0f", 0);   // 排序方式
+            m.sub = std::move(sortSub);
+            items.push_back(std::move(m));
+        }
+        {
+            PopupMenuItem m(L"\u67e5\u770b", 0);                // 查看
+            m.sub = std::move(viewSub);
+            items.push_back(std::move(m));
+        }
     }
     items.push_back(PopupMenuItem::Sep());
     items.push_back(
         PopupMenuItem(L"\u6253\u5f00\u8bbe\u7f6e\u9762\u677f", kCmdSettings));  // 打开设置面板
     items.push_back(PopupMenuItem(L"\u91cd\u547d\u540d\u5206\u533a", kCmdRename));  // 重命名分区
-    // 分组：头部的标签页。切分组 = 换一批图标，所以「新建分组」进来是空的。
-    items.push_back(PopupMenuItem(L"\u521b\u5efa\u5206\u7ec4", kCmdNewGroup));  // 创建分组
-    if (f->hasTabs()) {
-        items.push_back(PopupMenuItem(L"\u91cd\u547d\u540d\u5206\u7ec4", kCmdRenameGroup));
+    if (!todo) {
+        // 分组：头部的标签页。切分组 = 换一批图标，所以「新建分组」进来是空的。
+        items.push_back(PopupMenuItem(L"\u521b\u5efa\u5206\u7ec4", kCmdNewGroup));  // 创建分组
+        if (f->hasTabs()) {
+            items.push_back(PopupMenuItem(L"\u91cd\u547d\u540d\u5206\u7ec4", kCmdRenameGroup));
+        }
     }
     // 头部右侧的锁按钮在「显示盒子标题」关掉时是看不见的，这里留一个出口，
     // 免得锁上之后没法再解开。
@@ -1930,7 +1983,7 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
     // 「删除分组」始终占一行（灰掉比消失更好懂）：第 0 个标签就是盒子标题本身，
     // 它不能被删 —— 要删盒子请用下面的「删除盒子」。
     items.push_back(PopupMenuItem::Sep());
-    {
+    if (!todo) {
         PopupMenuItem m(L"\u5220\u9664\u5206\u7ec4", kCmdDeleteGroup);   // 删除分组
         m.disabled = !f->hasTabs() || f->activeGroup() <= 0;
         items.push_back(std::move(m));
@@ -1961,7 +2014,16 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
             }
             return;
         }
-        if (id == kCmdNewFence) { NewFenceNear(fi); return; }
+        if (id == kCmdNewFence) { NewFenceNear(fi, 0); return; }
+        if (id == kCmdNewFenceTodo) { NewFenceNear(fi, 1); return; }
+        // 待办盒：item 就是行号（-1 = 点在空白 / 头部）
+        if (id == kCmdTodoAdd) {
+            if (fi < (int)g_config.fences.size())
+                w->EditTodoAt((int)g_config.fences[fi].todos.size());
+            return;
+        }
+        if (id == kCmdTodoEdit) { w->EditTodoAt(item); return; }
+        if (id == kCmdTodoDelete) { w->DeleteTodoAt(item); return; }
         if (id == kCmdNewFolder) { NewDesktopFolder(); return; }
         if (id == kCmdSettings) { g_settings.Show(); return; }
         if (id == kCmdRename) { BeginRenameFence(fi); return; }
@@ -2165,6 +2227,10 @@ static void AddFenceWindow(int i, bool startCollapsed) {
     };
     // 双击分组标签 → 在盒子正中弹改名弹窗（0 = 盒子标题本身）
     f->onRenameGroup = [i](int group) { BeginRenameGroup(i, group); };
+    // 待办盒：右键落在第几条待办上就传几（-1 = 内容区空白 / 头部）。
+    // 直接复用盒子自己的菜单 —— ShowFenceMenu 里按 kind 分支，待办盒多出
+    // 「新建 / 编辑 / 删除待办」，其它项（重命名、锁定、删除盒子）照旧。
+    f->onTodoContextMenu = [i](int row, POINT sp) { ShowFenceMenu(i, sp, row); };
     // 「查看 / 排序 / 重命名」改完之后存盘：配置（viewMode 等）+ 图标顺序
     f->onStateChanged = [i] {
         EnsureFenceIconSize(i);
@@ -2232,6 +2298,13 @@ static void AddFenceWindow(int i, bool startCollapsed) {
         FenceWindow::DropHint h;
         if (fi >= 0 && g_fences[fi]) h = g_fences[fi]->dropHint();
         ClearAllDropHints();
+
+        // 待办盒不收图标：松手就当没这回事（图标原样留在原来的盒子里）
+        if (fi >= 0 && g_fences[fi] && g_fences[fi]->isTodo()) {
+            SaveIconLayout();
+            RedrawAll();
+            return;
+        }
 
         if (fi >= 0) {
             // 「拖到某个图标的正中间」：目标是文件夹/回收站就移进去/删掉，是程序就用它
@@ -2600,9 +2673,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_surface.SetShowLabels(g_config.showLabels != 0);
     g_surface.onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
     g_surface.onContextInvoked = [] { ReloadDesktopIcons(); };
-    // 空白处框选松手 → 在松手点弹一个只含「创建盒子」的菜单，点它就按这个框建。
+    // 空白处框选松手 → 在**这个蓝框的右下角**弹菜单，点它就按这个框建。
+    // 以前是钉在松手时的鼠标位置：手一抖（或者从右上往左下画框）菜单就飘到
+    // 框外面去了，看着和这个框没关系。
     // 和盒子右键菜单同一套自绘 PopupMenu，观感一致。
-    g_surface.onMarqueeMenu = [](const RECT& r, POINT sp) {
+    g_surface.onMarqueeMenu = [](const RECT& r, POINT) {
         if (!g_fenceMenu.Create()) return;
         g_fenceMenu.SetOwner(g_surface.hwnd());
 
@@ -2616,9 +2691,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 picked.push_back(e->path);
 
         g_fenceMenu.onCommand = [r, picked](int id) {
-            if (id != kCmdFenceFromMarquee) return;
+            if (id != kCmdFenceFromMarquee && id != kCmdFenceTodoFromMarquee) return;
+            const int kind = (id == kCmdFenceTodoFromMarquee) ? 1 : 0;
             std::vector<DesktopIconView*> list;
-            if (!picked.empty()) {
+            // 待办盒装不了图标：框里选中的东西留在桌面，不跟着搬
+            if (kind == 0 && !picked.empty()) {
                 // 按 g_icons 的顺序收（就是桌面上的先后），再按位置从左到右、
                 // 从上到下排一遍 —— 框出来的东西进盒子后顺序才跟眼睛看到的一致。
                 for (auto* e : g_icons) {
@@ -2631,12 +2708,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     return a->pos.x < b->pos.x;
                 });
             }
-            NewFenceInRect(r, list);
+            NewFenceInRect(r, list, kind);
         };
+        // 二级菜单：收纳盒子（装图标）/ 待办盒子（To-do 清单）
+        std::vector<PopupMenuItem> sub;
+        sub.push_back(PopupMenuItem(L"\u6536\u7eb3\u76d2\u5b50", kCmdFenceFromMarquee));      // 收纳盒子
+        sub.push_back(PopupMenuItem(L"\u5f85\u529e\u76d2\u5b50", kCmdFenceTodoFromMarquee));  // 待办盒子
+        PopupMenuItem create(L"\u521b\u5efa\u76d2\u5b50", 0);   // 创建盒子
+        create.sub = std::move(sub);
         std::vector<PopupMenuItem> items;
-        items.push_back(
-            PopupMenuItem(L"\u521b\u5efa\u76d2\u5b50", kCmdFenceFromMarquee));   // 创建盒子
-        g_fenceMenu.Show(sp, std::move(items));
+        items.push_back(std::move(create));
+        g_fenceMenu.ShowAnchoredToRect(r, std::move(items));
     };
     // 拖拽时「光标底下算不算有效落点」：盒子算；桌面上的回收站 / 文件夹 / 可执行
     // 图标也算（它们能接手被拖来的东西）。只有这些是真的目标，其余照旧按
@@ -2671,6 +2753,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         FenceWindow::DropHint h;
         if (g_fences[fi]) h = g_fences[fi]->dropHint();
         ClearAllDropHints();
+
+        // 待办盒不收图标：当「已经处理过」返回 —— 图标留在原处什么都不发生。
+        // 不能返回 false（那样会吸附到光标底下那一格，等于把图标摆到待办盒上面）。
+        if (g_fences[fi] && g_fences[fi]->isTodo()) return true;
 
         // 中间区域 → 交给目标图标（文件夹移进去 / 回收站删 / 程序打开）。
         // 目标按「光标正下方是哪个图标」直接取，不要拿 h.item 下标去反查：
