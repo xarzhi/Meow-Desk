@@ -727,6 +727,63 @@ void DesktopSurface::AbortDrag() {
     Redraw();
 }
 
+void DesktopSurface::SuspendDrag(POINT cursorScreen) {
+    suspended_ = false;
+    suspendIcons_.clear();
+    suspendStart_.clear();
+    suspendPos_.clear();
+    // 只有「真的拖起来了」才值得挂起：按下没动的单击不该被接着拖
+    if (mode_ != Mode::Move || !moved_ || dragSet_.empty()) {
+        AbortDrag();
+        return;
+    }
+    suspendIcons_ = dragSet_;
+    suspendStart_ = dragStartPos_;
+    for (size_t i = 0; i < dragSet_.size(); ++i)
+        suspendPos_.push_back(dragSet_[i] ? dragSet_[i]->dragPos : dragStartPos_[i]);
+    suspendCursor_ = cursorScreen;
+    suspended_ = true;
+    AbortDrag();   // 摆回原位 + 撤浮层 + 清 mode_（和以前交棒前的收尾完全一致）
+}
+
+bool DesktopSurface::ResumeDrag(POINT cursorScreen) {
+    if (!suspended_) return false;
+    suspended_ = false;
+    if (suspendIcons_.empty() || suspendIcons_.size() != suspendStart_.size() ||
+        suspendStart_.size() != suspendPos_.size())
+        return false;
+    // 期间可能重新枚举过图标（文件被目标搬走 / 桌面监视触发）→ 认不回来就算了
+    for (auto* e : suspendIcons_)
+        if (!e || !e->OnDesktop()) return false;
+
+    dragSet_ = suspendIcons_;
+    dragStartPos_ = suspendStart_;
+    // pressScreen_ 要反推出「让 dragPos 等于 挂起时的跟手位置 + 这一段光标位移」的值，
+    // 否则图标会瞬间跳回原位或者跳到光标正下方。取第一个图标即可（整批共享同一个位移）。
+    const POINT rel{suspendPos_[0].x - suspendCursor_.x, suspendPos_[0].y - suspendCursor_.y};
+    pressScreen_ = POINT{suspendStart_[0].x - rel.x, suspendStart_[0].y - rel.y};
+    curScreen_ = cursorScreen;
+    moved_ = true;
+    dragLayerShown_ = false;   // 让下一帧把浮层重新画出来
+    mode_ = Mode::Move;
+    if (hwnd_) SetCapture(hwnd_);
+
+    const int dx = cursorScreen.x - pressScreen_.x;
+    const int dy = cursorScreen.y - pressScreen_.y;
+    for (size_t i = 0; i < dragSet_.size(); ++i) {
+        if (!dragSet_[i]) continue;
+        dragSet_[i]->dragPos = POINT{dragStartPos_[i].x + dx, dragStartPos_[i].y + dy};
+    }
+    suspendIcons_.clear();
+    suspendStart_.clear();
+    suspendPos_.clear();
+
+    if (onDragUpdate) onDragUpdate(dragSet_);   // 浮层立刻回来，不用等下一次移动
+    if (onDragHover) onDragHover(cursorScreen); // 落点提示 / 盒子缝隙线
+    Redraw();
+    return true;
+}
+
 DesktopIconView* DesktopSurface::HitTest(POINT pt) const {
     if (!icons_) return nullptr;
     for (auto* e : *icons_) {
@@ -1082,13 +1139,6 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER:
-        // 「交棒给系统拖放」的快时钟（拖拽中光标压在别人窗口上时才有）。
-        // 停下来之后鼠标不动就没有 WM_MOUSEMOVE，靠 500ms 心跳会把交棒拖到下一秒，
-        // 用户手快一点先松手就变成「拖到上传区松手却没上传」。
-        if (wp == kTimerDragCheck) {
-            if (onDragTimer) onDragTimer();
-            return 0;
-        }
         // 搜索「定位」的闪烁：只重画那一格
         if (wp == 2) {
             DesktopIconView* e = flash_;

@@ -159,6 +159,15 @@ public:
     // 吃掉，我们收不到 WM_LBUTTONUP，状态只能自己清。
     void AbortDrag();
 
+    // 把这次拖拽「挂起」：图标照样摆回原位、浮层撤掉，但把「这批图标 + 各自的位置」
+    // 记下来，好在系统拖放被取消时用 ResumeDrag 接着拖。
+    // 交棒给 OLE 之前用它代替 AbortDrag —— 用户拖过别人的窗口再回到桌面，
+    // 图标要能立刻重新跟手，而不是「拖到一半，拖拽没了」。
+    void SuspendDrag(POINT cursorScreen);
+    // 接着拖：重新进入 Move 模式、重新抓鼠标，图标马上跟手（抓取偏移和挂起时一致，
+    // 不会「跳回原位」也不会「跳到光标下」）。返回 false = 没有可恢复的拖拽。
+    bool ResumeDrag(POINT cursorScreen);
+
     // 拖到外部（盒子）时询问是否接收；返回 true 表示这批图标被拿走
     std::function<bool(const std::vector<DesktopIconView*>&, POINT screenPt)> onDrop;
     // 拖动中判断光标是否落在外部目标（盒子）上：是则图标跟手走，不再吸附格子
@@ -167,11 +176,6 @@ public:
     // 松手时用它决定「这次拖动该当取消」——落在别人窗口上又没交棒给系统拖放，
     // 只会把图标藏到那个窗口底下，用户看着就是「拖没了」。
     std::function<bool(POINT screenPt)> overForeignWindow;
-    // 交棒判定用的快时钟（kTimerDragCheck）：拖拽中光标压在别人窗口上时才被上层打开，
-    // 因为「停下来准备放下」的时候没有 WM_MOUSEMOVE，等不到下一次鼠标消息。
-    std::function<void()> onDragTimer;
-    // 快时钟的 id。上层 SetTimer(hwnd(), kTimerDragCheck, ...) 打开 / KillTimer 关掉。
-    static constexpr UINT_PTR kTimerDragCheck = 3;
     // 拖动中每帧回调（屏幕坐标）：外部据此更新盒子的「插入缝隙线」提示
     std::function<void(POINT screenPt)> onDragHover;
     // 拖动结束、位置变了 → 外部负责写回资源管理器
@@ -314,6 +318,14 @@ private:
     void DrawSeamGdi(HDC hdc);
     std::vector<DesktopIconView*> dragSet_;
     std::vector<POINT> dragStartPos_;
+    // 挂起中的拖拽（交棒给系统拖放期间留着），见 SuspendDrag / ResumeDrag。
+    // 存的是拖拽那一刻的快照：图标原位、跟手位置、光标位置 —— 恢复时靠它们反推
+    // pressScreen_，抓取偏移才不会变。
+    bool suspended_ = false;
+    std::vector<DesktopIconView*> suspendIcons_;
+    std::vector<POINT> suspendStart_;
+    std::vector<POINT> suspendPos_;
+    POINT suspendCursor_{0, 0};
     POINT pressScreen_{0, 0};
     POINT curScreen_{0, 0};
     POINT marqueeA_{0, 0};

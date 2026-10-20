@@ -164,6 +164,9 @@ private:
 // ---------------------------------------------------------------------------
 class FileDropSrc final : public IDropSource {
 public:
+    explicit FileDropSrc(std::function<bool(POINT)> keepDragging)
+        : keep_(std::move(keepDragging)) {}
+
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
@@ -182,33 +185,50 @@ public:
     }
 
     STDMETHODIMP QueryContinueDrag(BOOL escape, DWORD keys) override {
-        if (escape) return DRAGDROP_S_CANCEL;
+        if (escape) {
+            cancelled_ = true;
+            return DRAGDROP_S_CANCEL;
+        }
         // 左键松开 = 放下。用 OLE 给的按键状态，不要自己 GetAsyncKeyState
         // （那条路上的状态和 OLE 内部不一定同步，会出现「松手了还在拖」）。
         if (!(keys & MK_LBUTTON)) return DRAGDROP_S_DROP;
+        // 光标回到「我们自己这边」（桌面 / 盒子）→ 结束系统拖放，让上层把
+        // 内部拖拽接回去。必须在「松手」之后判：松手那一帧要以放下为准。
+        if (keep_) {
+            POINT pt{};
+            if (GetCursorPos(&pt) && !keep_(pt)) {
+                left_ = true;
+                return DRAGDROP_S_CANCEL;
+            }
+        }
         return S_OK;
     }
 
     // 交给系统画光标（复制/移动/禁止），别自己画
     STDMETHODIMP GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
 
+    bool cancelled_ = false;
+    bool left_ = false;
+
 private:
     ~FileDropSrc() = default;
     LONG ref_ = 1;
+    std::function<bool(POINT)> keep_;
 };
 
 }  // namespace
 
-DWORD DragFiles(const std::vector<std::wstring>& paths, bool* cancelled) {
-    if (cancelled) *cancelled = false;
-    if (paths.empty()) return DROPEFFECT_NONE;
+DragOutcome DragFiles(const std::vector<std::wstring>& paths,
+                      std::function<bool(POINT)> keepDragging) {
+    DragOutcome out;
+    if (paths.empty()) return out;
 
     auto* data = new (std::nothrow) FileData(paths);
-    if (!data) return DROPEFFECT_NONE;
-    auto* src = new (std::nothrow) FileDropSrc();
+    if (!data) return out;
+    auto* src = new (std::nothrow) FileDropSrc(std::move(keepDragging));
     if (!src) {
         data->Release();
-        return DROPEFFECT_NONE;
+        return out;
     }
 
     // 交棒之前必须放掉鼠标捕获：OLE 的 StartDrag 要自己抓，
@@ -218,12 +238,15 @@ DWORD DragFiles(const std::vector<std::wstring>& paths, bool* cancelled) {
     DWORD eff = DROPEFFECT_NONE;
     const HRESULT hr = DoDragDrop(data, src,
                                   DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &eff);
+    out.leftTarget = src->left_;
+    // Esc / 右键取消走的是 DRAGDROP_S_CANCEL，和「松手了但没人要」不是一回事；
+    // leftTarget 也是 CANCEL，但那不是用户取消，上层要接着跑内部拖拽。
+    out.cancelled = !out.leftTarget && (src->cancelled_ || hr == DRAGDROP_S_CANCEL);
+    out.effect = SUCCEEDED(hr) ? eff : DROPEFFECT_NONE;
+
     src->Release();
     data->Release();
-
-    // Esc / 右键取消走的是 DRAGDROP_S_CANCEL，和「松手了但没人要」不是一回事
-    if (cancelled) *cancelled = (hr == DRAGDROP_S_CANCEL);
-    return SUCCEEDED(hr) ? eff : DROPEFFECT_NONE;
+    return out;
 }
 
 }  // namespace ShellDrag

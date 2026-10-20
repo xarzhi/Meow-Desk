@@ -16,21 +16,40 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// DROPEFFECT_* 在 objidl.h 里；WIN32_LEAN_AND_MEAN 会把 ole2.h 从 windows.h 里剔掉，
+// 所以下面这个结构体光靠 windows.h 编不过（error C2065: DROPEFFECT_NONE 未声明）。
+#include <objbase.h>
+#include <ole2.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace ShellDrag {
 
+// 一次系统拖放的结果。
+struct DragOutcome {
+    DWORD effect = DROPEFFECT_NONE;
+    // 用户按 Esc / 右键取消
+    bool cancelled = false;
+    // 光标离开了「别人的窗口」→ 我们主动让拖放循环返回 CANCEL（见 keepDragging）。
+    // 这时鼠标左键**通常还按着**，调用方可以把内部拖拽接回去，用户感觉是
+    // 「拖过别人窗口又回到桌面，图标重新跟手」。
+    bool leftTarget = false;
+};
+
 // 开始一次系统级文件拖放。**阻塞**：从调用到用户松手/按 Esc 期间由 OLE 的消息
-// 循环接管。返回最终的 DROPEFFECT_*（DROPEFFECT_NONE = 取消或没人接收）。
+// 循环接管。
 //
-// cancelled 非空时回告「是不是被用户按 Esc 取消的」。这个区别很重要：
-// DROPEFFECT_NONE 既可能是「Esc 取消」，也可能是「松手了但没任何目标接手」——
-// 后者调用方还想按自己的规则把图标落到松手那一格，前者绝对不能动。
+// keepDragging：每次 QueryContinueDrag（约等于每帧）问一次「这个屏幕点还算在
+// 拖放目标里吗」。返回 false 就当作「用户把文件拖回自己家窗口了」，立刻取消这次
+// 系统拖放并回 DragOutcome::leftTarget —— 不这么做的话，一旦交棒给 OLE，我们就
+// 只能等用户松手，中途想换回内部拖拽（换个桌面位置）没有任何办法。
+// 不传 = 一直拖到松手。
 //
 // paths 必须是磁盘上真实存在的路径。虚拟项（回收站 / 此电脑，路径形如 ::{GUID}）
 // 没法用 CF_HDROP 表达，调用方要先过滤掉；全是虚拟项时别调这个函数。
-DWORD DragFiles(const std::vector<std::wstring>& paths, bool* cancelled = nullptr);
+DragOutcome DragFiles(const std::vector<std::wstring>& paths,
+                      std::function<bool(POINT)> keepDragging = {});
 
 }  // namespace ShellDrag
