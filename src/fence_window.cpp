@@ -2805,8 +2805,15 @@ void FenceWindow::Paint() {
             }
             const BYTE hA = hasBackdrop ? (BYTE)std::min(255, (int)(alpha * 0.72))
                                         : (BYTE)std::min(255, alpha + 42);
-            SolidBrush headBrush{Color((BYTE)(hA * headFade), (BYTE)Lighten(r, 0.45),
-                                        (BYTE)Lighten(g, 0.45), (BYTE)Lighten(b, 0.45))};
+            // 「头部略亮一点」的提亮系数要分深浅。
+            // 浅色底照旧 45%（底色本来就亮，提亮只是让头部更实一点）；
+            // 深色底必须收着来 —— RGB(56,62,78) 提 45% 会变成 (145,149,158) 的
+            // 中灰，未选中标签的浅灰字就糊在上面，用户看到的就是「深色主题下
+            // 只有 active 那一项的文字还在，其他都看不见」。20% 既保住"略亮"的
+            // 层次，又不把底噪抬到吃掉文字对比度。
+            const double headLift = light ? 0.45 : 0.20;
+            SolidBrush headBrush{Color((BYTE)(hA * headFade), (BYTE)Lighten(r, headLift),
+                                        (BYTE)Lighten(g, headLift), (BYTE)Lighten(b, headLift))};
             // 头部这个路径是「上圆下方」的，只适合贴在卡片顶上。盒子收起时
             // 卡片只剩头部那么高，它的两个下直角就落到卡片圆角外面去了 ——
             // 表现为头部左右下角「多出两个直角」。按卡片形状裁一刀就干净了。
@@ -2877,7 +2884,10 @@ void FenceWindow::Paint() {
             // 非当前分组原来是「同一个字色 + 低 alpha（48%/57%）」：字是半透明的，
             // 和背后那块壁纸混在一起，壁纸一花字就散了。现在换成**不透明的中性灰**，
             // 层级只靠明度差（黑/深灰、白/浅灰），字始终是实的。
-            const ARGB idleFg = light ? 0xFF55575F : 0xFFC2C4CC;
+            // 深色这一档不能取太暗的灰（以前是 0xC2C4CC）：深色卡片的头部本身
+            // 比卡片主体亮一截，浅灰字贴上去就没对比了。现在取近白偏冷的中性灰，
+            // 和 active 的 0xF2F2F5 只差在明度一点点，层级交给粗体和胶囊底。
+            const ARGB idleFg = light ? 0xFF55575F : 0xFFDEE0E6;
             const BYTE fadeA8 = (BYTE)std::lround(255.0f * headFade);
             for (size_t i = 0; i < tabs.size(); ++i) {
                 const RECT& tr = tabs[i];
