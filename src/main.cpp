@@ -1108,12 +1108,18 @@ static DWORD DropIconsOntoIcon(const std::vector<DesktopIconView*>& list,
 
 // 这个桌面图标能不能「接手」被拖来的东西（回收站 / 文件夹 / 可执行程序）。
 // 拖拽时用来判断「光标底下算不算有效落点」：算的话才把松手交给我们处理，
-// 不算（普通文件图标、快捷方式的空白区）就照旧按「摆到那一格」走。
+// 不算（普通文件图标）就照旧按「摆到那一格」走，缝隙线提示也不会消失。
 static bool IconAcceptsDrop(const DesktopIconView* e) {
     if (!e || e->path.empty()) return false;
-    if (IsRecycleBinPath(e->path)) return true;
-    if (IsContainerTarget(e)) return true;
-    return IsProgramTarget(e);
+    // 虚拟项（回收站 / 此电脑）是解析名 ::{GUID}，里面只有回收站能接手。
+    // 先按路径形状分流：IsRecycleBinPath 对普通路径会去查一次已知文件夹，
+    // 而这个函数在拖动时每帧都要跑一遍，能省就省。
+    if (e->path.size() > 2 && e->path[0] == L':' && e->path[1] == L':')
+        return IsRecycleBinPath(e->path);
+    const DWORD a = GetFileAttributesW(e->path.c_str());
+    if (a == INVALID_FILE_ATTRIBUTES) return false;
+    if ((a & FILE_ATTRIBUTE_DIRECTORY) != 0) return true;   // 文件夹：移进去
+    return IsProgramTarget(e);                              // 程序：用它打开
 }
 
 // ---------------------------------------------------------------------------
