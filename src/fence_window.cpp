@@ -3625,7 +3625,30 @@ void FenceWindow::Paint() {
         const int glow = g_config.textShadow ? 2 : 0;
         const int textH = LabelTextHeight();
 
-        for (size_t i = 0; i < mine.size(); ++i) {
+        // 画序：选中的放最后。聚焦（唯一选中）时标签不限行（名字要完整），会往下
+        // 压到后面几排的图标上；按原顺序画就被那些图标盖掉，名字还是看不全。
+        std::vector<size_t> order;
+        order.reserve(mine.size());
+        for (size_t i = 0; i < mine.size(); ++i)
+            if (!(mine[i] && mine[i]->selected)) order.push_back(i);
+        for (size_t i = 0; i < mine.size(); ++i)
+            if (mine[i] && mine[i]->selected) order.push_back(i);
+
+        // 只有「恰好选中一个」时那个图标才展开标签。多选（框选 / Ctrl 加选）
+        // 全部展开会把盒子糊满文字，和桌面层同一套规则。
+        DesktopIconView* expandOne = nullptr;
+        {
+            int selN = 0;
+            for (auto* e2 : mine)
+                if (e2 && e2->selected) {
+                    ++selN;
+                    expandOne = e2;
+                }
+            if (selN != 1) expandOne = nullptr;
+        }
+
+        for (size_t oi = 0; oi < order.size(); ++oi) {
+            const size_t i = order[oi];
             DesktopIconView* e = mine[i];
             if (!posOk[i]) continue;
             const int ix = posOf[i].x;
@@ -3680,8 +3703,10 @@ void FenceWindow::Paint() {
                                  gaLabel, gd);
                 }
             } else if (showLabels_) {
-                // 平时一行（超出省略），单击选中后展开成两行 —— 和桌面图标一致
-                const int maxLines = e->selected ? 2 : 1;
+                // 网格：平时一行（超出省略），聚焦（唯一选中）后**行数不限**，
+                // 名字整段显示 —— 宽度还是格子宽，高度由 LabelDib 自己往下撑。
+                // 列表：行高固定，展开会压到下一行，所以最多两行。
+                const int maxLines = (e == expandOne) ? (listMode ? 2 : 0) : 1;
                 if (listMode) {
                     const int labW = std::max(24, (width_ - kPad * 2) - (iconX - ix) - iconW - 8);
                     // 列表行的标签盒给到「两行」的高度（图标本身就有 32px，够两行）

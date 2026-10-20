@@ -662,6 +662,48 @@ RECT DesktopSurface::CellRect(const DesktopIconView* e) const {
     return r;
 }
 
+// 每次绘制前算一次「谁有资格展开标签」：恰好一个图标被选中时才是它。
+// 多选（框选 / Ctrl 加选 / 全选）时一个都不展开 —— 否则一片图标同时往下长
+// 好几行，桌面直接变成一堵字墙。
+void DesktopSurface::ResolveLabelExpand() {
+    labelExpand_ = nullptr;
+    if (!icons_) return;
+    // 拖拽 / 框选过程中谁都不展开：那时候图标在动，脏矩形只按格子算，
+    // 多出来的那几行既会跟手乱跳、又会在局部重画时被擦掉一截。
+    if (mode_ != Mode::None) return;
+    for (auto* e : *icons_) {
+        if (!e || !e->OnDesktop() || !e->selected) continue;
+        if (labelExpand_) return;   // 第二个 → 谁都不展开
+        labelExpand_ = e;
+    }
+}
+
+// 图标实际画到的范围。选中（聚焦）时标签不限行，高度得按「标签实际多高」算 ——
+// 直接问那枚已经缓存的 LabelDib（和 DrawOneLayered 用同一个 key，命中缓存不重建）。
+// 拿不到 DIB（还没画过 / 关掉了标题）就退回格子本身。
+RECT DesktopSurface::IconExtent(const DesktopIconView* e) const {
+    RECT r{};
+    if (!e) return r;
+    r = CellRect(e);
+    if (!IsLabelExpand(e) || !showLabels_ || e->renaming || e->name.empty() || !impl_) return r;
+
+    const int ih = e->bmp.valid() ? e->bmp.height : iconPx_;
+    const int lineH = IconLabelLineHeight();
+    int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);
+    if (textH > lineH * 2) textH = lineH * 2;
+    if (textH < 14) textH = 14;
+
+    // 这就是 DrawOneLayered 里那次 Build 的参数（key 里含 maxLines=0，会命中同一条缓存）
+    const LabelDib* lab = impl_->Label(const_cast<DesktopIconView*>(e), cellW_ - kLabelInset,
+                                       textH, textShadow_ ? 2 : 0, 0);
+    if (!lab || !lab->valid()) return r;
+
+    const int textTop = r.top + kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap;
+    const int bottom = textTop - lab->pad + lab->h;
+    if (bottom > r.bottom) r.bottom = bottom;
+    return r;
+}
+
 // 放弃这次拖动、图标回原位（交棒给系统级拖放之前调）。
 // 和鼠标松开时「没落在盒子上、也没真的移动」那条分支同一套收尾，只是位置直接从
 // dragStartPos_ 还原，不再吸附格子。
@@ -1159,14 +1201,15 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghos
     // 正在原地改名：名字由那个输入框代替（见 DesktopIconView::renaming）
     if (e->name.empty() || !showLabels_ || e->renaming) return;
 
-    // 标题区按「两行」预留：平时只画一行（超出用省略号），单击选中后展开成两行。
-    // 两行是硬上限 —— 再长的名字也只是两行 + 省略号，不会顶到下一排图标上去。
+    // 平时只画一行（超出用省略号）；单击选中（聚焦，且只有它一个被选中）后行数
+    // **不限**，名字整段显示出来 —— 宽度仍然是格子宽，高度由 LabelDib 自己往下撑开。
+    // textH 只是给「不选中」那一档的最小盒子，展开时它会被 Build 顶大。
     const int lineH = IconLabelLineHeight();
     int textTop = y + kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap;
     int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);
     if (textH > lineH * 2) textH = lineH * 2;
     if (textH < 14) textH = 14;
-    const int maxLines = e->selected ? 2 : 1;
+    const int maxLines = IsLabelExpand(e) ? 0 : 1;
 
     if (!impl_) return;
     LabelDib* lab = impl_->Label(e, cellW_ - kLabelInset, textH, textShadow_ ? 2 : 0, maxLines);
@@ -1184,15 +1227,23 @@ void DesktopSurface::PaintLayered() {
     std::memset(bits_, 0, (size_t)bufW_ * (size_t)bufH_ * 4);  // 全透明底
 
     if (!icons_) return;
+    ResolveLabelExpand();   // 谁能展开标签（唯一选中的那个）
 
     // 整屏重画前按当前光标位置同步一次悬停（图标可能刚搬过家）
     SyncHoverToCursor();
 
     // 拖动中的图标在**原位**留一份灰的当占位，跟手的那张由拖拽浮层画在最上面。
     // 以前是「拖走的直接跳过、原位什么都不画」，多选拖动时看不出原来占了哪几格。
-    for (auto* e : *icons_) {
-        if (!e || !e->OnDesktop()) continue;
-        DrawOneLayered(e, false, IsDragGhost(e));
+    //
+    // 分两遍：选中的最后画。选中时标签行数不限，会往下压到下一排图标的格子上，
+    // 按原顺序画就会被后面的图标盖掉，名字还是看不全。
+    for (int pass = 0; pass < 2; ++pass) {
+        for (auto* e : *icons_) {
+            if (!e || !e->OnDesktop()) continue;
+            const bool onTop = e->selected && !IsDragGhost(e);
+            if ((pass == 1) != onTop) continue;
+            DrawOneLayered(e, false, IsDragGhost(e));
+        }
     }
     // 正在拖的图标交给拖拽浮层画（桌面层在所有盒子下面，不然会被盒子挡住）
 
@@ -1310,10 +1361,16 @@ void DesktopSurface::PaintOpaque(HDC hdc) {
     if (icons_) {
         // 整屏重画前按当前光标位置同步一次悬停（图标可能刚搬过家）
         SyncHoverToCursor();
-        for (auto* e : *icons_) {
-            if (!e || !e->OnDesktop()) continue;
-            // 拖动中的图标：原位画灰占位（跟手的那张在拖拽浮层上）
-            DrawOneGdi(hdc, e, false, IsDragGhost(e));
+        ResolveLabelExpand();   // 谁能展开标签（唯一选中的那个）
+        // 分两遍：选中的最后画（标签不限行，会压到下面几格的图标上，见 PaintLayered）
+        for (int pass = 0; pass < 2; ++pass) {
+            for (auto* e : *icons_) {
+                if (!e || !e->OnDesktop()) continue;
+                const bool onTop = e->selected && !IsDragGhost(e);
+                if ((pass == 1) != onTop) continue;
+                // 拖动中的图标：原位画灰占位（跟手的那张在拖拽浮层上）
+                DrawOneGdi(hdc, e, false, IsDragGhost(e));
+            }
         }
     }
 
@@ -1428,13 +1485,13 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging, bool
     // 正在原地改名：名字由那个输入框代替（见 DesktopIconView::renaming）
     if (e->name.empty() || !showLabels_ || e->renaming) return;
 
-    // 同上：标题区两行预留，单行省略 / 选中展开
+    // 同上：平时一行省略，聚焦（唯一选中）后不限行（和分层路径完全一致）
     const int lineH = IconLabelLineHeight();
     int textTop = y + kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap;
     int textH = cellH_ - (kIconTopPad + (ih > 0 ? ih : iconPx_) + kTextGap);
     if (textH > lineH * 2) textH = lineH * 2;
     if (textH < 14) textH = 14;
-    const int maxLines = e->selected ? 2 : 1;
+    const int maxLines = IsLabelExpand(e) ? 0 : 1;
 
     if (LabelDib* lab = impl_->Label(e, cellW_ - kLabelInset, textH, textShadow_ ? 2 : 0,
                                      maxLines)) {
@@ -1593,7 +1650,20 @@ void DesktopSurface::RepaintCells(const RECT& rect) {
     // 注意：不透明路径没有 bits_（那是分层窗口的整屏缓冲），这条判断必须在下面
     // 那个 opaque_ 分支之后 —— 否则不透明模式下悬停高亮永远不会重画。
     if (opaque_) {   // 不透明路径有自己的脏矩形机制
-        Dirty(rect);
+        // 和分层路径同一个理由：展开的标签会超出格子，裁剪区不够就会把它擦掉一截
+        ResolveLabelExpand();
+        RECT c2 = rect;
+        if (labelExpand_) {
+            const RECT er = IconExtent(labelExpand_);
+            if (er.right > c2.left && er.left < c2.right && er.bottom > c2.top &&
+                er.top < c2.bottom) {
+                c2.left = std::min(c2.left, er.left);
+                c2.top = std::min(c2.top, er.top);
+                c2.right = std::max(c2.right, er.right);
+                c2.bottom = std::max(c2.bottom, er.bottom);
+            }
+        }
+        Dirty(c2);
         FlushDirty();
         return;
     }
@@ -1606,24 +1676,26 @@ void DesktopSurface::RepaintCells(const RECT& rect) {
     if (c.bottom > bufH_) c.bottom = bufH_;
     if (c.right <= c.left || c.bottom <= c.top) return;
 
-    // 关键：先把 rect 撑到「盖住所有与它相交的图标所在的整格」。
-    // 图标只能画在自己格子里，所以这样做之后重画的图标一定完整落在清空区域内。
-    // 不这么做的话：rect 带 2px 外扩会切到隔壁格子，隔壁图标被重画一次，
-    // 但它只有一小截被清空 → 那一截叠成双份颜色（实测隔壁图标会变色）。
-    // 用整格（不带 padding）判断相交，撑一次就收敛，不会连锁扩散。
+    // 局部重画也要知道「谁在展开」：IconExtent 靠它算多出来的那几行
+    ResolveLabelExpand();
+
+    // 关键：先把 rect 撑到「盖住所有与它相交的图标所在的整块」。
+    // 图标平时只画在自己格子里，但**选中时标签不限行、会往下多长几行**，
+    // 所以范围要用 IconExtent()（格子 ∪ 展开的标签），不能再用 cellH_。
+    // 不这么做的话：清空区只盖住格子，多出来的那几行没被清、也没被重画，
+    // 移走图标后就会在桌面上留一串残影。
     for (bool grew = true; grew;) {
         grew = false;
         for (auto* e : *icons_) {
             if (!e || !e->OnDesktop()) continue;
-            const int ex = e->pos.x - origin_.x;
-            const int ey = e->pos.y - origin_.y;
-            if (ex + cellW_ <= c.left || ex >= c.right || ey + cellH_ <= c.top ||
-                ey >= c.bottom)
+            const RECT er = IconExtent(e);
+            if (er.right <= c.left || er.left >= c.right || er.bottom <= c.top ||
+                er.top >= c.bottom)
                 continue;
-            const int l = std::min<int>(c.left, ex);
-            const int t = std::min<int>(c.top, ey);
-            const int r = std::max<int>(c.right, ex + cellW_);
-            const int b = std::max<int>(c.bottom, ey + cellH_);
+            const int l = std::min<int>(c.left, er.left);
+            const int t = std::min<int>(c.top, er.top);
+            const int r = std::max<int>(c.right, er.right);
+            const int b = std::max<int>(c.bottom, er.bottom);
             if (l != c.left || t != c.top || r != c.right || b != c.bottom) {
                 c = RECT{l, t, r, b};
                 grew = true;
@@ -1643,15 +1715,19 @@ void DesktopSurface::RepaintCells(const RECT& rect) {
         for (int x = c.left; x < c.right; ++x) row[x] = 0x01000000u;
     }
 
-    // 重画所有和这块区域相交的图标（可能不止一个：相邻格子的光晕会溢进来）
-    for (auto* e : *icons_) {
-        if (!e || !e->OnDesktop()) continue;
-        const int ex = e->pos.x - origin_.x;
-        const int ey = e->pos.y - origin_.y;
-        if (ex + cellW_ <= c.left || ex >= c.right || ey + cellH_ <= c.top ||
-            ey >= c.bottom)
-            continue;
-        DrawOneLayered(e, false, IsDragGhost(e));
+    // 重画所有和这块区域相交的图标（可能不止一个：相邻格子的光晕会溢进来）。
+    // 同样分两遍、选中的最后画 —— 和整屏重画保持同一套层级。
+    for (int pass = 0; pass < 2; ++pass) {
+        for (auto* e : *icons_) {
+            if (!e || !e->OnDesktop()) continue;
+            const RECT er = IconExtent(e);
+            if (er.right <= c.left || er.left >= c.right || er.bottom <= c.top ||
+                er.top >= c.bottom)
+                continue;
+            const bool onTop = e->selected && !IsDragGhost(e);
+            if ((pass == 1) != onTop) continue;
+            DrawOneLayered(e, false, IsDragGhost(e));
+        }
     }
     UploadLayered();
 }

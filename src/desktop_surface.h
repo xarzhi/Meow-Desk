@@ -196,6 +196,16 @@ private:
 
     DesktopIconView* HitTest(POINT clientPt) const;
     RECT CellRect(const DesktopIconView* e) const;
+    // 这个图标**实际画到**的范围（客户区像素），用来做脏矩形。
+    // 平时就是自己那一格；单击选中时标签不限行、会往下多长几行，范围要跟着长 ——
+    // 只用格子算的话，局部重画会把它擦掉一截或用旧像素盖回去。
+    RECT IconExtent(const DesktopIconView* e) const;
+    // 每次绘制前算一次：**唯一**被选中的那个图标才展开标签（名字全显示）。
+    // 框选一片的时候全部展开，桌面会被文字糊满 —— 「聚焦」本来就是单数的。
+    void ResolveLabelExpand();
+    bool IsLabelExpand(const DesktopIconView* e) const { return e && e == labelExpand_; }
+    // 本次绘制里「标签不限行」的那个图标（nullptr = 没有）
+    DesktopIconView* labelExpand_ = nullptr;
 
     // 悬停：光标压到哪个图标上 → 给它画一层半透明底（和选中态区分开）
     void UpdateHover(POINT screenPt);

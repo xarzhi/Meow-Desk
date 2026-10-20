@@ -464,6 +464,10 @@ bool LabelDib::Build(const std::wstring& text, HFONT font, int boxW, int boxH, i
                      COLORREF color, int maxLines) {
     Free();
     if (text.empty() || boxW <= 0 || boxH <= 0 || !font) return false;
+    // maxLines <= 0 = 不限行（单击图标聚焦时用）：一直折到名字写完。
+    // 仍然留一个硬上限 —— 真碰到几百字符的病态名字也不能把整块屏铺满。
+    const bool unlimited = (maxLines <= 0);
+    if (unlimited) maxLines = 24;
     if (maxLines < 1) maxLines = 1;
 
     // 1) 先按格子宽度折行，再按「实际文字宽度」收窄 DIB。
@@ -504,6 +508,23 @@ bool LabelDib::Build(const std::wstring& text, HFONT font, int boxW, int boxH, i
         boxW = best + 2;
     }
     if (boxW < 8) boxW = 8;
+
+    // 1.5) 不限行：盒子高度按「实际需要」撑开 —— 宽度还是格子的宽度，
+    //      只是往下多长几行，名字整段都画得出来。
+    //      用 DT_CALCRECT 量而不是自己乘行高：它连字体的行距一起算，最后一行
+    //      不会被切掉一截（GDI 多行行距是 tmHeight + tmExternalLeading）。
+    if (unlimited) {
+        HDC measure = CreateCompatibleDC(nullptr);
+        if (measure) {
+            HGDIOBJ f = SelectObject(measure, font);
+            RECT cr{0, 0, boxW, 0};
+            DrawTextW(measure, wrapped.c_str(), -1, &cr,
+                      DT_CENTER | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_CALCRECT);
+            SelectObject(measure, f);
+            DeleteDC(measure);
+            if (cr.bottom + 2 > boxH) boxH = cr.bottom + 2;
+        }
+    }
 
     // 2) 在 boxW x boxH 的 DIB 上用 GDI 写白字
     HDC mdc = nullptr;
