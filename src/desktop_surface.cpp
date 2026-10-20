@@ -976,6 +976,13 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (onDragEnd) onDragEnd();
 
         if (mode_ == Mode::Move) {
+            // 松手压在别人的程序窗口上、又没交棒（停的时间不够）→ 当取消。
+            // 否则图标会「瞬移」到那个窗口底下的格子里：看不见、像被删了。
+            if (moved_ && !dragSet_.empty() && overForeignWindow &&
+                overForeignWindow(curScreen_)) {
+                AbortDrag();   // 图标回原位 + 撤浮层，和「按 Esc 取消」同一条路
+                return 0;
+            }
             bool over = overTarget && overTarget(curScreen_);
             if (TraceOn()) {
                 LogSurface("LBUTTONUP pt=%ld,%ld over=%d moved=%d n=%zu", (long)curScreen_.x,
@@ -1075,6 +1082,13 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER:
+        // 「交棒给系统拖放」的快时钟（拖拽中光标压在别人窗口上时才有）。
+        // 停下来之后鼠标不动就没有 WM_MOUSEMOVE，靠 500ms 心跳会把交棒拖到下一秒，
+        // 用户手快一点先松手就变成「拖到上传区松手却没上传」。
+        if (wp == kTimerDragCheck) {
+            if (onDragTimer) onDragTimer();
+            return 0;
+        }
         // 搜索「定位」的闪烁：只重画那一格
         if (wp == 2) {
             DesktopIconView* e = flash_;

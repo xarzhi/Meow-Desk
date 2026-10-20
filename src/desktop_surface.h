@@ -163,6 +163,15 @@ public:
     std::function<bool(const std::vector<DesktopIconView*>&, POINT screenPt)> onDrop;
     // 拖动中判断光标是否落在外部目标（盒子）上：是则图标跟手走，不再吸附格子
     std::function<bool(POINT screenPt)> overTarget;
+    // 这个屏幕点上是不是「别人的程序窗口」（不是我们的、也不是 explorer 的桌面背景）。
+    // 松手时用它决定「这次拖动该当取消」——落在别人窗口上又没交棒给系统拖放，
+    // 只会把图标藏到那个窗口底下，用户看着就是「拖没了」。
+    std::function<bool(POINT screenPt)> overForeignWindow;
+    // 交棒判定用的快时钟（kTimerDragCheck）：拖拽中光标压在别人窗口上时才被上层打开，
+    // 因为「停下来准备放下」的时候没有 WM_MOUSEMOVE，等不到下一次鼠标消息。
+    std::function<void()> onDragTimer;
+    // 快时钟的 id。上层 SetTimer(hwnd(), kTimerDragCheck, ...) 打开 / KillTimer 关掉。
+    static constexpr UINT_PTR kTimerDragCheck = 3;
     // 拖动中每帧回调（屏幕坐标）：外部据此更新盒子的「插入缝隙线」提示
     std::function<void(POINT screenPt)> onDragHover;
     // 拖动结束、位置变了 → 外部负责写回资源管理器

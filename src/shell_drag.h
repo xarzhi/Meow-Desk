@@ -25,8 +25,12 @@ namespace ShellDrag {
 // 开始一次系统级文件拖放。**阻塞**：从调用到用户松手/按 Esc 期间由 OLE 的消息
 // 循环接管。返回最终的 DROPEFFECT_*（DROPEFFECT_NONE = 取消或没人接收）。
 //
+// cancelled 非空时回告「是不是被用户按 Esc 取消的」。这个区别很重要：
+// DROPEFFECT_NONE 既可能是「Esc 取消」，也可能是「松手了但没任何目标接手」——
+// 后者调用方还想按自己的规则把图标落到松手那一格，前者绝对不能动。
+//
 // paths 必须是磁盘上真实存在的路径。虚拟项（回收站 / 此电脑，路径形如 ::{GUID}）
 // 没法用 CF_HDROP 表达，调用方要先过滤掉；全是虚拟项时别调这个函数。
-DWORD DragFiles(const std::vector<std::wstring>& paths);
+DWORD DragFiles(const std::vector<std::wstring>& paths, bool* cancelled = nullptr);
 
 }  // namespace ShellDrag

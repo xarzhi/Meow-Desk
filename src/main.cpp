@@ -2105,18 +2105,68 @@ static bool IsShellBackdropWindow(HWND w) {
     return false;
 }
 
-// 光标下面压着的是不是「别人的窗口」。
+// 光标下面压着的是不是「别人的窗口」；不是就返回 nullptr。
 //
 // 不能反过来用「点不在我们窗口里」判：桌面层是全屏分层窗口，alpha=0 的地方
 // 鼠标直接穿透，WindowFromPoint 会返回 Progman / WorkerW（explorer 的桌面背景）。
 // 所以判据是：窗口属于别的进程、可见，而且不是 shell 的桌面背景 / 任务栏。
-static bool CursorOverForeignWindow(POINT pt) {
+static HWND ForeignWindowAt(POINT pt) {
     HWND w = WindowFromPoint(pt);
-    if (!w || !IsWindowVisible(w)) return false;
+    if (!w || !IsWindowVisible(w)) return nullptr;
     DWORD pid = 0;
     GetWindowThreadProcessId(w, &pid);
-    if (pid == GetCurrentProcessId()) return false;   // 我们自己的窗口（含拖拽浮层）
-    return !IsShellBackdropWindow(w);
+    if (pid == GetCurrentProcessId()) return nullptr;   // 我们自己的窗口（含拖拽浮层）
+    return IsShellBackdropWindow(w) ? nullptr : w;
+}
+
+// 「压到别人窗口上」只是交棒的必要条件，不是充分条件 —— 得先**停住**。
+//
+// 拖图标换桌面位置时，中途划过浏览器 / 聊天窗 / 播放器太常见了。以前是一压上去
+// 立刻交棒，于是「想换个位置」的手一抖就变成系统拖放：光标变上传样式、我们的
+// 内部拖拽已经被 AbortDrag 撤掉，回来松手什么都不发生。用户原话：
+// 「拖拽的途中经过某个程序的窗口，然后拖拽就变为拖拽上传了，然后离开窗口时，
+//   还是拖拽上传的鼠标样式，这时候在桌面其他位置鼠标松开，换位置就会失效」。
+//
+// 所以改成：同一个窗口底下、光标几乎不动地待满 kHandOffDwellMs 才交棒。
+// 真要在浏览器上传区里放文件，人是会停一下的；路过不会。
+//
+// 两个常数连起来就是「多慢才算停」：drift / dwell ≈ 60px/s。
+// 拖图标正常都在 200px/s 以上，路过窗口绝不会误触；而「对准上传区慢慢放」
+// （大约 40~60px/s 的减速瞄准）能正常触发 —— 阈值定得太死（比如 8px/s）
+// 会让上传功能变成「必须完全静止半秒才认」，实测手感很差。
+static constexpr DWORD kHandOffDwellMs = 300;   // 停住多久算「想放这儿」
+static constexpr int kHandOffDriftPx = 18;      // 这段时间里最多允许漂多少
+static struct {
+    HWND win = nullptr;
+    POINT anchor{0, 0};
+    DWORD since = 0;
+} g_handOffGate;
+
+static void ResetHandOffGate() {
+    g_handOffGate.win = nullptr;
+    g_handOffGate.since = 0;
+}
+
+// w == nullptr（光标不在别人窗口上 / 拖拽没在跑）时返回 false 并顺手重置计时。
+static bool HandOffDwellElapsed(HWND w, POINT pt) {
+    if (!w) {
+        ResetHandOffGate();
+        return false;
+    }
+    const DWORD now = GetTickCount();
+    const int dx = pt.x > g_handOffGate.anchor.x ? pt.x - g_handOffGate.anchor.x
+                                                 : g_handOffGate.anchor.x - pt.x;
+    const int dy = pt.y > g_handOffGate.anchor.y ? pt.y - g_handOffGate.anchor.y
+                                                 : g_handOffGate.anchor.y - pt.y;
+    if (w != g_handOffGate.win || !g_handOffGate.since || dx > kHandOffDriftPx ||
+        dy > kHandOffDriftPx) {
+        // 换了窗口，或者又挪了一段 → 从现在重新计时
+        g_handOffGate.win = w;
+        g_handOffGate.anchor = pt;
+        g_handOffGate.since = now;
+        return false;
+    }
+    return now - g_handOffGate.since >= kHandOffDwellMs;
 }
 
 // 当前这批被拖的东西里，能拿去拖放的磁盘路径。
@@ -2147,32 +2197,158 @@ static void EndInternalDragForShell() {
     g_dragIcons.clear();
 }
 
-// 拖动中每次鼠标移动都过一遍：一旦压到别的程序窗口上就交棒。
+// 交棒那一刻「本来想做什么」：这批图标 + 各自被拖到哪（格子左上角，屏幕坐标）。
+// EndInternalDragForShell 会把它们全摆回原位，所以得先留一份备份 —— 万一系统拖放
+// 最后没人接手（eff == NONE），还能按内部拖拽的规则落到松手那一格。
+//
+// 存**路径**而不是指针：DoDragDrop 的模态循环期间照样会跑我们的消息处理，
+// 真赶上重新枚举图标（文件被目标搬走 / 桌面监视触发），旧指针就成了悬垂的。
+struct PendingMove {
+    struct Item {
+        std::wstring path;
+        POINT want{0, 0};
+    };
+    std::vector<Item> items;
+    bool fromDesktop = false;
+};
+
+static PendingMove CapturePendingMove() {
+    PendingMove p;
+    p.fromDesktop = g_dragIcons.empty();
+    const std::vector<DesktopIconView*>& src =
+        p.fromDesktop ? g_surface.draggingItems() : g_dragIcons;
+    for (auto* e : src) {
+        if (!e || e->path.empty()) continue;
+        p.items.push_back(PendingMove::Item{e->path, e->dragPos});
+    }
+    return p;
+}
+
+// 系统拖放没人接手 → 按 WM_LBUTTONUP 里那套规则重新落位（单选：目标格被占就交换；
+// 多选：各自找最近的空格子）。盒子来源（owner >= 0）先不做：那要连着 owner / group
+// 一起改，属于「把图标搬回桌面」另一条完整路径，不在这次修复范围内。
+static void ApplyPendingDesktopMove(const PendingMove& p, POINT up) {
+    if (!p.fromDesktop || p.items.empty()) return;
+
+    // 按路径重新认一遍图标（见 PendingMove 的注释）
+    std::vector<DesktopIconView*> icons;
+    std::vector<POINT> wants;
+    for (const auto& it : p.items) {
+        for (auto* e : g_icons) {
+            if (!e || !e->OnDesktop() || e->path != it.path) continue;
+            icons.push_back(e);
+            wants.push_back(it.want);
+            break;
+        }
+    }
+    if (icons.empty()) return;
+
+    // 记下来的位置是「压在那个窗口上」那一瞬的，之后用户可能又拖去别处了 ——
+    // 按松手点整体平移一次，多选时队形也不会散。
+    const POINT shift{up.x - wants[0].x, up.y - wants[0].y};
+    for (auto& w : wants) {
+        w.x += shift.x;
+        w.y += shift.y;
+    }
+
+    std::vector<DesktopIconView*> pending = icons;
+    std::vector<DesktopIconView*> swapped;
+    for (size_t i = 0; i < icons.size(); ++i) {
+        DesktopIconView* e = icons[i];
+        pending.erase(std::remove(pending.begin(), pending.end(), e), pending.end());
+        const POINT cell = (icons.size() == 1)
+                               ? g_surface.ResolveDropCell(wants[i], e, pending, &swapped)
+                               : g_surface.SnapToFreeCell(wants[i], pending);
+        e->pos = cell;
+        e->dragPos = cell;
+    }
+    if (g_surface.onMoved) g_surface.onMoved(icons);
+    if (!swapped.empty() && g_surface.onMoved) g_surface.onMoved(swapped);   // 被换走的也要写回
+    SaveIconLayout();
+    RedrawAll();
+}
+
+// 「交棒判定」的快时钟：只在「拖拽中 + 光标压在别人窗口上」时开，60ms 一次。
+// 其余时间一律关着 —— 空闲时每 60ms 醒一次纯属白烧电。
+static void MaybeHandOffToShell(POINT pt);   // 定义在下面
+
+static bool g_handOffTimerOn = false;
+
+static void StartHandOffTimer() {
+    if (g_handOffTimerOn) return;
+    HWND h = g_surface.hwnd();
+    if (!h) return;
+    if (SetTimer(h, DesktopSurface::kTimerDragCheck, 60, nullptr)) g_handOffTimerOn = true;
+}
+
+static void StopHandOffTimer() {
+    if (!g_handOffTimerOn) return;
+    g_handOffTimerOn = false;
+    if (HWND h = g_surface.hwnd()) KillTimer(h, DesktopSurface::kTimerDragCheck);
+}
+
+static void HandOffTimerTick() {
+    POINT cur{};
+    if (!GetCursorPos(&cur) || (g_dragIcons.empty() && !g_surface.dragActive()) ||
+        !ForeignWindowAt(cur)) {
+        StopHandOffTimer();
+        ResetHandOffGate();
+        return;
+    }
+    MaybeHandOffToShell(cur);   // 停够了就交棒（交棒里会 ResetHandOffGate）
+}
+
+// 拖动中每次鼠标移动都过一遍：光标在别人窗口上**停住**了才交棒。
 //
 // 调用点必须都在「这一帧处理的最后」—— DoDragDrop 会跑一个模态消息循环，
 // 期间我们自己的窗口照样收消息，所以进去之前内部状态必须已经清干净。
 static void MaybeHandOffToShell(POINT pt) {
     if (g_shellDragRunning) return;
-    if (g_dragIcons.empty() && !g_surface.dragActive()) return;
-    if (!CursorOverForeignWindow(pt)) return;
+    if (g_dragIcons.empty() && !g_surface.dragActive()) {
+        ResetHandOffGate();   // 没在拖：计时清零，免得下次一上来就算「已经停够了」
+        StopHandOffTimer();
+        return;
+    }
+    const HWND over = ForeignWindowAt(pt);
+    if (!over) {
+        // 回到桌面 / 盒子上：计时和快时钟都撤掉
+        ResetHandOffGate();
+        StopHandOffTimer();
+        return;
+    }
+    StartHandOffTimer();   // 停下来之后就没有 WM_MOUSEMOVE 了，靠它叫醒
+    // 路过不算：必须在同一个窗口底下几乎不动地待满 kHandOffDwellMs
+    if (!HandOffDwellElapsed(over, pt)) return;
+
     const std::vector<std::wstring> paths = CurrentDragPaths();
     if (paths.empty()) return;   // 全是虚拟项：外面也用不上，保持原来的内部拖拽
 
+    const PendingMove pending = CapturePendingMove();
+    ResetHandOffGate();
+    StopHandOffTimer();
     EndInternalDragForShell();
 
     g_shellDragRunning = true;
-    const DWORD eff = ShellDrag::DragFiles(paths);
+    bool cancelled = false;
+    const DWORD eff = ShellDrag::DragFiles(paths, &cancelled);
     g_shellDragRunning = false;
 
+    POINT up{0, 0};
+    GetCursorPos(&up);
+
     LogStep("shell drag -> " + std::to_string(paths.size()) + " file(s), effect=" +
-            std::to_string((int)eff));
+            std::to_string((int)eff) + (cancelled ? " cancelled" : ""));
     if (eff != DROPEFFECT_NONE) {
         // 目标可能是「移动」（拖进别的资源管理器窗口）：文件真的被搬走了，
         // 重枚举一次让图标跟着消失。我们**绝不**自己删源文件 —— MOVE 由目标完成。
         ReloadDesktopIcons(true);
         SaveIconLayout();
         RedrawAll();
+        return;
     }
+    // 没人接手：如果鼠标最后回到了桌面（不在别的窗口上、也不在盒子上）才松手，
+    // 就按内部拖拽落位 —— 「换个位置」不该因为中途路过一个窗口就整件事作废。
+    if (!cancelled && !ForeignWindowAt(up) && FenceIndexAt(up) < 0) ApplyPendingDesktopMove(pending, up);
 }
 
 // ---------------------------------------------------------------------------
@@ -2722,6 +2898,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (FenceIndexAt(pt) >= 0) return true;
         return IconAcceptsDrop(g_surface.ItemAtScreen(pt));
     };
+    // 松手时压在别人的程序窗口上 → 这次拖动当取消（图标回原位）。
+    g_surface.overForeignWindow = [](POINT pt) { return ForeignWindowAt(pt) != nullptr; };
+    g_surface.onDragTimer = [] { HandOffTimerTick(); };
     g_surface.onDragHover = [](POINT pt) {
         UpdateAllDropHints(pt);
         // 压到别的程序窗口上 → 交棒给系统级拖放（必须放在这一帧的最后）
@@ -2966,6 +3145,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         for (auto& f : g_fences)
             if (f) f->PollBackdropChange();
         UpdateBackdropDemand();
+        // 拖拽中把光标停在别人窗口上「准备上传」时，鼠标是不动的 → 收不到
+        // WM_MOUSEMOVE，交棒那段「停够时间」的判定永远等不到下一脚。心跳补一次。
+        {
+            POINT cur{};
+            if (GetCursorPos(&cur)) MaybeHandOffToShell(cur);
+        }
         // 空闲时回收工作集（任务管理器「内存」列会明显降下来）
         bool busy = false;
         for (auto& f : g_fences)

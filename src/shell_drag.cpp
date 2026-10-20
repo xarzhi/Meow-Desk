@@ -199,7 +199,8 @@ private:
 
 }  // namespace
 
-DWORD DragFiles(const std::vector<std::wstring>& paths) {
+DWORD DragFiles(const std::vector<std::wstring>& paths, bool* cancelled) {
+    if (cancelled) *cancelled = false;
     if (paths.empty()) return DROPEFFECT_NONE;
 
     auto* data = new (std::nothrow) FileData(paths);
@@ -220,6 +221,8 @@ DWORD DragFiles(const std::vector<std::wstring>& paths) {
     src->Release();
     data->Release();
 
+    // Esc / 右键取消走的是 DRAGDROP_S_CANCEL，和「松手了但没人要」不是一回事
+    if (cancelled) *cancelled = (hr == DRAGDROP_S_CANCEL);
     return SUCCEEDED(hr) ? eff : DROPEFFECT_NONE;
 }
 
