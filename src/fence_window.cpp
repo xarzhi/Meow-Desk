@@ -467,17 +467,22 @@ struct TodoPaintArgs {
     int rowH = 34;
     int clipTop = 0;      // 内容区上下界：整行在里面才画（和图标一样不做半行）
     int clipBottom = 0;
-    int count = 0;        // 真实条目数（不含末尾那行「新建」）
-    int hot = -1;         // 悬停行（可能等于 count）
+    int hot = -1;         // 悬停行
     bool light = true;
     ARGB fg = 0xFF1B1B1F;
     ARGB fgDim = 0xFF6A6F78;
     ARGB accent = 0xFF0067C0;
     const std::vector<TodoItem>* items = nullptr;
+    // 这一帧要画的条目（cfg_->todos 的下标）。头部切了「未完成 / 已完成」之后
+    // 不是所有条目都在当前 tab 里，所以不能直接遍历 items。
+    const std::vector<int>* idx = nullptr;
+    bool showAdd = true;   // 末尾要不要画「＋ 新建待办」（已完成 tab 不画）
+    // 一条都没有时的提示（空 = 不画）。已完成 tab 用它说「还没有已完成的待办」
+    const wchar_t* emptyHint = nullptr;
 };
 
 void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
-    if (!a.items) return;
+    if (!a.items || !a.idx) return;
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
     g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);   // 和头部标签同一档
@@ -496,13 +501,28 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
     const int textX = boxX + boxSize + 10;
     const int textW = std::max(16, a.rowRight - 8 - textX);
 
-    const int total = a.count + 1;   // + 末尾的「新建」行
+    const int n = (int)a.idx->size();
+    const int total = n + (a.showAdd ? 1 : 0);
+
+    // 空 tab：居中一句话（已完成 tab 一条都没有的时候）
+    if (total == 0 && a.emptyHint) {
+        SolidBrush eb{Color(a.fgDim)};
+        StringFormat cf;
+        cf.SetAlignment(StringAlignmentCenter);
+        cf.SetLineAlignment(StringAlignmentCenter);
+        g.DrawString(a.emptyHint, -1, &fText,
+                     RectF((float)a.rowLeft, (float)a.top,
+                           (float)(a.rowRight - a.rowLeft), (float)(a.clipBottom - a.top)),
+                     &cf, &eb);
+        return;
+    }
+
     for (int i = 0; i < total; ++i) {
         const int y = a.top + i * a.rowH;
         // 整行落在内容区里才画：滚到边上时不出现「半行」
         if (y < a.clipTop || y + a.rowH > a.clipBottom) continue;
 
-        const bool addRow = (i == a.count);
+        const bool addRow = a.showAdd && (i == n);
         const bool hot = (a.hot == i);
         const int cy = y + a.rowH / 2;
 
@@ -529,7 +549,7 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
             continue;
         }
 
-        const TodoItem& it = (*a.items)[i];
+        const TodoItem& it = (*a.items)[(*a.idx)[i]];
         const bool done = it.done != 0;
         RectF box((float)boxX, (float)(cy - boxSize / 2), (float)boxSize, (float)boxSize);
         GraphicsPath bp;
@@ -586,10 +606,43 @@ void FenceWindow::Collect(std::vector<DesktopIconView*>& out) const {
 // 待办盒
 // ---------------------------------------------------------------------------
 
-// 条目数 + 末尾那一行「+ 新建待办」
+// 当前 tab 下要显示的条目在 cfg_->todos 里的下标。
+// 头部那两个 tab 就是一张过滤表：未完成只列 done==0 的，已完成只列 done!=0 的。
+// 存的是下标而不是拷贝 —— 勾选 / 改名 / 删除都要写回原数组。
+std::vector<int> FenceWindow::VisibleTodoIdx() const {
+    std::vector<int> out;
+    if (!isTodo()) return out;
+    const bool wantDone = (todoFilter_ == 1);
+    out.reserve(cfg_->todos.size());
+    for (size_t i = 0; i < cfg_->todos.size(); ++i) {
+        const bool done = cfg_->todos[i].done != 0;
+        if (done == wantDone) out.push_back((int)i);
+    }
+    return out;
+}
+
+int FenceWindow::VisibleTodoCount() const {
+    if (!isTodo()) return 0;
+    const bool wantDone = (todoFilter_ == 1);
+    int n = 0;
+    for (const auto& t : cfg_->todos)
+        if ((t.done != 0) == wantDone) ++n;
+    return n;
+}
+
+int FenceWindow::TodoIndexOfRow(int row) const {
+    if (!isTodo() || row < 0) return -1;
+    const std::vector<int> idx = VisibleTodoIdx();
+    if (row >= (int)idx.size()) return -1;
+    return idx[row];
+}
+
+bool FenceWindow::TodoRowIsItem(int row) const { return TodoIndexOfRow(row) >= 0; }
+
+// 行数 = 可见条目数 + 末尾那一行「＋ 新建待办」（已完成 tab 没有这一行）
 int FenceWindow::TodoCount() const {
     if (!isTodo()) return 0;
-    return (int)cfg_->todos.size() + 1;
+    return VisibleTodoCount() + (todoFilter_ == 0 ? 1 : 0);
 }
 
 RECT FenceWindow::TodoRowRect(int row) const {
@@ -612,34 +665,68 @@ int FenceWindow::HitTodoRow(POINT clientPt) const {
 
 void FenceWindow::ClickTodoRow(int row) {
     if (!isTodo() || row < 0 || row >= TodoCount()) return;
-    if (row == (int)cfg_->todos.size()) {
+    if (row == VisibleTodoCount()) {
         EditTodoAt(row);   // 末尾那行 = 新增
         return;
     }
     ToggleTodoAt(row);
 }
 
+// 勾上 / 取消勾。勾完这一条就不属于当前 tab 了（未完成 → 已完成，反之亦然），
+// 所以它会在下一帧直接消失 —— 这就是「勾掉就归档」的语义，不是 bug。
 void FenceWindow::ToggleTodoAt(int row) {
-    if (!isTodo() || row < 0 || row >= (int)cfg_->todos.size()) return;
-    cfg_->todos[row].done = cfg_->todos[row].done ? 0 : 1;
+    const int i = TodoIndexOfRow(row);
+    if (i < 0) return;
+    cfg_->todos[i].done = cfg_->todos[i].done ? 0 : 1;
     if (onStateChanged) onStateChanged();
+    ClampScroll();
+    if (hot_ == row) hot_ = -1;   // 这行已经换位置了，悬停态作废
     Redraw();
 }
 
 void FenceWindow::DeleteTodoAt(int row) {
-    if (!isTodo() || row < 0 || row >= (int)cfg_->todos.size()) return;
-    cfg_->todos.erase(cfg_->todos.begin() + row);
+    const int i = TodoIndexOfRow(row);
+    if (i < 0) return;
+    cfg_->todos.erase(cfg_->todos.begin() + i);
     if (onStateChanged) onStateChanged();
     ClampScroll();
+    if (hot_ >= TodoCount()) hot_ = -1;
+    Redraw();
+}
+
+void FenceWindow::AddTodo() {
+    if (!isTodo()) return;
+    // 新增的一定是「没做的」：在已完成 tab 里按新建，先切回未完成再开输入框，
+    // 否则输入框会出现在一个不属于当前 tab 的行位置。
+    if (todoFilter_ != 0) SetTodoFilter(0);
+    EditTodoAt(VisibleTodoCount());
+}
+
+void FenceWindow::SetTodoFilter(int f) {
+    if (!isTodo() || f < 0 || f > 1 || f == todoFilter_) return;
+    const RECT pillBefore = TabPillRect();
+    todoFilter_ = f;
+    scrollY_ = 0;   // 换了一批条目，从头开始
+    hot_ = -1;
+    pressTodoRow_ = -1;
+    marquee_ = false;
+    KickTabPill(pillBefore);
     Redraw();
 }
 
 // 就地改文字：输入框贴在那一行的文字区上（和图标改名同一个 RenameBox）。
-// row == todos.size() = 新加一条 —— 提交空字符串就当没加过，不留一条空待办。
+// row == VisibleTodoCount() = 当前 tab 末尾那行「新建」—— 提交空字符串就当没加过。
 void FenceWindow::EditTodoAt(int row) {
     if (!isTodo() || !hwnd_ || collapsed_) return;
-    const bool adding = (row == (int)cfg_->todos.size());
-    if (!adding && (row < 0 || row >= (int)cfg_->todos.size())) return;
+    const bool adding = (row == VisibleTodoCount());
+    // row 是「行号」，写回数组要换成 cfg_->todos 的下标
+    const int ci = adding ? -1 : TodoIndexOfRow(row);
+    if (!adding && ci < 0) return;
+    // 新增一条必然落在「未完成」里：万一在已完成 tab 被叫进来，先切回去
+    if (adding && todoFilter_ != 0) {
+        todoFilter_ = 0;
+        scrollY_ = 0;
+    }
 
     // 新加的那一行可能还在可视区外面：先把它滚进来，否则输入框会贴着卡片外面
     {
@@ -672,21 +759,27 @@ void FenceWindow::EditTodoAt(int row) {
 
     SetInteractionHold(true);
     RenameBox::ShowInPlace(
-        scr, adding ? std::wstring() : cfg_->todos[row].text,
-        [this, row, adding](const std::wstring& s) {
+        scr, adding ? std::wstring() : cfg_->todos[ci].text,
+        [this, ci, adding](const std::wstring& s) {
             if (!cfg_ || !isTodo()) return;
             // 去掉首尾空白：输入框里只有空格时按「没写」处理
             size_t a = s.find_first_not_of(L" \t\r\n");
             size_t b = s.find_last_not_of(L" \t\r\n");
             const std::wstring t = (a == std::wstring::npos) ? std::wstring() : s.substr(a, b - a + 1);
             if (t.empty()) {
-                if (!adding) DeleteTodoAt(row);
+                // 改成一个空名字 = 删掉这条（新加的那条本来就还没有，直接不管）
+                if (!adding && ci >= 0 && ci < (int)cfg_->todos.size()) {
+                    cfg_->todos.erase(cfg_->todos.begin() + ci);
+                    if (onStateChanged) onStateChanged();
+                    ClampScroll();
+                    Redraw();
+                }
                 return;
             }
             if (adding) {
                 cfg_->todos.push_back(TodoItem{t, 0});
-            } else if (row < (int)cfg_->todos.size()) {
-                cfg_->todos[row].text = t;
+            } else if (ci >= 0 && ci < (int)cfg_->todos.size()) {
+                cfg_->todos[ci].text = t;
             }
             if (onStateChanged) onStateChanged();
             Redraw();
@@ -846,7 +939,8 @@ FenceWindow::Edge FenceWindow::HitEdge(POINT pt) const {
 FenceWindow::Edge FenceWindow::HitEdgeForPress(POINT pt) const {
     const Edge e = HitEdge(pt);
     // 只有「正上方那条边」（Edge::T）会压在手把上；TL / TR 落在左右角落，保留。
-    if (e == Edge::T && !showTitle_ && !collapsed_) return Edge::None;
+    // 待办盒有完整头部（HeadH 不看 showTitle_），上边照旧能拉。
+    if (e == Edge::T && !showTitle_ && !isTodo() && !collapsed_) return Edge::None;
     return e;
 }
 
@@ -880,7 +974,9 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     // 锁按钮优先级最高：它压在头部右侧，点在它上面不能算「拖头部」。
     // 收起状态（4px 把手）里头部内容一个都不画，所以锁 / 标签 / 箭头都不参与命中，
     // 整条把手就是「拖盒子」的抓手动。
-    if (showTitle_ && !collapsed_ && pt.y < HeadH()) {
+    // 待办盒例外：关掉「显示标题」它也有完整头部（上面是未完成/已完成两个 tab），
+    // 所以这里对 todo 不看 showTitle_。
+    if ((showTitle_ || isTodo()) && !collapsed_ && pt.y < HeadH()) {
         const RECT lr = LockRect();
         if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom) {
             pressLock_ = true;
@@ -909,7 +1005,7 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
         return;
     }
 
-    if (pt.y < HeadH() && showTitle_ && !collapsed_ && pt.x > width_ - 40) {
+    if (pt.y < HeadH() && (showTitle_ || isTodo()) && !collapsed_ && pt.x > width_ - 40) {
         pressArrow_ = true;
     } else if (pt.y < HeadH()) {
         // 锁定后头部不再能拖动（不然「锁住位置」就成了空话）
@@ -1368,7 +1464,7 @@ void FenceWindow::SetActiveGroup(int g) {
 // 终点是当前 activeGroup 对应的标签矩形。
 void FenceWindow::KickTabPill(const RECT& from) {
     const std::vector<RECT> tabs = TabRects();
-    const int act = activeGroup();
+    const int act = HeadTabActive();   // 待办盒 = 当前 tab，收纳盒 = 当前分组
     if (act < 0 || act >= (int)tabs.size()) {
         tabPillAnim_ = false;
         return;
@@ -1391,7 +1487,7 @@ void FenceWindow::KickTabPill(const RECT& from) {
 // 滑块当前应该画在哪：动画中按 easeInOutCubic 在 from/to 之间取值
 RECT FenceWindow::TabPillRect() const {
     const std::vector<RECT> tabs = TabRects();
-    const int act = activeGroup();
+    const int act = HeadTabActive();
     RECT target{};
     if (act >= 0 && act < (int)tabs.size()) target = tabs[act];
     if (!tabPillAnim_ || tabPillDur_ <= 0) return target;
@@ -1466,8 +1562,52 @@ void FenceWindow::SetGroupName(int i, const std::wstring& n) {
     if (onStateChanged) onStateChanged();
 }
 
+// 头部标签显示什么字：收纳盒是分组名，待办盒固定两个（未完成 / 已完成）。
+std::wstring FenceWindow::HeadTabName(int i) const {
+    if (isTodo())
+        return i == 0 ? L"\u672a\u5b8c\u6210"     // 未完成
+                      : L"\u5df2\u5b8c\u6210";    // 已完成
+    return GroupName(i);
+}
+
+int FenceWindow::HeadTabActive() const { return isTodo() ? todoFilter_ : activeGroup(); }
+
+// 待办盒的两个 tab：**居中**摆在头部，不像分组标签那样从左边排。
+// 右边仍然要给锁按钮和箭头让位 —— 压到了就先整体左移，实在放不下再压窄
+// （待办盒最窄能到 180，那时候两个字只能截断显示）。
+std::vector<RECT> FenceWindow::TodoTabRects() const {
+    std::vector<RECT> out;
+    // 不看 showTitle_：这两个 tab 是导航，不是标题（见 HeadH() 的说明）
+    const int hh = HeadH();
+    if (hh < 16) return out;
+
+    const int fontPx = (headerH_ >= 40) ? 14 : 13;
+    const int th = std::min(hh - 8, 30);
+    const int top = (hh - th) / 2;
+
+    int w[2] = {TabWidthFor(HeadTabName(0), fontPx), TabWidthFor(HeadTabName(1), fontPx)};
+    const int leftLim = kTabLeft;
+    const int rightLim = width_ - kTabRightReserve;
+    const int avail = std::max(kTabMinW * 2 + kTabGap, rightLim - leftLim);
+    if (w[0] + w[1] + kTabGap > avail) {
+        const int each = std::max(kTabMinW, (avail - kTabGap) / 2);
+        w[0] = w[1] = each;
+    }
+
+    const int total = w[0] + w[1] + kTabGap;
+    int x = (width_ - total) / 2;          // 以整条头部居中
+    if (x + total > rightLim) x = rightLim - total;
+    if (x < leftLim) x = leftLim;
+
+    out.push_back(RECT{x, top, x + w[0], top + th});
+    x += w[0] + kTabGap;
+    out.push_back(RECT{x, top, x + w[1], top + th});
+    return out;
+}
+
 // 标签的排版：从左边 12px 开始一个个排，放不下就截断（锁按钮和箭头占右边）。
 std::vector<RECT> FenceWindow::TabRects() const {
+    if (isTodo()) return TodoTabRects();
     std::vector<RECT> out;
     const int n = groupCount();
     if (n <= 0 || !showTitle_) return out;
@@ -1493,7 +1633,12 @@ std::vector<RECT> FenceWindow::TabRects() const {
 }
 
 int FenceWindow::HitTab(POINT clientPt) const {
-    if (!showTitle_ || !hasTabs()) return -1;
+    // 待办盒永远有两个 tab（不受「显示标题」开关影响）；收纳盒要有分组才有
+    if (isTodo()) {
+        // 继续往下走，用 TabRects()（todo 时返回的就是 TodoTabRects()）
+    } else if (!showTitle_ || !hasTabs()) {
+        return -1;
+    }
     const auto rects = TabRects();
     for (size_t i = 0; i < rects.size(); ++i) {
         const RECT& r = rects[i];
@@ -1509,7 +1654,8 @@ int FenceWindow::HitTab(POINT clientPt) const {
 // ---------------------------------------------------------------------------
 RECT FenceWindow::RenameRectScreen(int gi) const {
     RECT none{0, 0, 0, 0};
-    if (!hwnd_ || !showTitle_) return none;
+    // 待办盒即便关了「显示标题」也还有头部（未完成/已完成），改名弹窗照样有地方贴
+    if (!hwnd_ || (!showTitle_ && !isTodo())) return none;
     const int hh = HeadH();
     if (hh < 16) return none;
 
@@ -2075,6 +2221,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (isTodo()) {
             const int row = pressTodoRow_;
             pressTodoRow_ = -1;
+            pressTab_ = -1;    // 双击 tab 不是「改 tab 名字」，别留给后面那条分支
             pressBody_ = false;
             if (row >= 0) EditTodoAt(row);
             return 0;
@@ -2119,7 +2266,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             ScreenToClient(h, &pt);
             // 锁按钮上给手型（它和头部拖动长得很近，得有个区分）。
             // 收起态的 4px 把手上什么都没有，直接跳过这一套。
-            if (showTitle_ && !collapsed_ && pt.y < HeadH()) {
+            if ((showTitle_ || isTodo()) && !collapsed_ && pt.y < HeadH()) {
                 const RECT lr = LockRect();
                 if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
@@ -2313,7 +2460,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // 分组标签：设置成「鼠标移入就切」时，光标一落到别的标签上就立刻切
         // （以前有 200ms 延迟定时器，用户实测觉得"卡了一下"，去掉了）。
         // 设置成「点击才切」时这里什么都不做，交给 WM_LBUTTONUP 里的 tabPress 分支。
-        if (g_config.switchTabOnHover && showTitle_ && !collapsed_ && pt.y < HeadH()) {
+        // 待办盒不参与：它的两个 tab 是过滤条件，鼠标只是路过就换列表太跳了。
+        if (!isTodo() && g_config.switchTabOnHover && showTitle_ && !collapsed_ &&
+            pt.y < HeadH()) {
             const int t = HitTab(pt);
             if (t >= 0 && t != activeGroup()) SetActiveGroup(t);
         }
@@ -2507,10 +2656,17 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        // 点标签：没拖动过才切分组（拖着走 = 用户只是想挪盒子）
-        if (tabPress >= 0 && !wasDragging && tabPress != activeGroup()) {
-            SetActiveGroup(tabPress);
-            return 0;
+        // 点标签：没拖动过才切（拖着走 = 用户只是想挪盒子）
+        // 待办盒的两个 tab 是「未完成 / 已完成」，走的是过滤而不是分组。
+        if (tabPress >= 0 && !wasDragging) {
+            if (isTodo()) {
+                if (tabPress != todoFilter_) SetTodoFilter(tabPress);
+                return 0;
+            }
+            if (tabPress != activeGroup()) {
+                SetActiveGroup(tabPress);
+                return 0;
+            }
         }
         // 待办盒：内容区点一下 = 勾掉/恢复，点末尾那行 = 新加一条。
         // 必须放在图标分支前面 —— todo 盒的 pressItem_ 恒为 -1，会一路漏到
@@ -3056,12 +3212,17 @@ void FenceWindow::Paint() {
         // 卡片底色/描边画到底 —— 收起态就是一条干净的圆角把手，
         // 而不是「内容区没了、头部还杵在那儿」。
         const float headH = (float)HeadH();
+        // 待办盒不看 showTitle_：它的头部是「未完成 / 已完成」，不是标题。
+        // （HeadH() 也按同一条规则给高度，两处必须一致，否则头部会画到卡片外面。）
         const float headFade =
-            showTitle_ ? std::clamp((float)(curH_ - kCollapsedHeadH) /
-                                        (float)std::max(1, headerH_ - kCollapsedHeadH),
-                                    0.0f, 1.0f)
-                       : 0.0f;
-        const bool drawHead = showTitle_ && headFade > 0.02f;
+            (showTitle_ || isTodo())
+                ? std::clamp((float)(curH_ - kCollapsedHeadH) /
+                                 (float)std::max(1, headerH_ - kCollapsedHeadH),
+                             0.0f, 1.0f)
+                : 0.0f;
+        // 待办盒即使关了「显示盒子标题」也要画头部 —— 那上面是「未完成 / 已完成」
+        // 两个 tab，是它唯一的切换入口。
+        const bool drawHead = (showTitle_ || isTodo()) && headFade > 0.02f;
         const BYTE fadeA = (BYTE)std::lround(255.0f * headFade);
         if (drawHead) {
             GraphicsPath head;
@@ -3106,11 +3267,12 @@ void FenceWindow::Paint() {
         const ARGB fg = light ? 0xFF1B1B1F : 0xFFF2F2F5;
 
         // ---- 头部：分组标签 / 单一标题 ----
-        // 有分组时整个头部变成一排标签（当前分组高亮）。标签是导航控件，
-        // 不受「显示图标标题」开关影响 —— 关掉它标签就没了，等于切不了分组。
-        if (drawHead && hasTabs()) {
+        // 收纳盒有分组时整个头部变成一排标签（当前分组高亮）；待办盒头部固定是
+        // 「未完成 / 已完成」两个居中的 tab。标签是导航控件，不受「显示图标标题」
+        // 开关影响 —— 关掉它标签就没了，等于切不了。
+        if (drawHead && (isTodo() || hasTabs())) {
             const std::vector<RECT> tabs = TabRects();
-            const int act = activeGroup();
+            const int act = HeadTabActive();
             FontFamily family(L"Microsoft YaHei UI");
             // 13px → 14px：特意渲染过对照图（13/14/15/16 各画一行），
             // 灰度抗锯齿下 13px 的汉字笔画太细，糊在模糊壁纸上就是「看不清」；
@@ -3168,7 +3330,7 @@ void FenceWindow::Paint() {
                 const RectF rr((float)tr.left, (float)tr.top, (float)(tr.right - tr.left),
                                (float)(tr.bottom - tr.top));
                 SolidBrush txt{Color(WithAlpha(on ? fg : idleFg, fadeA8))};
-                const std::wstring name = GroupName((int)i);
+                const std::wstring name = HeadTabName((int)i);
                 const RectF box(rr.X + 2.0f, rr.Y, std::max(4.0f, rr.Width - 4.0f), rr.Height);
                 gfx.DrawString(name.c_str(), -1, on ? &tabFontBold : &tabFont, box, &tf, &txt);
             }
@@ -3254,7 +3416,10 @@ void FenceWindow::Paint() {
         // ---- 悬停高亮（拖动中不画：被拖的那个已变成"空位"，再套一层高亮很乱）----
         // 直角填充：盒内图标的底色和桌面图标保持一致，不做圆角
         // （逐像素 alpha 的圆角在这个尺寸下没有抗锯齿，边缘会明显发毛）。
-        if (!collapsed_ && hot_ >= 0 && !itemDragging_) {
+        // 待办盒不画这一层：它的 hot_ 是**行号**，套进 ItemHighlightRect 会算出
+        // 一个图标格的矩形 —— 待办盒里凭空多出一块格子高亮（行高亮在
+        // PaintTodoBody 里自己画，形状是整行的圆角条）。
+        if (!collapsed_ && hot_ >= 0 && !itemDragging_ && !isTodo()) {
             RECT ir = ItemHighlightRect(hot_);
             if (ir.right > ir.left) {
                 SolidBrush hl{light ? Color(26, 0, 0, 0) : Color(52, 255, 255, 255)};
@@ -3357,6 +3522,7 @@ void FenceWindow::Paint() {
     // Flush 过了，这里只接管内容区，然后直接收尾 —— 下面整段图标排版、
     // flip 动画、缝隙线对 todo 盒都没有意义。
     if (isTodo()) {
+        const std::vector<int> vis = VisibleTodoIdx();
         if (!collapsed_) {
             Bitmap tbuf(bufW_, bufH_, bufW_ * 4, PixelFormat32bppPARGB,
                         reinterpret_cast<BYTE*>(bits_));
@@ -3368,15 +3534,54 @@ void FenceWindow::Paint() {
             a.rowH = TodoRowH();
             a.clipTop = HeadH();
             a.clipBottom = curH_ - kPad;
-            a.count = (int)cfg_->todos.size();
             a.hot = hot_;
-            a.light = light;
-            // 和头部标签同一套深浅：浅色底用近黑的字，深色底用近白的字，
-            // 完成态统一走 fgDim（浅色深灰 / 深色浅灰）。
-            a.fg = light ? 0xFF1F2126 : 0xFFE8EAF0;
-            a.fgDim = light ? 0xFF6A6F78 : 0xFFA8AEB8;
-            a.accent = light ? 0xFF0067C0 : 0xFF60CDFF;
             a.items = &cfg_->todos;
+            a.idx = &vis;
+            a.showAdd = (todoFilter_ == 0);
+            a.emptyHint = (todoFilter_ == 1) ? L"\u8fd8\u6ca1\u6709\u5df2\u5b8c\u6210\u7684\u5f85\u529e"
+                                             : nullptr;   // 还没有已完成的待办
+
+            // ---- 文字色跟着「实际看到的底色」走，而不是 cfg_->color ----
+            // 卡片是半透明的时候，base 黑 + 亮壁纸 = 实际是个中灰，按 base 判
+            // 「深色 → 白字」会在灰底上糊成一片；反过来浅 base + 暗壁纸同理。
+            // 所以拿底下那张磨砂图在内容区采几个点，按 alpha 把 base 叠上去，
+            // 得到「用户眼睛真正看到的颜色」再判深浅。没底图就退回 base。
+            COLORREF cardBg = base;
+            if (hasBackdrop && alpha < 255) {
+                const int bw = BdPixW(), bh = BdPixH();
+                const int x0 = kPad, x1 = width_ - kPad;
+                const int y0 = HeadH() + kPad, y1 = std::max(y0 + 1, curH_ - kPad);
+                int sr = 0, sg = 0, sb = 0, cnt = 0;
+                for (int gy = 0; gy < 3; ++gy) {
+                    for (int gx = 0; gx < 3; ++gx) {
+                        // 3x3 网格的中心点（1/6, 1/2, 5/6），避开边缘的圆角和描边
+                        const int cx = x0 + (x1 - x0) * (gx * 2 + 1) / 6;
+                        const int cy = y0 + (y1 - y0) * (gy * 2 + 1) / 6;
+                        const int px = (bsx + cx) / backdropScale_;
+                        const int py = (bsy + cy) / backdropScale_;
+                        if (px < 0 || py < 0 || px >= bw || py >= bh) continue;
+                        const size_t o = ((size_t)py * (size_t)bw + (size_t)px) * 4;
+                        sb += backdrop_[o + 0];   // BGRA
+                        sg += backdrop_[o + 1];
+                        sr += backdrop_[o + 2];
+                        ++cnt;
+                    }
+                }
+                if (cnt > 0) {
+                    const int ur = sr / cnt, ug = sg / cnt, ub = sb / cnt;
+                    const int ia = 255 - alpha;
+                    cardBg = RGB((GetRValue(base) * alpha + ur * ia) / 255,
+                                 (GetGValue(base) * alpha + ug * ia) / 255,
+                                 (GetBValue(base) * alpha + ub * ia) / 255);
+                }
+            }
+            const bool darkBg = !IsLight(cardBg);
+            a.light = !darkBg;
+            // 深色底 → 近白字（用户要的「黑色背景用白色字体」）；完成态降一档灰。
+            a.fg = darkBg ? 0xFFE8EAF0 : 0xFF1F2126;
+            a.fgDim = darkBg ? 0xFFA8AEB8 : 0xFF6A6F78;
+            a.accent = darkBg ? 0xFF60CDFF : 0xFF0067C0;
+
             PaintTodoBody(tg, a);
             tg.Flush(FlushIntentionSync);
         }

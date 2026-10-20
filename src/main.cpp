@@ -1909,14 +1909,13 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
     std::vector<PopupMenuItem> items;
 
     // ---- 待办盒：右键的是「某一条待办」还是空白，先摆这一组 ----
-    // item 在这里当行号用（-1 = 点在内容区空白 / 头部）
+    // item 在这里当行号用（-1 = 点在内容区空白 / 头部）。
+    // 「有没有这一条」问盒子自己要（TodoRowIsItem）—— 头部切了「未完成 / 已完成」
+    // 之后可见行号和 todos 下标不再是同一套，外面拿 todos.size() 去比会错。
     const bool todo = f->isTodo();
-    const int todoN = todo && fi < (int)g_config.fences.size()
-                          ? (int)g_config.fences[fi].todos.size()
-                          : 0;
     if (todo) {
         items.push_back(PopupMenuItem(L"\u65b0\u5efa\u5f85\u529e", kCmdTodoAdd));   // 新建待办
-        if (item >= 0 && item < todoN) {
+        if (f->TodoRowIsItem(item)) {
             items.push_back(PopupMenuItem(L"\u7f16\u8f91\u5f85\u529e", kCmdTodoEdit));    // 编辑
             items.push_back(PopupMenuItem(L"\u5220\u9664\u5f85\u529e", kCmdTodoDelete));  // 删除
         }
@@ -2017,11 +2016,7 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
         if (id == kCmdNewFence) { NewFenceNear(fi, 0); return; }
         if (id == kCmdNewFenceTodo) { NewFenceNear(fi, 1); return; }
         // 待办盒：item 就是行号（-1 = 点在空白 / 头部）
-        if (id == kCmdTodoAdd) {
-            if (fi < (int)g_config.fences.size())
-                w->EditTodoAt((int)g_config.fences[fi].todos.size());
-            return;
-        }
+        if (id == kCmdTodoAdd) { w->AddTodo(); return; }
         if (id == kCmdTodoEdit) { w->EditTodoAt(item); return; }
         if (id == kCmdTodoDelete) { w->DeleteTodoAt(item); return; }
         if (id == kCmdNewFolder) { NewDesktopFolder(); return; }

@@ -283,7 +283,7 @@ public:
     // 行高固定 34px（比图标格矮得多：一条待办就是「一个方块 + 一行字」）。
     static constexpr int kTodoRowH = 34;
     int TodoRowH() const { return kTodoRowH; }
-    // 条目数 + 末尾那行「+ 新建待办」
+    // 当前这个 tab 下能看到几行（可见条目数 + 末尾那行「+ 新建待办」）
     int TodoCount() const;
     // 第 row 行的客户区矩形（含末尾的「新建」行）
     RECT TodoRowRect(int row) const;
@@ -292,6 +292,15 @@ public:
     void DeleteTodoAt(int row);
     // 内容区点了一下（LBUTTONUP）：末尾那行 = 新增，其余 = 打勾
     void ClickTodoRow(int row);
+    // row 是一条真实条目吗（false = 末尾「新建」行 / 越界）。
+    // 右键菜单用它决定要不要摆「编辑 / 删除」—— 行号和 cfg_->todos 下标的
+    // 换算只在盒子内部做，外面不要再自己拿 todos.size() 去比。
+    bool TodoRowIsItem(int row) const;
+    // 在当前 tab 里新加一条（会自动切回「未完成」—— 新增的必然是没做的）
+    void AddTodo();
+    // 头部那两个 tab：0 = 未完成，1 = 已完成
+    int todoFilter() const { return todoFilter_; }
+    void SetTodoFilter(int f);
 
 private:
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
@@ -325,6 +334,20 @@ private:
 
     // 屏幕/客户区落点上是第几行；-1 = 没落在任何一行上（内部用）
     int HitTodoRow(POINT clientPt) const;
+
+    // 当前 tab 下的条目在 cfg_->todos 里的下标（按存储顺序）。
+    // 所有「第几行」的接口都先过这一层，外面看到的永远是行号，
+    // 隐藏掉的（另一个 tab 里的）条目不会把行号算错。
+    std::vector<int> VisibleTodoIdx() const;
+    int VisibleTodoCount() const;
+    // 行号 → cfg_->todos 下标；末尾的「新建」行和越界返回 -1
+    int TodoIndexOfRow(int row) const;
+
+    // 头部那排标签：收纳盒 = 分组名，待办盒 = 未完成 / 已完成
+    std::wstring HeadTabName(int i) const;
+    int HeadTabActive() const;
+    // 待办盒的两个 tab（居中）；收纳盒走 TabRects()
+    std::vector<RECT> TodoTabRects() const;
 
     // ---- 内容纵向滚动（图标多到超出盒子高度时）----
     // 只做「整行滚动」：滚半行会让上下两排都只显示一半，那需要裁剪；
@@ -439,7 +462,9 @@ private:
     // 收起之后头部收缩到的高度：整块盒子变成一条 4px 的圆角「把手」，
     // 头部的标签 / 标题 / 锁 / 箭头全部不画（见 Paint 里的 headFade）。
     static constexpr int kCollapsedHeadH = 4;
-    int HeadH() const { return showTitle_ ? headerH_ : kHeadStripH; }
+    // 头部高度。待办盒例外：它的「未完成 / 已完成」就在头部，关掉标题也不能
+    // 把切换入口一起收走，所以 todo 永远保留完整头部。
+    int HeadH() const { return (showTitle_ || isTodo()) ? headerH_ : kHeadStripH; }
 
     int minW() const;
     int minH() const;
@@ -561,6 +586,8 @@ private:
     int pressItem_ = -1;
     // 待办盒：按下时命中的行（TodoCount()-1 是末尾那行「新建」）
     int pressTodoRow_ = -1;
+    // 待办盒当前 tab：0 = 未完成，1 = 已完成（不落盘，重开回到「未完成」）
+    int todoFilter_ = 0;
     bool pressArrow_ = false;
     bool pressLock_ = false;
     // 点击标签：松手时（没拖动过）才切
