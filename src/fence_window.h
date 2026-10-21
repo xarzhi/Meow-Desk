@@ -389,6 +389,10 @@ private:
     // 画标签和「聚焦时选中高亮跟着变高」都从这里取 —— 两处口径必须一致，
     // 各写一套的话高亮迟早会跟文字错开一截。
     void ItemLabelMetrics(int index, int iconH, int& labW, int& labH, int& topRel) const;
+    // 悬停 / 选中**共用**的高亮框（客户区像素，内缩 2px）：
+    // 底部按这个图标「完整标签」的高度撑开，所以同一个图标悬停和选中时框完全重合，
+    // 点选那一下不会「框突然变高」。以前悬停固定 cellH()、选中才往下长，两者对不上。
+    RECT ItemHighlightBox(int index);
     // 第 index 个格子的客户区原点（图标左上角）；放不下返回 false
     bool ItemOrigin(int index, int& x, int& y) const;
 

@@ -212,7 +212,9 @@ private:
     // 这个图标**实际画到**的范围（客户区像素），用来做脏矩形。
     // 平时就是自己那一格；单击选中时标签不限行、会往下多长几行，范围要跟着长 ——
     // 只用格子算的话，局部重画会把它擦掉一截或用旧像素盖回去。
-    RECT IconExtent(const DesktopIconView* e) const;
+    // forceFull = true 时不管有没有选中，都按「完整标签」算（悬停框也长到那么高，
+    // 见 DrawOneLayered 里悬停那段 —— 两个状态的高度必须一致）。
+    RECT IconExtent(const DesktopIconView* e, bool forceFull = false) const;
     // 每次绘制前算一次：**唯一**被选中的那个图标才展开标签（名字全显示）。
     // 框选一片的时候全部展开，桌面会被文字糊满 —— 「聚焦」本来就是单数的。
     void ResolveLabelExpand();

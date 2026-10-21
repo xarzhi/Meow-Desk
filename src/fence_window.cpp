@@ -894,6 +894,41 @@ void FenceWindow::ItemLabelMetrics(int index, int iconH, int& labW, int& labH,
     ItemLabelBox(index, left, labW);
 }
 
+// 悬停 / 选中共用的一份高亮几何。
+//
+// 内缩 2px 和以前一样；底部不再固定成 cellH()-2，而是撑到这个图标**完整标签**
+// 的高度（LabelOf(...,0) 和聚焦时那条路径同一个缓存 key）。这样「悬停这个图标」
+// 和「选中这个图标」画出来的是**同一个矩形** —— 点选那一下框不会突然变高。
+// 以前悬停按格子算、选中才往下长，两个状态的高度对不上（用户原话：
+// 「鼠标 hover 时的背景应该和 active 项的高亮背景高度一致」）。
+RECT FenceWindow::ItemHighlightBox(int index) {
+    RECT r = ItemHighlightRect(index);
+    if (r.right <= r.left) return r;   // 滚出视野 / 没有这个格子
+
+    int bottom = r.top + cellH() - 2;
+    // 只在「名字画在图标下面」的模式下撑高：列表 / 详情模式标签是单行、行高固定，
+    // 关掉标题时也没有标签可撑。
+    if (!IsListView() && showLabels_ && index >= 0) {
+        std::vector<DesktopIconView*> vis;
+        CollectVisible(vis);
+        if (index < (int)vis.size() && vis[index]) {
+            DesktopIconView* e = vis[index];
+            if (!e->name.empty() && !e->renaming) {
+                const IconBitmap& bm = e->bmp;
+                int lw = 0, lh = 0, topRel = 0;
+                ItemLabelMetrics(index, bm.valid() ? bm.height : 32, lw, lh, topRel);
+                if (LabelDib* lab = LabelOf(e, lw, lh, g_config.textShadow ? 2 : 0, 0)) {
+                    if (lab->valid()) {
+                        const int lb = r.top + topRel - lab->pad + lab->h + 2;
+                        if (lb > bottom) bottom = lb;
+                    }
+                }
+            }
+        }
+    }
+    return RECT{r.left + 2, r.top + 2, r.right - 2, bottom};
+}
+
 int FenceWindow::minW() const {
     // 列表 / 详情是一行一个，右边的列会按宽度逐级隐藏，所以可以收得很窄
     // （留出「图标 + 名称」的最低宽度即可）
@@ -3441,11 +3476,12 @@ void FenceWindow::Paint() {
         // 悬停是 52、选中是 44，选中的那块反而比悬停还淡，看着像两种颜色。
         const Color iconHlFill = light ? Color(26, 0, 0, 0) : Color(52, 255, 255, 255);
         if (!collapsed_ && hot_ >= 0 && !itemDragging_ && !isTodo()) {
-            RECT ir = ItemHighlightRect(hot_);
-            if (ir.right > ir.left) {
+            // 和下面选中那块走同一个 ItemHighlightBox：两态除了描边之外完全重合
+            const RECT hb = ItemHighlightBox(hot_);
+            if (hb.right > hb.left) {
                 SolidBrush hl{iconHlFill};
-                gfx.FillRectangle(&hl, Rect(ir.left + 2, ir.top + 2, ir.right - ir.left - 4,
-                                            cellH() - 4));
+                gfx.FillRectangle(&hl,
+                                  Rect(hb.left, hb.top, hb.right - hb.left, hb.bottom - hb.top));
             }
         }
 
@@ -3470,30 +3506,16 @@ void FenceWindow::Paint() {
                     }
                 if (selN != 1) expandOne = nullptr;
             }
-            const bool gridLabels = !IsListView() && showLabels_;
-            const int glow = g_config.textShadow ? 2 : 0;
             // 底色和上面悬停那块完全一样（iconHlFill），选中只多一圈描边
             SolidBrush fill{iconHlFill};
             Pen pen{light ? Color(70, 0, 0, 0) : Color(80, 255, 255, 255), 1.0f};
             for (size_t i = 0; i < mineSel.size(); ++i) {
                 if (!mineSel[i] || !mineSel[i]->selected) continue;
-                RECT sr = ItemHighlightRect((int)i);
-                if (sr.right <= sr.left) continue;
-                // 内缩和悬停那块保持一致（2px），这样两态除了描边之外完全重合
-                int bottom = sr.top + cellH() - 2;
-                if (gridLabels && mineSel[i] == expandOne) {
-                    const IconBitmap& bm = mineSel[i]->bmp;
-                    int lw = 0, lh = 0, topRel = 0;
-                    ItemLabelMetrics((int)i, bm.valid() ? bm.height : 32, lw, lh, topRel);
-                    if (LabelDib* lab = LabelOf(mineSel[i], lw, lh, glow, 0)) {
-                        if (lab->valid()) {
-                            const int lb = sr.top + topRel - lab->pad + lab->h + 2;
-                            if (lb > bottom) bottom = lb;
-                        }
-                    }
-                }
-                const Rect rc(sr.left + 2, sr.top + 2, sr.right - sr.left - 4,
-                              bottom - sr.top - 2);
+                // 高度由 ItemHighlightBox 统一算（含聚焦时按完整标签撑高），
+                // 悬停和选中必然是同一个矩形
+                const RECT hb = ItemHighlightBox((int)i);
+                if (hb.right <= hb.left) continue;
+                const Rect rc(hb.left, hb.top, hb.right - hb.left, hb.bottom - hb.top);
                 // 浅色卡片上用暗一点的高亮，深色卡片上用亮一点的
                 gfx.FillRectangle(&fill, rc);
                 gfx.DrawRectangle(&pen, rc);

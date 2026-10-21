@@ -681,11 +681,16 @@ void DesktopSurface::ResolveLabelExpand() {
 // 图标实际画到的范围。选中（聚焦）时标签不限行，高度得按「标签实际多高」算 ——
 // 直接问那枚已经缓存的 LabelDib（和 DrawOneLayered 用同一个 key，命中缓存不重建）。
 // 拿不到 DIB（还没画过 / 关掉了标题）就退回格子本身。
-RECT DesktopSurface::IconExtent(const DesktopIconView* e) const {
+//
+// forceFull：不管现在选没选中，都按「完整标签」量一遍。悬停高亮要用它 ——
+// 悬停框和选中框必须一样高，否则鼠标点下去那一瞬框会突然长高。
+RECT DesktopSurface::IconExtent(const DesktopIconView* e, bool forceFull) const {
     RECT r{};
     if (!e) return r;
     r = CellRect(e);
-    if (!IsLabelExpand(e) || !showLabels_ || e->renaming || e->name.empty() || !impl_) return r;
+    if (!(forceFull || IsLabelExpand(e)) || !showLabels_ || e->renaming || e->name.empty() ||
+        !impl_)
+        return r;
 
     const int ih = e->bmp.valid() ? e->bmp.height : iconPx_;
     const int lineH = IconLabelLineHeight();
@@ -1219,7 +1224,13 @@ void DesktopSurface::DrawOneLayered(DesktopIconView* e, bool dragging, bool ghos
     // 直角：和盒子里的悬停底色、资源管理器的选中框保持一致（圆角在这个尺寸下
     // 没有抗锯齿，边缘会明显发毛）。
     if (e->hover && !e->selected && !dragging) {
-        RECT hf{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
+        // 高度必须和选中（active）那块一致 —— 否则鼠标点下去、框会突然长高。
+        // 选中框是长到「完整标签」底部的，悬停也按同一个口径量（IconExtent 的
+        // forceFull），名字长的图标悬停时框就已经是高框了。
+        int hb = y + cellH_ - 2;
+        const RECT ext = IconExtent(e, /*forceFull=*/true);
+        if (ext.bottom - 2 > hb) hb = ext.bottom - 2;
+        RECT hf{x + 2, y + 2, x + cellW_ - 2, hb};
         auto* b = reinterpret_cast<BYTE*>(bits_);
         FillRectAlpha(b, bufW_, bufH_, hf, kHlFill, kHlColor);
         RECT edge[4] = {
@@ -1505,7 +1516,11 @@ void DesktopSurface::DrawOneGdi(HDC hdc, DesktopIconView* e, bool dragging, bool
     // 悬停底：这里用直角 + 描边，和分层路径保持一致
     //（两套渲染路径的观感必须一样，否则换 MEOW_SURFACE 就成了两个程序）
     if (e->hover && !e->selected && !dragging) {
-        RECT hf{x + 2, y + 2, x + cellW_ - 2, y + cellH_ - 2};
+        // 和分层路径同一套：高度取自「完整标签」，和选中框一致
+        int hb = y + cellH_ - 2;
+        const RECT ext = IconExtent(e, /*forceFull=*/true);
+        if (ext.bottom - 2 > hb) hb = ext.bottom - 2;
+        RECT hf{x + 2, y + 2, x + cellW_ - 2, hb};
         FillRectBlend(hdc, hf, kHlFill, kHlColor);
         RECT hedge[4] = {
             {hf.left, hf.top, hf.right, hf.top + 1},
@@ -1868,8 +1883,13 @@ void DesktopSurface::SyncHoverToCursor() {
     // 旧/新格子可能都不在裁剪区内，得补一次失效，否则旧底色会留到下次全屏重画。
     // 补完下一次 WM_PAINT 就会把两格都画对，不会反复触发（同步只在换图标时发生）。
     if (opaque_ && hwnd_) {
-        if (old) InvalidateRect(hwnd_, &CellRect(old), FALSE);
-        if (hit) InvalidateRect(hwnd_, &CellRect(hit), FALSE);
+        // 悬停框可能比格子高（见 UpdateHover 的注释），两个格子都按实际范围失效
+        RECT ro = IconExtent(old, /*forceFull=*/true);
+        InflateRect(&ro, 2, 2);
+        RECT rh = IconExtent(hit, /*forceFull=*/true);
+        InflateRect(&rh, 2, 2);
+        if (old) InvalidateRect(hwnd_, &ro, FALSE);
+        if (hit) InvalidateRect(hwnd_, &rh, FALSE);
     }
 }
 
@@ -1885,8 +1905,10 @@ void DesktopSurface::UpdateHover(POINT screenPt) {
     bool has = false;
     auto add = [&](DesktopIconView* e) {
         if (!e) return;
-        RECT r{e->pos.x - origin_.x - 2, e->pos.y - origin_.y - 2,
-               e->pos.x - origin_.x + cellW_ + 2, e->pos.y - origin_.y + cellH_ + 2};
+        // 悬停框会长到「完整标签」的高度（见 DrawOneLayered），所以这里不能只按
+        // 格子算 —— 否则鼠标移开时，格子下面那截高亮会留在屏幕上。
+        RECT r = IconExtent(e, /*forceFull=*/true);
+        InflateRect(&r, 2, 2);
         if (!has) {
             u = r;
             has = true;
@@ -1911,8 +1933,9 @@ void DesktopSurface::ClearHover() {
     DesktopIconView* old = hover_;
     hover_ = nullptr;
     old->hover = false;
-    RECT r{old->pos.x - origin_.x - 2, old->pos.y - origin_.y - 2,
-           old->pos.x - origin_.x + cellW_ + 2, old->pos.y - origin_.y + cellH_ + 2};
+    // 同 UpdateHover：悬停框可能比格子高，要把标签那几行一起擦掉
+    RECT r = IconExtent(old, /*forceFull=*/true);
+    InflateRect(&r, 2, 2);
     RepaintCells(r);
 }
 
