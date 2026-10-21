@@ -170,7 +170,12 @@ public:
     // 外部弹窗（改名输入框 / 原生菜单）开着时占住盒子：
     // 那些窗口一盖上来鼠标就「离开」了盒子，悬停展开的盒子会当场缩回去。
     // 和 menuOpen_ 分开记：菜单是自己知道自己开着的，改名要主程序通知。
-    void SetInteractionHold(bool on) { holdOpen_ = on; }
+    void SetInteractionHold(bool on) {
+        holdOpen_ = on;
+        // 占住 = 盒子必须开着。输入框是另一个顶层窗口，盒子要是这时候收成一条
+        // 4px 把手，正在改的名字就悬在把手上，根本没法改（伸缩模式踩过这个）。
+        if (on && collapsed_) SetCollapsed(false);
+    }
 
     // ---- 布局尺寸（右键菜单的「查看」会改这些）----
     int headerH() const { return headerH_; }

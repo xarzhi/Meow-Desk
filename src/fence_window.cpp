@@ -2932,8 +2932,13 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             onContextMenu(it, sp);
         }
         menuOpen_ = false;
-        // 菜单关掉之后鼠标多半还停在外面：该收就收，别留一个开着却没人操作的盒子
-        if (nativeMenu && expandMode() == 0) {
+        // 菜单关掉之后鼠标多半还停在外面：该收就收，别留一个开着却没人操作的盒子。
+        //
+        // **但 holdOpen_ 为真时绝不能收** —— 用户刚才点的可能就是「重命名」，
+        // 输入框已经弹出来了（BeginRenameIcon 里 HoldFence 占住了盒子）。而那一瞬
+        // 光标还停在菜单项上，原生菜单是从光标处往下展开的，「重命名」往往落在
+        // 盒子矩形外面 —— 这里一收，正在改的名字就悬在一块 4px 把手上，没法改名。
+        if (nativeMenu && expandMode() == 0 && !holdOpen_) {
             POINT cur{};
             GetCursorPos(&cur);
             if (!HitTest(cur)) {
