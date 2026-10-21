@@ -304,6 +304,14 @@ public:
     void ToggleTodoAt(int row);    // 勾上 / 取消勾
     void EditTodoAt(int row);      // 就地改文字；row == TodoCount()-1 表示新增
     void DeleteTodoAt(int row);
+    // 第 row 行右侧那个「×」删除按钮的客户区矩形（行不存在 → 空矩形）。
+    RECT TodoDeleteRect(int row) const;
+    // 这一点是不是点在那颗「×」上（删除按钮，命中范围比图形本身宽一点，好点）
+    bool TodoDeleteHit(int row, POINT clientPt) const;
+    // 勾掉 / 取消勾的过渡动画：先让这一行淡出并轻微下沉，动画结束再真正写数据
+    // —— 数据一改，这一条就属于另一个 tab 了，会当场从列表里消失，没有过渡可言。
+    void StartTodoToggle(int row);
+    void FinishTodoAnim();   // 有挂起的改动就立刻落地（删行 / 改名 / 关盒子前都要调）
     // 内容区点了一下（LBUTTONUP）：末尾那行 = 新增，其余 = 打勾
     void ClickTodoRow(int row);
     // row 是一条真实条目吗（false = 末尾「新建」行 / 越界）。
@@ -513,6 +521,19 @@ private:
     void ResolveDragMove(RECT from, int wantX, int wantY, int& outX, int& outY) const;
 
     LabelDib* LabelOf(DesktopIconView* e, int boxW, int boxH, int glow, int maxLines);
+
+    // ---- UI 文字：GDI 栅格化（和图标标题同一套）----
+    // 待办条目 / 头部标签 / 盒子标题以前都走 GDI+ 的 DrawString：13~15px 的中文
+    // 在它自己的光栅器里笔画会摊到半像素上，叠在模糊壁纸上就是「发虚」。
+    // 图标标题用的是 GDI + 灰度抗锯齿，实得多 —— 这里统一成同一条路：
+    //   UiText() 按 (文字, 字号, 粗体, 删除线, 最宽, 颜色) 缓存一张 DIB，
+    //   DrawUiTextDib() 用预乘合成贴到缓冲上。
+    LabelDib* UiText(const std::wstring& text, int px, bool bold, bool strike, int maxW,
+                     COLORREF color);
+    void DrawUiTextDib(const std::wstring& text, int px, bool bold, bool strike, int maxW,
+                       COLORREF color, int alpha, RECT box, bool leftAlign);
+    std::unordered_map<std::wstring, LabelDib> uiText_;
+    void ClearUiTextCache() { uiText_.clear(); }
     HWND hwnd_ = nullptr;
     int index_ = 0;
     FenceConfig* cfg_ = nullptr;
@@ -631,6 +652,13 @@ private:
     int pressTodoRow_ = -1;
     // 待办盒当前 tab：0 = 未完成，1 = 已完成（不落盘，重开回到「未完成」）
     int todoFilter_ = 0;
+    // 勾掉 / 取消勾的淡出动画：正在淡出的行号、对应的 todos 下标、动画结束要写的
+    // done 值。数据要等动画放完才真改（改了行就从当前 tab 消失了）。
+    int todoAnimRow_ = -1;
+    int todoAnimSub_ = -1;
+    int todoAnimDone_ = 0;
+    DWORD todoAnimT0_ = 0;
+    int todoAnimDur_ = 220;
     bool pressArrow_ = false;
     bool pressLock_ = false;
     // 点击标签：松手时（没拖动过）才切

@@ -331,6 +331,48 @@ HFONT TabMeasureFont(int px) {
     return cache[i];
 }
 
+// UI 文字用的字体（待办条目 / 头部标签 / 盒子标题）。
+//
+// 和图标标题一样必须用 ANTIALIASED_QUALITY（灰度抗锯齿）：
+// 分层窗口是 per-pixel alpha，ClearType 会在半透明像素上出色边。
+// 这里只是把「字号 / 粗体 / 删除线」三档做了缓存 —— 每次画都建一个 HFONT
+// 的话，待办盒一帧十几行就是十几个 GDI 对象。
+HFONT UiFontFor(int px, bool bold, bool strike) {
+    static std::unordered_map<int, HFONT> cache;
+    const int key = px * 100 + (bold ? 10 : 0) + (strike ? 1 : 0);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    LOGFONTW lf{};
+    lf.lfHeight = -px;
+    lf.lfWeight = bold ? FW_SEMIBOLD : FW_NORMAL;
+    lf.lfQuality = ANTIALIASED_QUALITY;
+    lf.lfStrikeOut = strike ? TRUE : FALSE;
+    lstrcpynW(lf.lfFaceName, L"Microsoft YaHei UI", LF_FACESIZE);
+    HFONT f = CreateFontIndirectW(&lf);
+    cache[key] = f;
+    return f;
+}
+
+// 这个字体的行高（tmHeight）。LabelDib 里 DrawTextW 是 DT_TOP，
+// 所以「文字盒高度给行高，再按 (行高 - 行高)/2 贴」就是垂直居中。
+int UiFontHeight(int px, bool bold, bool strike) {
+    static std::unordered_map<int, int> cache;
+    const int key = px * 100 + (bold ? 10 : 0) + (strike ? 1 : 0);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    int h = px + 2;
+    HDC dc = GetDC(nullptr);
+    if (dc) {
+        HGDIOBJ old = SelectObject(dc, UiFontFor(px, bold, strike));
+        TEXTMETRICW tm{};
+        if (GetTextMetricsW(dc, &tm)) h = tm.tmHeight;
+        SelectObject(dc, old);
+        ReleaseDC(nullptr, dc);
+    }
+    cache[key] = h;
+    return h;
+}
+
 int MeasureTabText(const std::wstring& s, int px) {
     if (s.empty()) return 0;
     HDC dc = GetDC(nullptr);
@@ -460,6 +502,24 @@ std::wstring FormatMTime(const FILETIME& ft) {
 // 行高固定（FenceWindow::kTodoRowH），所以滚动量、命中、输入框位置可以
 // 全部用 row * rowH 直接算出来，不需要额外的布局缓存。
 // ---------------------------------------------------------------------------
+// ARGB（GDI+ 的 Color 值）取分量。注意和 COLORREF 的字节序相反。
+inline BYTE ArgbR(ARGB c) { return (BYTE)((c >> 16) & 0xFF); }
+inline BYTE ArgbG(ARGB c) { return (BYTE)((c >> 8) & 0xFF); }
+inline BYTE ArgbB(ARGB c) { return (BYTE)(c & 0xFF); }
+
+// 一条要贴的文字。PaintTodoBody 只负责排版（算出文字盒），真正栅格化交给
+// FenceWindow::DrawUiTextDib —— 那里走 GDI，和图标标题同一条路（见 UiText）。
+struct TodoTextOut {
+    std::wstring text;
+    RECT box{};
+    int px = 13;
+    bool bold = false;
+    bool strike = false;
+    bool leftAlign = true;
+    int alpha = 255;
+    COLORREF color = RGB(0, 0, 0);
+};
+
 struct TodoPaintArgs {
     int rowLeft = 0;
     int rowRight = 0;
@@ -479,41 +539,52 @@ struct TodoPaintArgs {
     bool showAdd = true;   // 末尾要不要画「＋ 新建待办」（已完成 tab 不画）
     // 一条都没有时的提示（空 = 不画）。已完成 tab 用它说「还没有已完成的待办」
     const wchar_t* emptyHint = nullptr;
+    // 勾掉动画：这一行整体淡出 + 轻微下沉。row < 0 = 没有动画。
+    int animRow = -1;
+    float animT = 0.0f;
+    // 动画期间勾选框先显示**新状态**（勾上 / 取消勾），再整行淡出 ——
+    // 只淡出不改勾的话，用户看不到"我这一下点中了"。
+    int animDone = 0;
+    // 输出：这一帧要贴的文字。正文交给 FenceWindow::DrawUiTextDib 走 GDI 栅格化，
+    // 不在这里用 GDI+ 的 DrawString（见 UiText 的说明）。
+    std::vector<TodoTextOut>* texts = nullptr;
 };
 
 void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
     if (!a.items || !a.idx) return;
     g.SetSmoothingMode(SmoothingModeAntiAlias);
     g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
-    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);   // 和头部标签同一档
 
-    FontFamily fam(L"Microsoft YaHei UI");
-    Font fText(&fam, 13.0f, FontStyleRegular, UnitPixel);
-    Font fDone(&fam, 13.0f, FontStyleStrikeout, UnitPixel);
-
-    StringFormat sf;
-    sf.SetLineAlignment(StringAlignmentCenter);
-    sf.SetFormatFlags(StringFormatFlagsNoWrap);
-    sf.SetTrimming(StringTrimmingEllipsisCharacter);
+    const int rowPx = 13;   // 正文 13px：和资源管理器列表的字号一致
 
     const int boxSize = 17;
     const int boxX = a.rowLeft + 10;
     const int textX = boxX + boxSize + 10;
-    const int textW = std::max(16, a.rowRight - 8 - textX);
+    // 右边留出「×」删除按钮的位置（18px + 右边距）
+    const int delW = 22;
+    // 文字右边再让出 6px：命中盒比图形宽，贴太紧的话点「最后一个字」会误删
+    const int textW = std::max(16, a.rowRight - delW - 6 - textX);
 
     const int n = (int)a.idx->size();
     const int total = n + (a.showAdd ? 1 : 0);
+    auto pushText = [&](const std::wstring& s, RECT box, ARGB c, bool strike, bool left,
+                        int alpha) {
+        if (!a.texts) return;
+        TodoTextOut t;
+        t.text = s;
+        t.box = box;
+        t.px = rowPx;
+        t.strike = strike;
+        t.leftAlign = left;
+        t.alpha = alpha;
+        t.color = RGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+        a.texts->push_back(std::move(t));
+    };
 
     // 空 tab：居中一句话（已完成 tab 一条都没有的时候）
     if (total == 0 && a.emptyHint) {
-        SolidBrush eb{Color(a.fgDim)};
-        StringFormat cf;
-        cf.SetAlignment(StringAlignmentCenter);
-        cf.SetLineAlignment(StringAlignmentCenter);
-        g.DrawString(a.emptyHint, -1, &fText,
-                     RectF((float)a.rowLeft, (float)a.top,
-                           (float)(a.rowRight - a.rowLeft), (float)(a.clipBottom - a.top)),
-                     &cf, &eb);
+        pushText(a.emptyHint,
+                 RECT{a.rowLeft, a.top, a.rowRight, a.clipBottom}, a.fgDim, false, false, 255);
         return;
     }
 
@@ -526,12 +597,29 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
         const bool hot = (a.hot == i);
         const int cy = y + a.rowH / 2;
 
-        if (hot) {
+        // 勾掉动画：这一行整体淡出 + 往下沉一点（像被"收走"）
+        float fade = 1.0f;
+        int animDy = 0;
+        if (a.animRow == i && a.animT > 0.0f) {
+            const float t = std::min(1.0f, a.animT);
+            // 前 30% 保持不动（让"打勾"这一下看清楚），之后才淡出下沉
+            const float k = std::max(0.0f, (t - 0.3f) / 0.7f);
+            fade = 1.0f - k;
+            animDy = (int)std::lround(5.0f * k);
+        }
+        const int rowA = (int)std::lround(255.0f * fade);
+        const int ry = y + animDy;
+        const int rcy = cy + animDy;
+        if (rowA <= 2) continue;
+
+        if (hot && !addRow) {
             GraphicsPath hp;
-            AddRoundRect(hp, RectF((float)a.rowLeft, (float)y + 2.0f,
+            AddRoundRect(hp, RectF((float)a.rowLeft, (float)ry + 2.0f,
                                    (float)(a.rowRight - a.rowLeft), (float)a.rowH - 4.0f),
                          6.0f);
-            SolidBrush hb{Color(a.light ? 0x140067C0 : 0x224CC2FF)};
+            const ARGB hc = (a.light ? 0x140067C0 : 0x224CC2FF);
+            SolidBrush hb{Color((BYTE)((hc >> 24) * rowA / 255), ArgbR(hc), ArgbG(hc),
+                                ArgbB(hc))};
             g.FillPath(&hb, &hp);
         }
 
@@ -541,17 +629,19 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
             plus.SetStartCap(LineCapRound);
             plus.SetEndCap(LineCapRound);
             const float cx = (float)boxX + (float)boxSize * 0.5f;
-            g.DrawLine(&plus, cx - 4.5f, (float)cy, cx + 4.5f, (float)cy);
-            g.DrawLine(&plus, cx, (float)cy - 4.5f, cx, (float)cy + 4.5f);
-            SolidBrush tb{hot ? Color(a.accent) : Color(a.fgDim)};
-            g.DrawString(L"\u65b0\u5efa\u5f85\u529e", -1, &fText,
-                         RectF((float)textX, (float)y, (float)textW, (float)a.rowH), &sf, &tb);
+            g.DrawLine(&plus, cx - 4.5f, (float)rcy, cx + 4.5f, (float)rcy);
+            g.DrawLine(&plus, cx, (float)rcy - 4.5f, cx, (float)rcy + 4.5f);
+            pushText(L"\u65b0\u5efa\u5f85\u529e",   // 新建待办
+                     RECT{textX, ry, textX + textW, ry + a.rowH},
+                     hot ? a.accent : a.fgDim, false, true, rowA);
             continue;
         }
 
         const TodoItem& it = (*a.items)[(*a.idx)[i]];
-        const bool done = it.done != 0;
-        RectF box((float)boxX, (float)(cy - boxSize / 2), (float)boxSize, (float)boxSize);
+        // 这一行正在放勾选动画：勾选框先按新状态画（数据还没改）
+        const bool animating = (a.animRow == i);
+        const bool done = animating ? (a.animDone != 0) : (it.done != 0);
+        RectF box((float)boxX, (float)(rcy - boxSize / 2), (float)boxSize, (float)boxSize);
         GraphicsPath bp;
         AddRoundRect(bp, box, 4.5f);
         if (done) {
@@ -567,9 +657,28 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
             g.DrawPath(&edge, &bp);
         }
 
-        SolidBrush tb{Color(done ? a.fgDim : a.fg)};
-        g.DrawString(it.text.c_str(), -1, done ? &fDone : &fText,
-                     RectF((float)textX, (float)y, (float)textW, (float)a.rowH), &sf, &tb);
+        pushText(it.text, RECT{textX, ry, textX + textW, ry + a.rowH},
+                 done ? a.fgDim : a.fg, done, true, rowA);
+
+        // ---- 右侧「×」删除按钮 ----
+        // 悬停这一行时实一点、带一圈淡底，平时很淡 —— 一直画着，但不去抢内容。
+        {
+            const int ds = 16;
+            const int dx = a.rowRight - (delW - 6) - ds / 2;   // 右边留 8px
+            const float cx = (float)dx + ds * 0.5f;
+            const float cyy = (float)rcy;
+            const float r = 4.0f;
+            if (hot) {
+                SolidBrush db{Color(a.light ? 0x14000000 : 0x22FFFFFF)};
+                g.FillEllipse(&db, cx - 8.0f, cyy - 8.0f, 16.0f, 16.0f);
+            }
+            const BYTE ea = (BYTE)std::min(255, (int)((hot ? 210 : 120) * rowA / 255));
+            Pen xp{a.light ? Color(ea, 40, 44, 52) : Color(ea, 235, 238, 244), 1.5f};
+            xp.SetStartCap(LineCapRound);
+            xp.SetEndCap(LineCapRound);
+            g.DrawLine(&xp, cx - r, cyy - r, cx + r, cyy + r);
+            g.DrawLine(&xp, cx - r, cyy + r, cx + r, cyy - r);
+        }
     }
 }
 
@@ -665,15 +774,57 @@ int FenceWindow::HitTodoRow(POINT clientPt) const {
 
 void FenceWindow::ClickTodoRow(int row) {
     if (!isTodo() || row < 0 || row >= TodoCount()) return;
-    if (row == VisibleTodoCount()) {
+    if (!TodoRowIsItem(row)) {
         EditTodoAt(row);   // 末尾那行 = 新增
         return;
     }
-    ToggleTodoAt(row);
+    StartTodoToggle(row);
 }
 
-// 勾上 / 取消勾。勾完这一条就不属于当前 tab 了（未完成 → 已完成，反之亦然），
-// 所以它会在下一帧直接消失 —— 这就是「勾掉就归档」的语义，不是 bug。
+// 第 row 行右边那颗「×」：图形本身 16px，命中盒给到 18px（好点一点）。
+// 中心和 PaintTodoBody 里画的那个椭圆**必须**一致 —— 两处各写一份的话
+// 鼠标明明点在 × 上却判成「打勾」。
+RECT FenceWindow::TodoDeleteRect(int row) const {
+    if (!isTodo() || row < 0) return RECT{0, 0, 0, 0};
+    const RECT r = TodoRowRect(row);
+    if (r.bottom <= r.top) return RECT{0, 0, 0, 0};
+    const int cy = (r.top + r.bottom) / 2;
+    const int cx = r.right - 16;
+    return RECT{cx - 9, cy - 9, cx + 9, cy + 9};
+}
+
+bool FenceWindow::TodoDeleteHit(int row, POINT clientPt) const {
+    if (!TodoRowIsItem(row)) return false;   // 「＋ 新建」那行没有 ×
+    const RECT d = TodoDeleteRect(row);
+    if (d.right <= d.left) return false;
+    return clientPt.x >= d.left && clientPt.x < d.right && clientPt.y >= d.top &&
+           clientPt.y < d.bottom;
+}
+
+// 勾掉 / 取消勾：**先放动画，动画完了才改数据**。
+// 数据一改这条就不属于当前 tab 了，会当场从列表里消失 —— 没有动画可言。
+// 所以标记哪一行、哪个下标、要写成什么 done 值，等 FinishTodoAnim 再落地。
+void FenceWindow::StartTodoToggle(int row) {
+    // 上一次动画还没放完就点了下一条：先把上一条落地，别丢改动。
+    // **必须在算下标之前** —— 落地会让行号整体错位，先取下标就会改到别的条目上。
+    if (todoAnimRow_ >= 0) {
+        const int wasRow = todoAnimRow_;
+        FinishTodoAnim();
+        // 连点同一行：第一次已经把这条送去另一个 tab 了，这一下就当点空
+        if (wasRow == row) return;
+    }
+    const int i = TodoIndexOfRow(row);
+    if (i < 0) return;
+    todoAnimRow_ = row;
+    todoAnimSub_ = i;
+    todoAnimDone_ = cfg_->todos[i].done ? 0 : 1;
+    todoAnimT0_ = GetTickCount();
+    if (hwnd_) SetTimer(hwnd_, kAnimTimer, 16, nullptr);
+    Redraw();
+}
+
+// 语义包装：外部（右键菜单 / 脚本）要「立刻把这条勾上」时用。
+// 界面里点行不再走这里 —— 那里要的是带过渡的 StartTodoToggle。
 void FenceWindow::ToggleTodoAt(int row) {
     const int i = TodoIndexOfRow(row);
     if (i < 0) return;
@@ -684,10 +835,35 @@ void FenceWindow::ToggleTodoAt(int row) {
     Redraw();
 }
 
+void FenceWindow::FinishTodoAnim() {
+    if (todoAnimRow_ < 0) return;
+    const int i = todoAnimSub_;
+    const int want = todoAnimDone_;
+    todoAnimRow_ = -1;
+    todoAnimSub_ = -1;
+    if (cfg_ && isTodo() && i >= 0 && i < (int)cfg_->todos.size()) {
+        if (cfg_->todos[i].done != want) {
+            cfg_->todos[i].done = want;
+            if (onStateChanged) onStateChanged();
+        }
+    }
+    ClampScroll();
+    // 这一行已经换到另一个 tab 去了，悬停态作废
+    hot_ = -1;
+    Redraw();
+}
+
 void FenceWindow::DeleteTodoAt(int row) {
     const int i = TodoIndexOfRow(row);
     if (i < 0) return;
+    // 删的正好是正在淡出的那条：动画作废，别让 FinishTodoAnim 越界写到别的条目上
+    if (todoAnimSub_ == i) {
+        todoAnimRow_ = -1;
+        todoAnimSub_ = -1;
+    }
     cfg_->todos.erase(cfg_->todos.begin() + i);
+    // 下标整体前移：挂起的动画下标也要跟着挪（否则会去改下一条）
+    if (todoAnimSub_ > i) --todoAnimSub_;
     if (onStateChanged) onStateChanged();
     ClampScroll();
     if (hot_ >= TodoCount()) hot_ = -1;
@@ -718,6 +894,9 @@ void FenceWindow::SetTodoFilter(int f) {
 // row == VisibleTodoCount() = 当前 tab 末尾那行「新建」—— 提交空字符串就当没加过。
 void FenceWindow::EditTodoAt(int row) {
     if (!isTodo() || !hwnd_ || collapsed_) return;
+    // 有挂起的勾选动画就先落地：行号 / 下标在动画结束时会整体变一次，
+    // 不落地的话「点了 A 行改名字，结果改到 B 行」。
+    FinishTodoAnim();
     const bool adding = (row == VisibleTodoCount());
     // row 是「行号」，写回数组要换成 cfg_->todos 的下标
     const int ci = adding ? -1 : TodoIndexOfRow(row);
@@ -1311,6 +1490,74 @@ LabelDib* FenceWindow::DetailText(const std::wstring& text, int boxW, int boxH, 
 }
 
 void FenceWindow::ClearDetailCache() { detailText_.clear(); }
+
+// ---------------------------------------------------------------------------
+// UI 文字：GDI 栅格化缓存
+//
+// 待办条目 / 头部标签 / 盒子标题以前走 GDI+ 的 Graphics::DrawString。
+// 13~15px 的汉字在 GDI+ 自己的光栅器里会被摆到半像素位置上，笔画摊开、
+// 叠在磨砂底图（本身就糊）上就是用户说的「发虚」。图标标题、详情列用的是
+// GDI + 灰度抗锯齿，同样的字号实得多 —— 这里统一成同一条路。
+//
+// 缓存 key 里必须带齐「文字 + 字号 + 粗体 + 删除线 + 最宽 + 颜色」：
+// 少带一个就会出现「改了设置字号文字不变」这类穿越 bug（和 LabelOf 一个道理）。
+// ---------------------------------------------------------------------------
+LabelDib* FenceWindow::UiText(const std::wstring& text, int px, bool bold, bool strike,
+                             int maxW, COLORREF color) {
+    if (text.empty() || px <= 0 || maxW <= 8) return nullptr;
+    std::wstring key = text;
+    key += L'\x1';
+    key += std::to_wstring(px);
+    key += bold ? L"b" : L"r";
+    key += strike ? L"s" : L"n";
+    key += std::to_wstring(maxW);
+    key += L"c";
+    key += std::to_wstring((unsigned)color);
+
+    auto it = uiText_.find(key);
+    if (it != uiText_.end()) return it->second.valid() ? &it->second : nullptr;
+
+    // 盒子改宽时 maxW 会变，key 全换一批 —— 老条目再也用不上，撞到上限就整块丢掉。
+    if (uiText_.size() > 512) uiText_.clear();
+
+    LabelDib d;
+    // glow = 0：卡片上有底色，不需要黑描边（图标标题需要是因为它直接压在壁纸上）。
+    // maxLines = 1：待办一行就是一行，超宽由 LabelDib 自己打省略号。
+    if (!d.Build(text, UiFontFor(px, bold, strike), maxW, UiFontHeight(px, bold, strike), 0,
+                 color, 1)) {
+        uiText_.insert_or_assign(key, LabelDib{});   // 缓存失败结果，别每帧重试
+        return nullptr;
+    }
+    auto r = uiText_.insert_or_assign(key, std::move(d));
+    return &r.first->second;
+}
+
+// 把一段 UI 文字贴到缓冲上（预乘合成，直接写 bits_）。
+// **必须在 GDI+ 全部 Flush 之后调** —— GDI 不认 GDI+ 的延迟绘制，
+// 顺序反了文字会被上面那层半透明卡片底色盖住。
+//
+// box 是「排版盒」：高度是整行高，文字自己在盒子里垂直居中。
+// 之前待办行偏上就是因为 GDI+ 那边按 baseline 排、又没有行高可依。
+void FenceWindow::DrawUiTextDib(const std::wstring& text, int px, bool bold, bool strike,
+                               int maxW, COLORREF color, int alpha, RECT box,
+                               bool leftAlign) {
+    if (alpha <= 2) return;
+    if (!bits_ || bufW_ <= 0 || bufH_ <= 0) return;
+    if (box.right <= box.left || box.bottom <= box.top) return;
+    LabelDib* lab = UiText(text, px, bold, strike, maxW, color);
+    if (!lab || !lab->valid()) return;
+
+    const int cw = lab->w - lab->pad * 2;    // 实际文字宽
+    const int ch = lab->h - lab->pad * 2;    // 实际文字高（= 行高）
+    const int bw = box.right - box.left;
+    const int bh = box.bottom - box.top;
+    const int x = leftAlign ? box.left : box.left + (bw - cw) / 2;
+    const int y = box.top + (bh - ch) / 2;
+
+    BlendIntoDim(reinterpret_cast<BYTE*>(bits_), bufW_, bufH_,
+                 reinterpret_cast<const BYTE*>(lab->bits), lab->w, lab->h, x - lab->pad,
+                 y - lab->pad, alpha, 255);
+}
 
 // 详情列几何：图标在左，名称占剩余空间，右侧依次 修改日期 / 类型 / 大小（右对齐）。
 // 盒子变窄时按用户要求的顺序隐藏：大小 → 类型 → 修改日期；名称至少留 80px。
@@ -2816,6 +3063,13 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // 必须放在图标分支前面 —— todo 盒的 pressItem_ 恒为 -1，会一路漏到
         // 最后那条「点空白取消选中」上，什么都点不动。
         if (isTodo() && todoRow >= 0 && !wasDragging) {
+            // 先判右边那颗「×」：点在它上面是删除，绝不能顺带把这一条勾掉
+            POINT upPt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (TodoDeleteHit(todoRow, upPt)) {
+                hot_ = -1;
+                DeleteTodoAt(todoRow);
+                return 0;
+            }
             ClickTodoRow(todoRow);
             return 0;
         }
@@ -2911,6 +3165,16 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (tabPillAnim_) {
             if (GetTickCount() - tabPillT0_ >= (DWORD)tabPillDur_) tabPillAnim_ = false;
             busy = true;
+        }
+
+        // 待办勾选 / 取消勾的过渡：行淡出 + 轻微下沉，放完才真正写数据
+        if (todoAnimRow_ >= 0) {
+            const DWORD el = GetTickCount() - todoAnimT0_;
+            if (el >= (DWORD)todoAnimDur_) {
+                FinishTodoAnim();   // 里面会自己 Redraw 一帧让行消失
+            } else {
+                busy = true;
+            }
         }
 
         // 亚克力底图补抓（在工作线程里跑）：回来了就在这里换上并重画一帧。
@@ -3308,6 +3572,10 @@ void FenceWindow::Paint() {
     if (!bits_ || !memDC_ || !cfg_) return;
     std::memset(bits_, 0, (size_t)bufW_ * (size_t)bufH_ * 4);
 
+    // 头部文字（分组标签 / 盒子标题）先只算排版，等 GDI+ 全部 Flush 完再贴 ——
+    // GDI 直接写 bits_，在上面那个 Graphics 还挂着延迟绘制时贴字会被它盖掉。
+    std::vector<TodoTextOut> headTexts;
+
     // 「聚焦」= 恰好一个图标被选中：它的标签不限行，选中高亮也要跟着一起变高。
     // 高亮画在图标之前，两个地方都要用同一个指针，所以在函数级声明一次。
     DesktopIconView* expandOne = nullptr;
@@ -3452,14 +3720,11 @@ void FenceWindow::Paint() {
         if (drawHead && (isTodo() || hasTabs())) {
             const std::vector<RECT> tabs = TabRects();
             const int act = HeadTabActive();
-            FontFamily family(L"Microsoft YaHei UI");
             // 13px → 14px：特意渲染过对照图（13/14/15/16 各画一行），
             // 灰度抗锯齿下 13px 的汉字笔画太细，糊在模糊壁纸上就是「看不清」；
             // 14px 明显变实，15px 在 24px 高的胶囊里又开始挤。
             // ClearType 用不了（per-pixel alpha 分层窗口会出色边），只能靠字号。
             const int fontPx = (headerH_ >= 40) ? 15 : 14;
-            Font tabFont(&family, (float)fontPx, FontStyleRegular, UnitPixel);
-            Font tabFontBold(&family, (float)fontPx, FontStyleBold, UnitPixel);
 
             // ---- 滑块（当前分组身后的那块底色）----
             // 样式参考 Windows 11 的分段控件：浅色卡片上是「更白的胶囊 + 极淡描边
@@ -3490,11 +3755,6 @@ void FenceWindow::Paint() {
                 }
             }
 
-            StringFormat tf;
-            tf.SetAlignment(StringAlignmentCenter);
-            tf.SetLineAlignment(StringAlignmentCenter);
-            tf.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsNoClip);
-            tf.SetTrimming(StringTrimmingEllipsisCharacter);
             // 非当前分组原来是「同一个字色 + 低 alpha（48%/57%）」：字是半透明的，
             // 和背后那块壁纸混在一起，壁纸一花字就散了。现在换成**不透明的中性灰**，
             // 层级只靠明度差（黑/深灰、白/浅灰），字始终是实的。
@@ -3503,29 +3763,50 @@ void FenceWindow::Paint() {
             // 和 active 的 0xF2F2F5 只差在明度一点点，层级交给粗体和胶囊底。
             const ARGB idleFg = light ? 0xFF55575F : 0xFFDEE0E6;
             const BYTE fadeA8 = (BYTE)std::lround(255.0f * headFade);
+            // 待办盒：左边把盒子标题加回来（用户要的「待办盒子左边的待办标题」）。
+            // tab 是居中的，所以标题只在「和左边那个 tab 之间还放得下」时才画 ——
+            // 盒子被拖得很窄的时候宁可让位给 tab，毕竟 tab 是切换入口。
+            if (isTodo() && !tabs.empty() && !cfg_->title.empty()) {
+                RECT tb{16, 0, tabs[0].left - 10, (int)headH};
+                if (tb.right - tb.left >= 40) {
+                    TodoTextOut t;
+                    t.text = cfg_->title;
+                    t.box = tb;
+                    t.px = fontPx;
+                    t.bold = true;          // 标题给粗一点，和 tab 的层级分开
+                    t.leftAlign = true;
+                    t.alpha = fadeA8;
+                    t.color = RGB((fg >> 16) & 0xFF, (fg >> 8) & 0xFF, fg & 0xFF);
+                    headTexts.push_back(std::move(t));
+                }
+            }
             for (size_t i = 0; i < tabs.size(); ++i) {
                 const RECT& tr = tabs[i];
                 const bool on = ((int)i == act);
-                const RectF rr((float)tr.left, (float)tr.top, (float)(tr.right - tr.left),
-                               (float)(tr.bottom - tr.top));
-                SolidBrush txt{Color(WithAlpha(on ? fg : idleFg, fadeA8))};
-                const std::wstring name = HeadTabName((int)i);
-                const RectF box(rr.X + 2.0f, rr.Y, std::max(4.0f, rr.Width - 4.0f), rr.Height);
-                gfx.DrawString(name.c_str(), -1, on ? &tabFontBold : &tabFont, box, &tf, &txt);
+                // 文字交给 DrawUiTextDib 走 GDI：GDI+ 的 DrawString 画 13~14px
+                // 中文会摊在半像素上，叠在磨砂底图里就是「发虚」。
+                const ARGB tc = on ? fg : idleFg;
+                TodoTextOut t;
+                t.text = HeadTabName((int)i);
+                t.box = RECT{tr.left + 2, tr.top, std::max(tr.left + 6, tr.right - 2), tr.bottom};
+                t.px = fontPx;
+                t.bold = on;
+                t.leftAlign = false;        // 标签里居中
+                t.alpha = fadeA8;
+                t.color = RGB((tc >> 16) & 0xFF, (tc >> 8) & 0xFF, tc & 0xFF);
+                headTexts.push_back(std::move(t));
             }
         } else if (drawHead && g_config.showLabels) {
-            FontFamily family(L"Microsoft YaHei UI");
             // 和分组标签同步放大（12.5 → 13.5）：同一个头部的字不该一粗一细
-            const float fs = headerH_ >= 40 ? 15.0f : 13.5f;
-            Font titleFont(&family, fs, FontStyleRegular, UnitPixel);
-            SolidBrush brush{Color(WithAlpha(fg, fadeA))};
-            StringFormat fmt;
-            fmt.SetLineAlignment(StringAlignmentCenter);
-            fmt.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsNoClip);
-            fmt.SetTrimming(StringTrimmingEllipsisCharacter);
-            gfx.DrawString(cfg_->title.c_str(), -1, &titleFont,
-                           RectF(16.0f, 0.0f, (float)bufW_ - 56.0f, headH),
-                           &fmt, &brush);
+            const int fs = headerH_ >= 40 ? 15 : 14;
+            TodoTextOut t;
+            t.text = cfg_->title;
+            t.box = RECT{16, 0, std::max(20, bufW_ - 40), (int)headH};
+            t.px = fs;
+            t.leftAlign = true;
+            t.alpha = fadeA;
+            t.color = RGB((fg >> 16) & 0xFF, (fg >> 8) & 0xFF, fg & 0xFF);
+            headTexts.push_back(std::move(t));
         }
 
         // ---- 锁按钮（自绘挂锁）----
@@ -3701,19 +3982,25 @@ void FenceWindow::Paint() {
         std::vector<DesktopIconView*> mineEmpty;
         CollectVisible(mineEmpty);
         if (!collapsed_ && !isTodo() && mineEmpty.empty()) {
-            FontFamily family(L"Microsoft YaHei UI");
-            Font hintFont(&family, 12.0f, FontStyleRegular, UnitPixel);
-            SolidBrush h2{Color((BYTE)(light ? 150 : 170), (BYTE)(light ? 90 : 210),
-                                 (BYTE)(light ? 96 : 210), (BYTE)(light ? 108 : 210))};
-            StringFormat hf;
-            hf.SetAlignment(StringAlignmentCenter);
-            hf.SetLineAlignment(StringAlignmentCenter);
-            gfx.DrawString(L"\u628a\u684c\u9762\u56fe\u6807\u62d6\u8fdb\u6765", -1, &hintFont,
-                           RectF(0.0f, headH, (float)bufW_, (float)bufH_ - headH),
-                           &hf, &h2);
+            // 这一句也走 GDI（以前是 GDI+ 12px，同样发虚）
+            TodoTextOut t;
+            t.text = L"\u628a\u684c\u9762\u56fe\u6807\u62d6\u8fdb\u6765";   // 把桌面图标拖进来
+            t.box = RECT{0, (int)headH, bufW_, bufH_};
+            t.px = 13;
+            t.leftAlign = false;
+            t.alpha = light ? 150 : 170;
+            t.color = light ? RGB(90, 96, 108) : RGB(210, 210, 210);
+            headTexts.push_back(std::move(t));
         }
 
         gfx.Flush(FlushIntentionSync);
+    }
+
+    // ---- 头部 / 提示文字：GDI 贴图 ----
+    // 必须在上面的 Graphics 析构（或至少 Flush）之后：GDI+ 的延迟绘制会把它盖掉。
+    for (const TodoTextOut& t : headTexts) {
+        DrawUiTextDib(t.text, t.px, t.bold, t.strike, t.box.right - t.box.left, t.color,
+                      t.alpha, t.box, t.leftAlign);
     }
 
     // ---- 待办盒：内容区是一列可勾选的条目，不是图标网格 ----
@@ -3727,6 +4014,8 @@ void FenceWindow::Paint() {
                         reinterpret_cast<BYTE*>(bits_));
             Graphics tg(&tbuf);
             TodoPaintArgs a;
+            std::vector<TodoTextOut> texts;
+            a.texts = &texts;
             a.rowLeft = kPad;
             a.rowRight = width_ - kPad;
             a.top = HeadH() + kPad - scrollY_;
@@ -3739,6 +4028,13 @@ void FenceWindow::Paint() {
             a.showAdd = (todoFilter_ == 0);
             a.emptyHint = (todoFilter_ == 1) ? L"\u8fd8\u6ca1\u6709\u5df2\u5b8c\u6210\u7684\u5f85\u529e"
                                              : nullptr;   // 还没有已完成的待办
+            // 勾选过渡：这一行淡出 + 轻微下沉
+            a.animRow = todoAnimRow_;
+            a.animDone = todoAnimDone_;
+            if (todoAnimRow_ >= 0) {
+                const DWORD el = GetTickCount() - todoAnimT0_;
+                a.animT = std::min(1.0f, (float)el / (float)std::max(1, todoAnimDur_));
+            }
 
             // ---- 文字色跟着「实际看到的底色」走，而不是 cfg_->color ----
             // 卡片是半透明的时候，base 黑 + 亮壁纸 = 实际是个中灰，按 base 判
@@ -3783,6 +4079,12 @@ void FenceWindow::Paint() {
 
             PaintTodoBody(tg, a);
             tg.Flush(FlushIntentionSync);
+            // 文字最后贴：GDI 直接写 bits_，不认 GDI+ 的延迟绘制。
+            // 顺序反了的话上面那些圆角块 / 勾选框会盖在字上。
+            for (const TodoTextOut& t : texts) {
+                DrawUiTextDib(t.text, t.px, t.bold, t.strike, t.box.right - t.box.left,
+                              t.color, t.alpha, t.box, t.leftAlign);
+            }
         }
         return;
     }
@@ -4358,6 +4660,9 @@ void FenceWindow::SetExpandMode(int m) {
 }
 
 void FenceWindow::Destroy() {
+    // 还在放勾选动画就关盒子：先把改动落地（onStateChanged 会存盘），
+    // 否则「勾了一下马上关盒子」这条改动会静默丢掉。
+    FinishTodoAnim();
     if (hwnd_) {
         FileDrop::Detach(hwnd_);   // OLE 那边还挂着这个 HWND，先摘掉再销毁
         KillTimer(hwnd_, kAnimTimer);
@@ -4380,5 +4685,6 @@ void FenceWindow::Destroy() {
     labelKeys_.clear();
     detailInfo_.clear();
     detailText_.clear();
+    ClearUiTextCache();   // 每个 LabelDib 都握着一个 HDC + HBITMAP，别留着
     StopFlip();
 }
