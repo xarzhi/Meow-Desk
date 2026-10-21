@@ -1073,34 +1073,39 @@ void FenceWindow::ItemLabelMetrics(int index, int iconH, int& labW, int& labH,
     ItemLabelBox(index, left, labW);
 }
 
-// 悬停 / 选中共用的一份高亮几何。
+// 悬停 / 选中的高亮几何。
 //
-// 内缩 2px 和以前一样；底部不再固定成 cellH()-2，而是撑到这个图标**完整标签**
-// 的高度（LabelOf(...,0) 和聚焦时那条路径同一个缓存 key）。这样「悬停这个图标」
-// 和「选中这个图标」画出来的是**同一个矩形** —— 点选那一下框不会突然变高。
-// 以前悬停按格子算、选中才往下长，两个状态的高度对不上（用户原话：
-// 「鼠标 hover 时的背景应该和 active 项的高亮背景高度一致」）。
+// 默认高度就是**图标所占的那一格**（`r.top + cellH() - 2`）：
+// 悬停时框不该比图标本身大，只有 active（选中）的高度才增加 —— 撑到这个图标
+// **完整标签**的底部（`LabelOf` 和聚焦时那条路径同一个 key）。
+// 以前这里不分状态一律撑高，长名字的图标一悬停就顶着个下半截空着的高框。
+//
+// 撑高的只有「聚焦」那一个（恰好一个选中）：多选时标签仍按两行画，
+// 框也必须按两行量，否则框比字高出好几行。maxLines 要和绘制那边完全一致。
 RECT FenceWindow::ItemHighlightBox(int index) {
     RECT r = ItemHighlightRect(index);
     if (r.right <= r.left) return r;   // 滚出视野 / 没有这个格子
 
     int bottom = r.top + cellH() - 2;
-    // 只在「名字画在图标下面」的模式下撑高：列表 / 详情模式标签是单行、行高固定，
-    // 关掉标题时也没有标签可撑。
+    // 只在「名字画在图标下面」的模式下才有撑高这回事：列表 / 详情模式标签是
+    // 单行、行高固定，关掉标题时也没有标签可撑。
     if (!IsListView() && showLabels_ && index >= 0) {
         std::vector<DesktopIconView*> vis;
         CollectVisible(vis);
-        if (index < (int)vis.size() && vis[index]) {
-            DesktopIconView* e = vis[index];
-            if (!e->name.empty() && !e->renaming) {
-                const IconBitmap& bm = e->bmp;
-                int lw = 0, lh = 0, topRel = 0;
-                ItemLabelMetrics(index, bm.valid() ? bm.height : 32, lw, lh, topRel);
-                if (LabelDib* lab = LabelOf(e, lw, lh, g_config.textShadow ? 2 : 0, 0)) {
-                    if (lab->valid()) {
-                        const int lb = r.top + topRel - lab->pad + lab->h + 2;
-                        if (lb > bottom) bottom = lb;
-                    }
+        DesktopIconView* e = (index < (int)vis.size()) ? vis[index] : nullptr;
+        if (e && e->selected && !e->name.empty() && !e->renaming) {
+            int selN = 0;
+            for (auto* x : vis)
+                if (x && x->selected) ++selN;
+            // 和 Paint 那边同一个口径：唯一选中才不限行，否则两行
+            const int maxLines = (selN == 1) ? 0 : 2;
+            const IconBitmap& bm = e->bmp;
+            int lw = 0, lh = 0, topRel = 0;
+            ItemLabelMetrics(index, bm.valid() ? bm.height : 32, lw, lh, topRel);
+            if (LabelDib* lab = LabelOf(e, lw, lh, g_config.textShadow ? 2 : 0, maxLines)) {
+                if (lab->valid()) {
+                    const int lb = r.top + topRel - lab->pad + lab->h + 2;
+                    if (lb > bottom) bottom = lb;
                 }
             }
         }
@@ -3885,7 +3890,8 @@ void FenceWindow::Paint() {
         // 悬停是 52、选中是 44，选中的那块反而比悬停还淡，看着像两种颜色。
         const Color iconHlFill = light ? Color(26, 0, 0, 0) : Color(52, 255, 255, 255);
         if (!collapsed_ && hot_ >= 0 && !itemDragging_ && !isTodo()) {
-            // 和下面选中那块走同一个 ItemHighlightBox：两态除了描边之外完全重合
+            // 和选中那块用同一个 ItemHighlightBox：悬停时它给的就是格子本身的高度，
+            // 只有这个图标**同时是 active** 才会跟着标签撑高。
             const RECT hb = ItemHighlightBox(hot_);
             if (hb.right > hb.left) {
                 SolidBrush hl{iconHlFill};
@@ -3920,8 +3926,7 @@ void FenceWindow::Paint() {
             Pen pen{light ? Color(70, 0, 0, 0) : Color(80, 255, 255, 255), 1.0f};
             for (size_t i = 0; i < mineSel.size(); ++i) {
                 if (!mineSel[i] || !mineSel[i]->selected) continue;
-                // 高度由 ItemHighlightBox 统一算（含聚焦时按完整标签撑高），
-                // 悬停和选中必然是同一个矩形
+                // 高度由 ItemHighlightBox 统一算：未选中 = 一格，active = 撑到完整标签
                 const RECT hb = ItemHighlightBox((int)i);
                 if (hb.right <= hb.left) continue;
                 const Rect rc(hb.left, hb.top, hb.right - hb.left, hb.bottom - hb.top);
