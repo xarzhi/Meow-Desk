@@ -27,7 +27,7 @@ std::wstring g_file;
 //   v5 — fence 表加 expandMode（展开 / 伸缩模式；-1 = 老数据，启动时按全局默认补）
 //   v6 — 把全局开关 defaultTelescope 落成 0：新建的盒子默认始终展开，不自己收起
 //   v7 — fence 表加 kind（0 = 收纳盒 / 1 = 待办盒）；新增 todo 表（待办条目）
-const int kSchemaVersion = 7;
+const int kSchemaVersion = 8;
 
 void SetError(const char* what) {
     g_lastError = what ? what : "";
@@ -70,7 +70,10 @@ bool Upgrade(int from) {
         "  expandMode  INTEGER NOT NULL DEFAULT -1,"
         // 盒子类型：0 = 收纳盒（装图标），1 = 待办盒（To-do 清单）。
         // 老库由 Upgrade 补这一列，默认 0 = 还是收纳盒。
-        "  kind INTEGER NOT NULL DEFAULT 0"
+        "  kind INTEGER NOT NULL DEFAULT 0,"
+        // 收起方向：0=上 1=下 2=左 3=右。收起后只剩 4px 的把手贴在对应的边上
+        // （见 FenceWindow::collapseDir）。默认 0 = 上，和老版本行为一致。
+        "  collapseDir INTEGER NOT NULL DEFAULT 0"
         ");"
         // 待办盒的条目。ord 是显示顺序（用户可能上下挪），done = 勾没勾掉。
         // 和 fence_group 一样按 (fence, ord) 存，读出来按 ord 顺序塞回配置。
@@ -143,6 +146,11 @@ bool Upgrade(int from) {
         // v7：待办盒。老库里的盒子补上 kind=0（还是收纳盒），todo 表由上面的
         // kSchema 建好（CREATE IF NOT EXISTS，每次都会执行）。
         AddColumn("fence", "kind", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (from < 8) {
+        // v8：收起方向。老库默认 0 = 向上收（把手留在上边），
+        // 和以前只会往上收的位置完全一致，用户不会看到盒子忽然换了个地方。
+        AddColumn("fence", "collapseDir", "INTEGER NOT NULL DEFAULT 0");
     }
 
     const std::string ver = "PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";";

@@ -112,6 +112,20 @@ public:
     void SetCollapsed(bool collapsed);
     bool collapsed() const { return collapsed_; }
 
+    // ---- 收起方向（右键菜单「收缩方向」）----
+    // 0 = 上，1 = 下，2 = 左，3 = 右。收起后整个盒子只剩 kCollapsedHeadH（4px）
+    // 那一条「把手」，贴在指定那条边上；鼠标移到这条 4px 上就展开。
+    //   上：盒子往上收，把手留在上边（一直以来的行为）
+    //   下：盒子往下收，把手留在下边
+    //   左 / 右：盒子横着收成一条 4px 宽、和盒子等高的竖把手
+    int collapseDir() const;
+    void SetCollapseDir(int dir);
+
+    // 盒子的**展开态**矩形（屏幕坐标）。收起之后窗口只是贴在一条边上的 4px 把手，
+    // 位置和展开态并不相同（下面 / 右边收时尤其明显）—— 存配置、算避让一律用它，
+    // 别用 rect()。
+    RECT expandedRect() const;
+
     // 展开方式：1 = 展开模式（始终展开）0 = 伸缩模式（悬停展开 / 移出收起）。
     // 由头部右侧的箭头点击切换，存在 FenceConfig::expandMode 里。
     // 关掉「显示盒子标题」时头部只剩一条 2px 感应条，没有箭头可点，
@@ -473,6 +487,17 @@ private:
     // 收起之后头部收缩到的高度：整块盒子变成一条 4px 的圆角「把手」，
     // 头部的标签 / 标题 / 锁 / 箭头全部不画（见 Paint 里的 headFade）。
     static constexpr int kCollapsedHeadH = 4;
+
+    // 收起状态下的「把手」：整窗现在就是这个把手，光标落在窗口里就算落在把手上。
+    // 上/下收的时候窗口只有 4px 高，左/右收的时候是一整条 4px 宽的竖条 ——
+    // 以前到处写成 `pt.y < HeadH()`，横着收就完全不对了。
+    bool OnCollapsedHandle(POINT clientPt) const {
+        return collapsed_ && clientPt.x >= 0 && clientPt.x < curW_ && clientPt.y >= 0 &&
+               clientPt.y < curH_;
+    }
+    // 按当前尺寸算出窗口该摆在屏幕哪儿：收起方向决定「贴哪条边」。
+    // 锚点是 animAnchor_（展开矩形），所以窗口位置永远由 (w,h) + 方向推出来。
+    void PlaceWindowFor(int w, int h, int& x, int& y) const;
     // 头部高度。待办盒例外：它的「未完成 / 已完成」就在头部，关掉标题也不能
     // 把切换入口一起收走，所以 todo 永远保留完整头部。
     int HeadH() const { return (showTitle_ || isTodo()) ? headerH_ : kHeadStripH; }
@@ -499,6 +524,13 @@ private:
     int height_ = 0;   // 展开时的高度
     int curH_ = 0;
     int targetH_ = 0;
+    // 当前的窗口宽度。左 / 右收的时候它会收到 4px，所以「窗口多宽」不能直接用
+    // width_（width_ 永远是展开态的宽度，布局全靠它）。
+    int curW_ = 0;
+    int targetW_ = 0;
+    // 收起 / 展开动画的锚点 = 展开矩形（屏幕坐标）。动画一开动窗口就在缩，
+    // 光看窗口矩形再也反推不出展开态，所以动画开始时记一份。
+    RECT animAnchor_{};
     bool collapsed_ = false;
     bool startCollapsed_ = true;   // 见 SetStartCollapsed：创建时是否允许一出生就收起
     bool autoExpanded_ = false;   // 这次展开是「悬停自动展开」造成的

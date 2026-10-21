@@ -1459,6 +1459,12 @@ enum {
     kCmdTodoEdit = 4054,               // 待办盒：改这一条的文字
     kCmdTodoDelete = 4055,             // 待办盒：删掉这一条
     kCmdMoveToGroup = 4100,   // 4100..4127：盒内图标「移动到第 N 个分组」
+    // 收缩方向：4060..4063 = 上 / 下 / 左 / 右。收起后只剩一条 4px 的把手，
+    // 方向决定这条把手停在哪一面（见 FenceWindow::collapseDir）。
+    kCmdCollapseUp = 4060,
+    kCmdCollapseDown = 4061,
+    kCmdCollapseLeft = 4062,
+    kCmdCollapseRight = 4063,
 };
 
 static void AddFenceWindow(int i, bool startCollapsed = true);
@@ -1542,7 +1548,9 @@ static void NewFenceNear(int fi, int kind = 0) {
         InheritFenceSize(w, h);
     }
     RECT base{200, 200, 200 + w, 200 + h};
-    if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) base = g_fences[fi]->rect();
+    // 用展开态矩形：盒子收着的时候窗口只是一条 4px 的把手，拿它当基准
+    // 新盒子会贴着那条把手冒出来（向下/向右收时还会直接压在人家身上）。
+    if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi]) base = g_fences[fi]->expandedRect();
 
     RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
     MONITORINFO mi{};
@@ -1701,7 +1709,7 @@ static int CreateRuleFence(const std::wstring& title) {
     RECT base{200, 200, 200 + w, 200 + h};
     for (int i = (int)g_fences.size() - 1; i >= 0; --i) {
         if (g_fences[i] && g_fences[i]->hwnd()) {
-            base = g_fences[i]->rect();
+            base = g_fences[i]->expandedRect();
             break;
         }
     }
@@ -1908,6 +1916,24 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
 
     std::vector<PopupMenuItem> items;
 
+    // ---- 收缩方向（收起后那条 4px 的把手停在哪一面）----
+    // 四个方向各一项，当前方向打勾。伸缩模式的盒子才看得出来，但「始终展开」的
+    // 盒子也可能随时切回伸缩模式，所以两种盒子都给这一项。
+    std::vector<PopupMenuItem> collapseSub;
+    {
+        static const wchar_t* kCollapseNames[] = {
+            L"\u5411\u4e0a",   // 向上
+            L"\u5411\u4e0b",   // 向下
+            L"\u5411\u5de6",   // 向左
+            L"\u5411\u53f3"};  // 向右
+        const int curDir = f->collapseDir();
+        for (int i = 0; i < 4; ++i) {
+            PopupMenuItem m(kCollapseNames[i], kCmdCollapseUp + i);
+            m.checked = (curDir == i);
+            collapseSub.push_back(std::move(m));
+        }
+    }
+
     // ---- 待办盒：右键的是「某一条待办」还是空白，先摆这一组 ----
     // item 在这里当行号用（-1 = 点在内容区空白 / 头部）。
     // 「有没有这一条」问盒子自己要（TodoRowIsItem）—— 头部切了「未完成 / 已完成」
@@ -1963,6 +1989,12 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
         }
     }
     items.push_back(PopupMenuItem::Sep());
+    {
+        // 收缩方向：收起后那条 4px 的把手贴在哪一面
+        PopupMenuItem m(L"\u6536\u7f29\u65b9\u5411", 0);   // 收缩方向
+        m.sub = std::move(collapseSub);
+        items.push_back(std::move(m));
+    }
     items.push_back(
         PopupMenuItem(L"\u6253\u5f00\u8bbe\u7f6e\u9762\u677f", kCmdSettings));  // 打开设置面板
     items.push_back(PopupMenuItem(L"\u91cd\u547d\u540d\u5206\u533a", kCmdRename));  // 重命名分区
@@ -2011,6 +2043,11 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
                 SaveIconLayout();
                 RedrawAll();
             }
+            return;
+        }
+        if (id >= kCmdCollapseUp && id <= kCmdCollapseRight) {
+            w->SetCollapseDir(id - kCmdCollapseUp);
+            RedrawAll();
             return;
         }
         if (id == kCmdNewFence) { NewFenceNear(fi, 0); return; }
@@ -2309,7 +2346,10 @@ static void AddFenceWindow(int i, bool startCollapsed) {
     f->onOpen = [](DesktopIconView* e) { OpenPath(e->path); };
     f->onGeometryChanged = [i] {
         if (i >= (int)g_fences.size()) return;
-        RECT r = g_fences[i]->rect();
+        // 用「展开态矩形」存配置：收起后窗口只是贴在一条边上的 4px 把手，
+        // rect() 拿到的是那条把手 —— 向下/向右收的时候它和盒子真实位置差着一整块，
+        // 直接存会把盒子越存越偏。
+        RECT r = g_fences[i]->expandedRect();
         // 拖动/改尺寸结束时打一行实况：避让出问题时能直接看出是「没拿到障碍」
         // 还是「拿到了但没挡住」。
         if (g_fences[i])

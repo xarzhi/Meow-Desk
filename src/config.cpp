@@ -144,7 +144,7 @@ bool ConfigFromDb(AppConfig& c) {
     {
         storage::Stmt st(
             "SELECT x,y,w,h,color,alpha,radius,acrylic,title,viewMode,sortKey,sortAsc,locked,"
-            "activeGroup,expandMode,kind FROM fence ORDER BY id");
+            "activeGroup,expandMode,kind,collapseDir FROM fence ORDER BY id");
         if (!st.ok()) return false;
         while (st.step()) {
             FenceConfig f;
@@ -164,6 +164,7 @@ bool ConfigFromDb(AppConfig& c) {
             f.activeGroup = st.colInt(13);
             f.expandMode = st.colInt(14);   // -1 = 老数据，下面 ConfigEnsureDefaults 补
             f.kind = st.colInt(15);
+            f.collapseDir = st.colInt(16);
             c.fences.push_back(std::move(f));
         }
     }
@@ -244,6 +245,11 @@ void ConfigEnsureDefaults() {
         // 于是盒子继续走伸缩模式 —— 升级不该让一个已经生效的行为悄悄失效。
         if (f.expandMode < 0 || f.expandMode > 1) {
             f.expandMode = g_config.defaultTelescope != 0 ? 0 : 1;
+            dirty = true;
+        }
+        // 收起方向：0=上 1=下 2=左 3=右。越界（老库 / 手改过的库）一律回 0。
+        if (f.collapseDir < 0 || f.collapseDir > 3) {
+            f.collapseDir = 0;
             dirty = true;
         }
     }
@@ -361,8 +367,8 @@ void AppConfig::Save() const {
 
         storage::Stmt fs(
             "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title,"
-            "viewMode,sortKey,sortAsc,locked,activeGroup,expandMode,kind)"
-            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)");
+            "viewMode,sortKey,sortAsc,locked,activeGroup,expandMode,kind,collapseDir)"
+            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)");
         for (size_t i = 0; i < fences.size() && fs.ok(); ++i) {
             const FenceConfig& c = fences[i];
             fs.bindInt(1, (int)i);
@@ -383,6 +389,7 @@ void AppConfig::Save() const {
             // -1 不许写回库里：那是「还没定过」的临时值，落盘要落一个真实选择
             fs.bindInt(16, c.expandMode == 0 ? 0 : 1);
             fs.bindInt(17, c.kind == 1 ? 1 : 0);
+            fs.bindInt(18, (c.collapseDir >= 0 && c.collapseDir <= 3) ? c.collapseDir : 0);
             ok = fs.done() && ok;
             fs.reset();
         }

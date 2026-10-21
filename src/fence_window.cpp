@@ -1001,6 +1001,15 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     dragLastY_ = dragStartRect_.top;
     dragRawX_ = dragLastX_;
     dragRawY_ = dragLastY_;
+    // 收起态拖的是那条 4px 把手，但用户心里拖的是**整个盒子**：夹取、吸附、
+    // 落盘都按展开矩形算。所以逻辑坐标改用展开矩形的左上角 ——
+    // 向下收 / 向右收的时候，把手位置和展开矩形的左上角并不是同一个点。
+    if (collapsed_) {
+        dragLastX_ = (int)animAnchor_.left;
+        dragLastY_ = (int)animAnchor_.top;
+        dragRawX_ = dragLastX_;
+        dragRawY_ = dragLastY_;
+    }
     dragging_ = false;
     itemDragging_ = false;
     pressCaptured_ = false;
@@ -1052,9 +1061,12 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
         return;
     }
 
-    if (pt.y < HeadH() && (showTitle_ || isTodo()) && !collapsed_ && pt.x > width_ - 40) {
+    // 收起态整窗就是那条把手（横的 4px 或竖的 4px），按住哪个位置都算「抓头部」：
+    // 以前这里只看 pt.y < HeadH()，横着收的盒子点中间那一段什么都拖不动。
+    const bool onHead = collapsed_ || pt.y < HeadH();
+    if (!collapsed_ && pt.y < HeadH() && (showTitle_ || isTodo()) && pt.x > width_ - 40) {
         pressArrow_ = true;
-    } else if (pt.y < HeadH()) {
+    } else if (onHead) {
         // 锁定后头部不再能拖动（不然「锁住位置」就成了空话）
         pressHeader_ = !locked();
     } else if (!collapsed_) {
@@ -1154,10 +1166,15 @@ void FenceWindow::ApplyResize(POINT screenPt) {
 
     width_ = nw;
     height_ = nh;
+    curW_ = nw;
+    targetW_ = nw;
     curH_ = nh;
     targetH_ = nh;
     dragLastX_ = l;
     dragLastY_ = t;
+    // 展开矩形跟着走：收起方向的所有位置都是从它推出来的。改尺寸时盒子必然
+    // 是展开态（收起态根本没有边可以拉），所以直接按新矩形记一份。
+    animAnchor_ = RECT{l, t, l + nw, t + nh};
     SetWindowPos(hwnd_, nullptr, l, t, nw, nh, SWP_NOZORDER | SWP_NOACTIVATE);
     // 尺寸变了，图标可能换行/换列；列宽也变了，标签和详情列缓存都得重做
     ClearSelection();
@@ -1931,7 +1948,8 @@ void FenceWindow::LocateItem(DesktopIconView* e) {
     locatePending_ = e;
     if (collapsed_ || expandMode() == 0) SetCollapsed(false);
     // 还在展开动画里：滚动量得等高度落定再算，交给 WM_TIMER
-    if (curH_ + 1 < height_) return;
+    // （左右收的盒子高度没变过，宽度才是正在长的那个）
+    if (curH_ + 1 < height_ || curW_ + 1 < width_) return;
     DoLocateNow(e);
 }
 
@@ -1972,6 +1990,60 @@ void FenceWindow::TickFlash() {
     Redraw();
 }
 
+int FenceWindow::collapseDir() const {
+    if (!cfg_) return 0;
+    return std::clamp(cfg_->collapseDir, 0, 3);
+}
+
+// 展开态的屏幕矩形。收起之后窗口只是一条贴在边上的把手，位置不等于展开态：
+//   向下收 → 把手在下边，展开矩形要往上推 height_
+//   向右收 → 把手在右边，展开矩形要往左推 width_
+// 存配置 / 算避让都得用这个，否则「收起状态的盒子被拖一下」就把配置存成一条线。
+RECT FenceWindow::expandedRect() const {
+    RECT r{};
+    if (hwnd_) GetWindowRect(hwnd_, &r);
+    if (!collapsed_) return r;
+    const int dir = collapseDir();
+    if (dir == 1) r.top = r.bottom - height_;
+    else if (dir == 0) r.bottom = r.top + height_;
+    if (dir == 3) r.left = r.right - width_;
+    else if (dir == 2) r.right = r.left + width_;
+    return r;
+}
+
+// 贴哪条边：上/左贴着锚点的左上角，下/右贴着锚点的下边/右边。
+void FenceWindow::PlaceWindowFor(int w, int h, int& x, int& y) const {
+    x = animAnchor_.left;
+    y = animAnchor_.top;
+    const int dir = collapseDir();
+    if (dir == 3) x = (int)animAnchor_.right - w;
+    else if (dir == 1) y = (int)animAnchor_.bottom - h;
+}
+
+// 换收起方向。盒子正收着的时候要立刻把那条把手挪到新的边上（展开态不变），
+// 否则用户选完「右边」还得自己等一次收放才生效。
+void FenceWindow::SetCollapseDir(int dir) {
+    if (!cfg_) return;
+    const int d = std::clamp(dir, 0, 3);
+    // 先按**旧**方向把展开矩形反推出来，再改方向
+    if (collapsed_) animAnchor_ = expandedRect();
+    if (cfg_->collapseDir == d) return;
+    cfg_->collapseDir = d;
+    if (collapsed_) {
+        curW_ = targetW_ = (d >= 2) ? kCollapsedHeadH : width_;
+        curH_ = targetH_ = (d <= 1) ? kCollapsedHeadH : height_;
+        if (hwnd_) {
+            int wx = 0, wy = 0;
+            PlaceWindowFor(curW_, curH_, wx, wy);
+            SetWindowPos(hwnd_, nullptr, wx, wy, curW_, curH_,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        hot_ = -1;
+    }
+    Redraw();
+    if (onStateChanged) onStateChanged();   // 主程序负责落盘
+}
+
 RECT FenceWindow::rect() const {
     RECT r{};
     if (hwnd_) GetWindowRect(hwnd_, &r);
@@ -1980,7 +2052,9 @@ RECT FenceWindow::rect() const {
 
 RECT FenceWindow::bodyRect() const {
     RECT r = rect();
-    // 收起后整窗只有 4px，比 HeadH() 还矮：别让 top 越过 bottom
+    // 收起后整窗就是那条把手（上/下收只有 4px 高，左/右收是 4px 宽的一整条）。
+    // 别拿 HeadH() 去切它：横着收的时候会把整条都切掉，右上角直接判成"外面"。
+    if (collapsed_) return r;
     r.top = std::min((int)r.bottom, (int)r.top + HeadH());
     return r;
 }
@@ -2189,9 +2263,17 @@ void FenceWindow::UpdateDropHint(POINT screenPt) {
         return;
     }
     RECT wr = rect();
-    // 收起后这条把手只有 4px 高，拿它当拖放入口太苛刻了：
-    // 拖着图标过来时判定范围往下放宽一点，够到就把盒子拉开展示。
-    if (collapsed_) wr.bottom += 28;
+    // 收起后这条把手只有 4px，拿它当拖放入口太苛刻了：拖着图标过来时把判定
+    // 范围往「盒子里面」那个方向放宽一点，够到就把盒子拉开展示。
+    // 放宽的方向必须跟着收起方向走 —— 向下收的把手在盒子下边，往 +y 放宽就跑到
+    // 盒子外面去了。
+    if (collapsed_) {
+        const int dir = collapseDir();
+        if (dir == 0) wr.bottom += 28;
+        else if (dir == 1) wr.top -= 28;
+        else if (dir == 2) wr.right += 28;
+        else wr.left -= 28;
+    }
     const bool inside = screenPt.x >= wr.left && screenPt.x < wr.right &&
                         screenPt.y >= wr.top && screenPt.y < wr.bottom;
 
@@ -2202,8 +2284,8 @@ void FenceWindow::UpdateDropHint(POINT screenPt) {
 
     POINT pt{screenPt.x - wr.left, screenPt.y - wr.top};
 
-    // 拖到收起盒子的头部 → 自动展开，才能看清要插到哪
-    if (collapsed_ && pt.y < HeadH()) {
+    // 拖到收起盒子的把手（判定范围已经放宽过）→ 自动展开，才能看清要插到哪
+    if (collapsed_) {
         autoExpanded_ = true;
         SetCollapsed(false);
         return;
@@ -2385,8 +2467,10 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     const int mdy = cur.y - dragLastCursor_.y;
                     if (mdx || mdy) {
                         dragLastCursor_ = cur;
-                        const int fw = (int)(dragStartRect_.right - dragStartRect_.left);
-                        // 收起时窗口只有 4px 高，位置夹取和吸附要按「展开后的大小」算，
+                        const int fw = collapsed_
+                                           ? width_
+                                           : (int)(dragStartRect_.right - dragStartRect_.left);
+                        // 收起时窗口只是一条贴边的把手，位置夹取和吸附要按「展开后的大小」算，
                         // 否则盒子能被拖到贴着屏幕底边，一展开就出屏了
                         const int fh2 =
                             collapsed_ ? height_
@@ -2419,7 +2503,17 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                         if (nx != dragLastX_ || ny != dragLastY_) {
                             dragLastX_ = nx;
                             dragLastY_ = ny;
-                            SetWindowPos(h, nullptr, nx, ny, 0, 0,
+                            int wx = nx, wy = ny;
+                            // 收起态：nx/ny 是**展开矩形**的左上角，把手贴着哪条边
+                            // 由收起方向决定，窗口位置得自己换算（不然向右收时
+                            // 把手会跟着跑到盒子的左上角去）
+                            if (collapsed_) {
+                                animAnchor_ = RECT{nx, ny, nx + width_, ny + height_};
+                                const int dir = collapseDir();
+                                if (dir == 3) wx = nx + width_ - curW_;
+                                else if (dir == 1) wy = ny + height_ - curH_;
+                            }
+                            SetWindowPos(h, nullptr, wx, wy, 0, 0,
                                          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
                             // 窗口一动，位图里的底图也得按新偏移重画一遍，
                             // 否则磨砂会「整块跟着窗口平移」（等于背景冻住了）。
@@ -2489,11 +2583,13 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
-        // 伸缩模式：收起状态下鼠标移到头部（那条 4px 把手）就展开，
+        // 伸缩模式：收起状态下鼠标移到那条 4px 把手就展开，
         // 移开整个盒子在 MOUSELEAVE 里收起。展开模式的盒子根本不收起，不必进来。
         // suppressAutoExpand_：刚手动收起时光标还压在把手上，抑制一次，
         // 否则「点了收起又立刻弹开」。
-        if (expandMode() == 0 && collapsed_ && !suppressAutoExpand_ && pt.y < HeadH()) {
+        // 判「在不在把手上」用 OnCollapsedHandle：上/下收时把手是横的 4px，
+        // 左/右收时是一整条竖的 4px，以前一律写 pt.y < HeadH() 横着收就失效了。
+        if (expandMode() == 0 && collapsed_ && !suppressAutoExpand_ && OnCollapsedHandle(pt)) {
             autoExpanded_ = true;
             SetCollapsed(false);
         }
@@ -2764,19 +2860,41 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         bool busy = false;
         bool waiting = false;   // 后台补抓还没回来：保住定时器，但这一帧不重画
 
-        // 收起/展开的高度补间
-        const int diff = targetH_ - curH_;
-        if (diff != 0) {
+        // 收起/展开的尺寸补间。宽和高都要补：上下收是高度收到 4px，
+        // 左右收是宽度收到 4px（窗口从一整块变成一条竖把手）。
+        auto tween = [](int cur, int target) {
+            const int diff = target - cur;
+            if (diff == 0) return cur;
             int step = (int)std::lround(diff * 0.35);
             if (step == 0) step = diff > 0 ? 4 : -4;
-            curH_ += step;
-            if ((diff > 0 && curH_ > targetH_) || (diff < 0 && curH_ < targetH_))
-                curH_ = targetH_;
-            busy = true;
+            int v = cur + step;
+            if ((diff > 0 && v > target) || (diff < 0 && v < target)) v = target;
+            return v;
+        };
+        {
+            const int nh = tween(curH_, targetH_);
+            const int nw = tween(curW_, targetW_);
+            if (nh != curH_ || nw != curW_) {
+                curH_ = nh;
+                curW_ = nw;
+                busy = true;
+                // 贴哪条边由收起方向决定：向下/向右收的时候，窗口位置也得跟着挪，
+                // 否则把手会一直黏在左上角
+                int wx = 0, wy = 0;
+                PlaceWindowFor(curW_, curH_, wx, wy);
+                RECT wr{};
+                if (hwnd_) GetWindowRect(hwnd_, &wr);
+                if (!hwnd_ || wr.left != wx || wr.top != wy || wr.right - wr.left != curW_ ||
+                    wr.bottom - wr.top != curH_) {
+                    if (hwnd_)
+                        SetWindowPos(hwnd_, nullptr, wx, wy, curW_, curH_,
+                                     SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
         }
 
         // 搜索「定位」：收起的盒子要先摊开才能算滚动量，所以等高度落定再做
-        if (locatePending_ && curH_ == targetH_) {
+        if (locatePending_ && curH_ == targetH_ && curW_ == targetW_) {
             DoLocateNow(locatePending_);
             busy = true;
         }
@@ -3265,12 +3383,22 @@ void FenceWindow::Paint() {
         const float headH = (float)HeadH();
         // 待办盒不看 showTitle_：它的头部是「未完成 / 已完成」，不是标题。
         // （HeadH() 也按同一条规则给高度，两处必须一致，否则头部会画到卡片外面。）
-        const float headFade =
-            (showTitle_ || isTodo())
-                ? std::clamp((float)(curH_ - kCollapsedHeadH) /
-                                 (float)std::max(1, headerH_ - kCollapsedHeadH),
-                             0.0f, 1.0f)
-                : 0.0f;
+        //
+        // 左右收的时候盒子是**横着**缩成一条 4px 的竖把手，高度一点没变 ——
+        // 只看 curH_ 的话头部会一直画着（被裁成一条竖缝）。所以宽度方向的淡出
+        // 也要算进来，取两者较小值。
+        float headFade = 0.0f;
+        if (showTitle_ || isTodo()) {
+            headFade = std::clamp((float)(curH_ - kCollapsedHeadH) /
+                                      (float)std::max(1, headerH_ - kCollapsedHeadH),
+                                  0.0f, 1.0f);
+            if (collapseDir() >= 2) {
+                const float wFade = std::clamp((float)(curW_ - kCollapsedHeadH) /
+                                                   (float)std::max(1, width_ - kCollapsedHeadH),
+                                               0.0f, 1.0f);
+                if (wFade < headFade) headFade = wFade;
+            }
+        }
         // 待办盒即使关了「显示盒子标题」也要画头部 —— 那上面是「未完成 / 已完成」
         // 两个 tab，是它唯一的切换入口。
         const bool drawHead = (showTitle_ || isTodo()) && headFade > 0.02f;
@@ -3925,7 +4053,9 @@ void FenceWindow::Redraw() {
     if (!hwnd_) return;
     // 图标数量 / 尺寸 / 盒子高度都可能刚变过，滚动位置可能已经越界
     ClampScroll();
-    EnsureBackbuffer(width_, curH_);
+    // 缓冲按「当前窗口尺寸」建：左 / 右收的时候宽度会收到 4px，
+    // 用 width_ 建会画到窗口外面（而且 Present 会带着错的尺寸去 ULW）
+    EnsureBackbuffer(curW_, curH_);
     Paint();
     Present();
 }
@@ -4064,15 +4194,18 @@ void FenceWindow::ApplyConfig(bool recapture) {
             if (expandMode() == 1) {
                 // 「始终展开」的盒子本来就没有收起入口（关掉标题后连箭头都没了），
                 // 卡在收起态就再也打不开 —— 这种盒子直接摊开。
+                animAnchor_ = expandedRect();   // 先按收起方向反推出展开矩形
                 collapsed_ = false;
-                targetH_ = height_;
-                curH_ = height_;
+                targetW_ = curW_ = width_;
+                targetH_ = curH_ = height_;
             } else {
-                targetH_ = kCollapsedHeadH;
-                curH_ = kCollapsedHeadH;
+                const int dir = collapseDir();
+                targetW_ = curW_ = (dir >= 2) ? kCollapsedHeadH : width_;
+                targetH_ = curH_ = (dir <= 1) ? kCollapsedHeadH : height_;
             }
-            RECT r = rect();
-            SetWindowPos(hwnd_, nullptr, r.left, r.top, width_, curH_,
+            int wx = 0, wy = 0;
+            PlaceWindowFor(curW_, curH_, wx, wy);
+            SetWindowPos(hwnd_, nullptr, wx, wy, curW_, curH_,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
@@ -4116,17 +4249,23 @@ bool FenceWindow::Create(int index, int x, int y, int w, int h) {
     showTitle_ = g_config.showFenceTitle != 0;
     showLabels_ = g_config.showLabels != 0;
     cellW_ = CellWForMode(cfg_->viewMode);
+    curW_ = w;
+    targetW_ = w;
     curH_ = h;
     targetH_ = h;
+    // 展开矩形就是建盒子时给的那个矩形；收起方向的所有位置都从它推出来
+    animAnchor_ = RECT{x, y, x + w, y + h};
 
     // 伸缩模式的盒子在启动时本来就该是收着的：用户点箭头切到伸缩模式的那一刻它就收了，
     // 这个状态存在 expandMode 里。以前创建时没落这个状态，得等鼠标滑过去再离开
     // （WM_MOUSELEAVE）才收 —— 看起来像是「忘了收」。
-    // 窗口直接用收起高度建出来，避免先闪一帧展开态。
+    // 窗口直接按收起尺寸建出来，避免先闪一帧展开态。上下收 = 高度收到 4px，
+    // 左右收 = 宽度收到 4px（一整条竖把手）。
     if (startCollapsed_ && expandMode() == 0) {
         collapsed_ = true;
-        curH_ = kCollapsedHeadH;
-        targetH_ = kCollapsedHeadH;
+        const int dir = collapseDir();
+        curW_ = targetW_ = (dir >= 2) ? kCollapsedHeadH : width_;
+        curH_ = targetH_ = (dir <= 1) ? kCollapsedHeadH : height_;
     }
 
     // 调试口子：MEOW_FLIP_MS=1200 可以把排序 flip 动画放慢，方便逐帧截图核对
@@ -4140,12 +4279,17 @@ bool FenceWindow::Create(int index, int x, int y, int w, int h) {
             debugHooks_ = true;
     }
 
+    // 一开始就是收起态的话，窗口得直接摆在「对应的那条边」上（向下/向右收
+    // 是贴下边/右边，不是原来的左上角）
+    int wx = x, wy = y;
+    if (collapsed_) PlaceWindowFor(curW_, curH_, wx, wy);
+
     hwnd_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                             kClass, L"meow-desk-fence", WS_POPUP,
-                            x, y, width_, curH_, nullptr, nullptr, inst, this);
+                            wx, wy, curW_, curH_, nullptr, nullptr, inst, this);
     if (!hwnd_) return false;
 
-    EnsureBackbuffer(width_, curH_);
+    EnsureBackbuffer(curW_, curH_);
     RefreshBackdrop();
     Paint();
     Present();
@@ -4174,13 +4318,25 @@ void FenceWindow::CollapseIfIdle() {
 
 void FenceWindow::SetCollapsed(bool collapsed) {
     if (collapsed_ == collapsed) return;
+    // 动画锚点 = 展开矩形：收起的这一刻窗口还是展开的，直接量；
+    // 展开时窗口已经是一条把手了，用 expandedRect() 按方向反推。
+    animAnchor_ = expandedRect();
     collapsed_ = collapsed;
     hot_ = -1;
     StopFlip();
     drop_ = DropHint{};
     // 收起 = 整块缩成一条 4px 的把手（头部一起收，不只是内容区）。
     // 以前这里是 HeadH()（只把内容区收掉，头部保持原样），用户要求头部也收。
-    targetH_ = collapsed ? kCollapsedHeadH : height_;
+    // 收哪两个方向上的尺寸由 collapseDir 决定：上下收是高度收到 4px，
+    // 左右收是宽度收到 4px（窗口变成一条和盒子等高的竖把手）。
+    const int dir = collapseDir();
+    if (collapsed) {
+        targetW_ = (dir >= 2) ? kCollapsedHeadH : width_;
+        targetH_ = (dir <= 1) ? kCollapsedHeadH : height_;
+    } else {
+        targetW_ = width_;
+        targetH_ = height_;
+    }
     if (hwnd_) SetTimer(hwnd_, kAnimTimer, 16, nullptr);
     Redraw();
 }
