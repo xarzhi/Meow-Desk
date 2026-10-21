@@ -612,7 +612,7 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
         const int rcy = cy + animDy;
         if (rowA <= 2) continue;
 
-        if (hot && !addRow) {
+        if (hot) {
             GraphicsPath hp;
             AddRoundRect(hp, RectF((float)a.rowLeft, (float)ry + 2.0f,
                                    (float)(a.rowRight - a.rowLeft), (float)a.rowH - 4.0f),
