@@ -14,16 +14,24 @@
 // 必须实现 IDropTarget，否则只能看着光标变禁止。
 namespace FileDrop {
 
+using Paths = std::vector<std::wstring>;
+
 // 在「创建窗口的那个 UI 线程」上调用一次（内部会做 OLE 初始化）。
 // 需要在 WinMain 里创建任何窗口之前调。
 void Init();
 
 // 给 hwnd 挂上拖放接收。
-// onDrop 参数：文件路径列表 + 松手时的**屏幕坐标**（调用方自己转客户端）。
-// 返回值必须是「我们真正做了什么」：DROPEFFECT_MOVE / DROPEFFECT_COPY / DROPEFFECT_NONE。
-// 这个值会回给拖放源 —— 报成 MOVE 源程序就会把原文件删掉，所以只做了复制时千万不能报 MOVE。
-void Attach(HWND hwnd,
-            std::function<DWORD(const std::vector<std::wstring>&, POINT)> onDrop);
+//
+// onDrop  ：松手。参数 = 文件路径列表 + **屏幕坐标**（调用方自己转客户端）。
+//           返回值必须是「我们真正做了什么」：MOVE / COPY / NONE，会原样回给拖放源。
+//           报成 MOVE 源程序就会把原文件删掉，所以只做了复制时千万不能报 MOVE。
+// onHover ：拖过我们的窗口时（每次鼠标移动都会调）。参数 = 路径 + 屏幕坐标 +
+//           拖放源允许的效果。返回值是我们接受的效果，NONE = 这里不收（光标变禁止）。
+//           必须便宜：这里是拖拽过程中每帧都会进的地方。
+// onLeave ：拖出我们的窗口 / 一次拖放结束（包括松手之后）。用来清高亮和落点提示。
+void Attach(HWND hwnd, std::function<DWORD(const Paths&, POINT)> onDrop,
+            std::function<DWORD(const Paths&, POINT, DWORD)> onHover = nullptr,
+            std::function<void()> onLeave = nullptr);
 
 // 窗口销毁前摘下（RevokeDragDrop）。不摘会让 OLE 一直挂着一个死窗口。
 void Detach(HWND hwnd);

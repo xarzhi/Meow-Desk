@@ -256,6 +256,17 @@ static int FenceIndexAt(POINT pt) {
     return -1;
 }
 
+// 拖拽过程中的落点判定。和 FenceIndexAt 的区别只有一条：收起态的盒子用
+// 「放宽 28px」的范围算命中 —— 否则「拖着东西移到头部就自动展开」要求用户
+// 精准压在 4px 的把手上，手感上等于这个功能不存在。
+// 松手那一步仍然用严格的 FenceIndexAt：拖过来时盒子已经展开了，不需要放宽。
+static int FenceIndexAtForDrag(POINT pt) {
+    for (size_t i = 0; i < g_fences.size(); ++i) {
+        if (g_fences[i] && g_fences[i]->HitTestForDrag(pt)) return (int)i;
+    }
+    return -1;
+}
+
 static void RedrawAll() {
     g_surface.Redraw();
     for (auto& f : g_fences) if (f) f->Redraw();
@@ -606,7 +617,7 @@ static void ClearAllDropHints() {
 
 // 拖拽过程中每帧刷新「插入缝隙线」提示
 static void UpdateAllDropHints(POINT pt) {
-    const int fi = FenceIndexAt(pt);
+    const int fi = FenceIndexAtForDrag(pt);
     // 拖着图标划过某个盒子的分组标签 → 立刻切到那个分组。
     // 盒内拖动由 FenceWindow 自己的 WM_MOUSEMOVE 处理；这里补的是「从桌面拖进来」
     // 那条路径（桌面层收不到盒子的鼠标消息）。必须先切组、再算落点，
@@ -867,6 +878,12 @@ static DWORD AcceptDroppedFiles(const std::vector<std::wstring>& paths, POINT sc
                                 int fenceIndex) {
     if (paths.empty()) return DROPEFFECT_NONE;
 
+    // 落点坐标一起记下来：「拖到回收站没反应」这种问题，有这行就能立刻分清是
+    // 「没落到我们窗口上」还是「落了但没认出目标图标」。
+    LogStep("file drop: " + std::to_string(paths.size()) + " item(s) at (" +
+            std::to_string(screenPt.x) + "," + std::to_string(screenPt.y) + ") fence=" +
+            std::to_string(fenceIndex));
+
     // 落点正压在某个图标上 → 按「放到它上面」处理，别搬进桌面：
     // 文件夹移进去、回收站删除、可执行/快捷方式用它打开（拖 .md 到 Typora）。
     if (DesktopIconView* tgt = IconAtScreen(screenPt)) {
@@ -881,8 +898,6 @@ static DWORD AcceptDroppedFiles(const std::vector<std::wstring>& paths, POINT sc
     for (auto* e : g_icons)
         if (e) before.insert(e->path);
 
-    LogStep("file drop: " + std::to_string(paths.size()) + " item(s) -> fence " +
-            std::to_string(fenceIndex));
     const DWORD done = MoveFilesInto(paths, DesktopFolderPath());
     if (done == DROPEFFECT_NONE) {
         LogStep("file drop: move/copy FAILED");
@@ -1148,6 +1163,66 @@ static bool IconAcceptsDrop(const DesktopIconView* e) {
     if (a == INVALID_FILE_ATTRIBUTES) return false;
     if ((a & FILE_ATTRIBUTE_DIRECTORY) != 0) return true;   // 文件夹：移进去
     return IsProgramTarget(e);                              // 程序：用它打开
+}
+
+// ---------------------------------------------------------------------------
+// 从别的程序（资源管理器 / 浏览器）拖东西进来时的拖拽反馈
+//
+// 以前只接了 Drop：文件其实放得下，但拖动过程中**一点动静都没有** ——
+// 盒子不展开、不出缝隙线、桌面上没有落点框，光标也不区分目标。
+// 用户看到的就是「拖过去完全没反应」，于是以为整条路都不通。
+// 这里把内部拖拽那套提示原样接过来（同一批函数，保证两种拖拽手感一致）：
+//   · 盒子       → 收起态在把手上自动展开，出现插入缝隙线 / 目标图标高亮
+//   · 桌面空地   → 整格落点预览框
+//   · 桌面图标   → 认路的（回收站 / 文件夹 / 程序）在它自己那格标出来，
+//                 不认的画「插到它左/右边」的竖向缝隙线
+// ---------------------------------------------------------------------------
+static void ExternalDragLeave() {
+    ClearAllDropHints();
+    g_surface.SetDropPreview(false);
+    g_surface.SetDropSeam(false, 0, 0, 0);
+}
+
+static DWORD ExternalDragHover(const std::vector<std::wstring>& paths, POINT pt) {
+    if (paths.empty()) return DROPEFFECT_NONE;
+
+    const int fi = FenceIndexAtForDrag(pt);
+    UpdateAllDropHints(pt);   // 收起的盒子就是在这一句里被拉开的
+
+    // 待办盒不收文件（它只收我们自己拖进去的图标）：光标直接给「禁止」
+    if (fi >= 0 && fi < (int)g_fences.size() && g_fences[fi] && g_fences[fi]->isTodo()) {
+        g_surface.SetDropPreview(false);
+        g_surface.SetDropSeam(false, 0, 0, 0);
+        return DROPEFFECT_NONE;
+    }
+
+    if (fi >= 0) {
+        // 盒子里面：缝隙线 / 目标高亮由盒子自己画，桌面层别抢
+        g_surface.SetDropPreview(false);
+        g_surface.SetDropSeam(false, 0, 0, 0);
+        return DROPEFFECT_COPY | DROPEFFECT_MOVE;
+    }
+
+    DesktopIconView* tgt = g_surface.ItemAtScreen(pt);
+    if (tgt && IconAcceptsDrop(tgt)) {
+        // 回收站 / 文件夹 / 程序：落点框画在**它自己那格**上，
+        // 告诉用户「松手是作用在这个图标身上」，不是插到它旁边
+        g_surface.SetDropSeam(false, 0, 0, 0);
+        g_surface.SetDropPreview(true, tgt->pos);
+        return DROPEFFECT_COPY | DROPEFFECT_MOVE;
+    }
+    if (tgt) {
+        // 普通文件图标：和内部拖拽一致，画竖向缝隙线
+        const bool left = pt.x < tgt->pos.x + g_cellW / 2;
+        const int sx = left ? tgt->pos.x : tgt->pos.x + g_cellW;
+        g_surface.SetDropPreview(false);
+        g_surface.SetDropSeam(true, sx, tgt->pos.y, g_cellH);
+        return DROPEFFECT_COPY | DROPEFFECT_MOVE;
+    }
+
+    g_surface.SetDropSeam(false, 0, 0, 0);
+    g_surface.SetDropPreview(true, g_surface.CellForCursor(pt, nullptr));
+    return DROPEFFECT_COPY | DROPEFFECT_MOVE;
 }
 
 // ---------------------------------------------------------------------------
@@ -2842,16 +2917,23 @@ static void AddFenceWindow(int i, bool startCollapsed) {
         // 从资源管理器拖文件到盒子上 → 收进这个盒子（和拖我们自己的图标一致）。
         // 捕获 hwnd 而不是下标：盒子增删都会让下标变，拿 hwnd 反查永远是对的。
         const HWND fh = g_fences[i]->hwnd();
-        FileDrop::Attach(fh, [fh](const std::vector<std::wstring>& paths, POINT pt) -> DWORD {
-            int fi = -1;
-            for (size_t k = 0; k < g_fences.size(); ++k) {
-                if (g_fences[k] && g_fences[k]->hwnd() == fh) {
-                    fi = (int)k;
-                    break;
+        // 拖拽过程中也要有反馈（盒子展开 / 缝隙线 / 落点框），不然拖过去像没反应
+        FileDrop::Attach(
+            fh,
+            [fh](const std::vector<std::wstring>& paths, POINT pt) -> DWORD {
+                int fi = -1;
+                for (size_t k = 0; k < g_fences.size(); ++k) {
+                    if (g_fences[k] && g_fences[k]->hwnd() == fh) {
+                        fi = (int)k;
+                        break;
+                    }
                 }
-            }
-            return AcceptDroppedFiles(paths, pt, fi);
-        });
+                return AcceptDroppedFiles(paths, pt, fi);
+            },
+            [](const std::vector<std::wstring>& paths, POINT pt, DWORD) -> DWORD {
+                return ExternalDragHover(paths, pt);
+            },
+            [] { ExternalDragLeave(); });
     }
 }
 
@@ -3317,10 +3399,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         InstallKeepAbove(g_surface.hwnd(), [] { return SurfaceAnchor(); });
         PlaceAbove(g_surface.hwnd(), SurfaceAnchor());
         // 接受从资源管理器 / 浏览器拖过来的文件（落点是桌面 → 收进桌面）
-        FileDrop::Attach(g_surface.hwnd(),
-                         [](const std::vector<std::wstring>& paths, POINT pt) -> DWORD {
-                             return AcceptDroppedFiles(paths, pt, -1);
-                         });
+        FileDrop::Attach(
+            g_surface.hwnd(),
+            [](const std::vector<std::wstring>& paths, POINT pt) -> DWORD {
+                return AcceptDroppedFiles(paths, pt, -1);
+            },
+            [](const std::vector<std::wstring>& paths, POINT pt, DWORD) -> DWORD {
+                return ExternalDragHover(paths, pt);
+            },
+            [] { ExternalDragLeave(); });
         LogStep("surface created");
     }
     // 桌面层建好 = 画布窗口名单可以发布了（盒子稍后 AddFenceWindow 会继续追加）

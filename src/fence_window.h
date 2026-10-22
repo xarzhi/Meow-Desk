@@ -159,6 +159,13 @@ public:
     // 屏幕坐标是否落在盒子矩形内（含收起后的头部）
     bool HitTest(POINT screenPt) const;
 
+    // 拖拽专用的命中范围：和 HitTest 一样，但收起态那条 4px 把手会往盒子里面
+    // 放宽一圈（28px）。拖着一批图标/文件过来时，要求精准压在那 4px 上才能
+    // 「移到头部自动展开」，实际做不到 —— 手感上等于不响应。
+    // 几何和 UpdateDropHint 内部那份必须一致，所以都从这里取。
+    bool HitTestForDrag(POINT screenPt) const;
+    RECT DragHitRect() const;
+
     // 伸缩模式下「光标已经不在盒子里了就把盒子收起来」。
     // WM_MOUSELEAVE 靠不住的地方（拖拽期间鼠标被别的窗口 SetCapture 走）由它兜底，
     // 也挂在 kIdleTimer 上每 200ms 自查一次。正在拖拽 / 拉尺寸 / 右键菜单 / 改名时不动。

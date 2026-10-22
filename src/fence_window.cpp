@@ -2318,6 +2318,28 @@ bool FenceWindow::HitTest(POINT screenPt) const {
            screenPt.y >= r.top && screenPt.y < r.bottom;
 }
 
+// 拖拽时的命中范围。收起态整窗就是一条 4px 把手，拿它当拖放入口太苛刻了：
+// 拖着东西过来时把判定范围往「盒子里面」那个方向放宽一点，够到就把盒子拉开展示。
+// 放宽的方向必须跟着收起方向走 —— 向下收的把手在盒子下边，往 +y 放宽就跑到
+// 盒子外面去了。
+RECT FenceWindow::DragHitRect() const {
+    RECT wr = rect();
+    if (!collapsed_) return wr;
+    const int dir = collapseDir();
+    if (dir == 0) wr.bottom += 28;
+    else if (dir == 1) wr.top -= 28;
+    else if (dir == 2) wr.right += 28;
+    else wr.left -= 28;
+    return wr;
+}
+
+bool FenceWindow::HitTestForDrag(POINT screenPt) const {
+    if (!hwnd_) return false;
+    const RECT r = DragHitRect();
+    return screenPt.x >= r.left && screenPt.x < r.right &&
+           screenPt.y >= r.top && screenPt.y < r.bottom;
+}
+
 // ---------------------------------------------------------------------------
 // 拖动定位：屏幕边硬夹 + 别的盒子「磁吸」
 //
@@ -2514,18 +2536,7 @@ void FenceWindow::UpdateDropHint(POINT screenPt) {
         ClearDropHint();
         return;
     }
-    RECT wr = rect();
-    // 收起后这条把手只有 4px，拿它当拖放入口太苛刻了：拖着图标过来时把判定
-    // 范围往「盒子里面」那个方向放宽一点，够到就把盒子拉开展示。
-    // 放宽的方向必须跟着收起方向走 —— 向下收的把手在盒子下边，往 +y 放宽就跑到
-    // 盒子外面去了。
-    if (collapsed_) {
-        const int dir = collapseDir();
-        if (dir == 0) wr.bottom += 28;
-        else if (dir == 1) wr.top -= 28;
-        else if (dir == 2) wr.right += 28;
-        else wr.left -= 28;
-    }
+    RECT wr = DragHitRect();
     const bool inside = screenPt.x >= wr.left && screenPt.x < wr.right &&
                         screenPt.y >= wr.top && screenPt.y < wr.bottom;
 

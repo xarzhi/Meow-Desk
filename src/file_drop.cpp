@@ -13,7 +13,9 @@ class DropTarget : public IDropTarget {
 public:
     explicit DropTarget(HWND h) : hwnd_(h) {}
 
-    std::function<DWORD(const std::vector<std::wstring>&, POINT)> onDrop;
+    std::function<DWORD(const FileDrop::Paths&, POINT)> onDrop;
+    std::function<DWORD(const FileDrop::Paths&, POINT, DWORD)> onHover;
+    std::function<void()> onLeave;
 
     // ---- IUnknown ----
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
@@ -34,40 +36,53 @@ public:
     }
 
     // ---- IDropTarget ----
-    STDMETHODIMP DragEnter(IDataObject* obj, DWORD, POINTL, DWORD* effect) override {
-        canDrop_ = HasHdrop(obj);
-        if (effect) *effect = canDrop_ ? Allowed(*effect) : DROPEFFECT_NONE;
+    STDMETHODIMP DragEnter(IDataObject* obj, DWORD, POINTL pt, DWORD* effect) override {
+        // 路径只在进入时读一次：DragOver 是每次鼠标移动都来，里面还去
+        // GetData + DragQueryFile 的话，拖拽期间会一直卡在数据提取上。
+        paths_ = ReadHdrop(obj);
+        canDrop_ = !paths_.empty();
+        if (effect) *effect = Hover(pt, *effect);
         return S_OK;
     }
-    STDMETHODIMP DragOver(DWORD, POINTL, DWORD* effect) override {
-        if (effect) *effect = canDrop_ ? Allowed(*effect) : DROPEFFECT_NONE;
+    STDMETHODIMP DragOver(DWORD, POINTL pt, DWORD* effect) override {
+        if (effect) *effect = Hover(pt, *effect);
         return S_OK;
     }
     STDMETHODIMP DragLeave() override {
         canDrop_ = false;
+        paths_.clear();
+        if (onLeave) onLeave();
         return S_OK;
     }
     STDMETHODIMP Drop(IDataObject* obj, DWORD, POINTL pt, DWORD* effect) override {
-        std::vector<std::wstring> paths = ReadHdrop(obj);
+        FileDrop::Paths paths = ReadHdrop(obj);
+        if (paths.empty()) paths = paths_;
         canDrop_ = false;
-        if (paths.empty()) {
-            if (effect) *effect = DROPEFFECT_NONE;
-            return S_OK;
-        }
-        if (onDrop) {
-            // 落点自己决定「实际做了什么」，原样回报给拖放源。
-            // 报错后果很严重：明明只复制了却报 MOVE，源程序会把原文件删掉。
-            const DWORD done = onDrop(paths, POINT{pt.x, pt.y});
-            if (effect) *effect = (done == DROPEFFECT_MOVE || done == DROPEFFECT_COPY)
-                                     ? done
-                                     : DROPEFFECT_NONE;
-        } else if (effect) {
-            *effect = DROPEFFECT_NONE;
-        }
+        paths_.clear();
+        DWORD done = DROPEFFECT_NONE;
+        if (!paths.empty() && onDrop) done = onDrop(paths, POINT{pt.x, pt.y});
+        // 高亮/落点提示一定要在动作做完之后收掉，中途收掉的话
+        // 「文件正在搬」那一瞬间会闪一下空白桌面。
+        if (onLeave) onLeave();
+        if (effect) *effect = (done == DROPEFFECT_MOVE || done == DROPEFFECT_COPY)
+                                 ? done
+                                 : DROPEFFECT_NONE;
         return S_OK;
     }
 
 private:
+    // 问调用方「这儿收不收」，并把结果夹到拖放源允许的范围里。
+    // 夹这一步不能省：源只允许 COPY 时我们回 MOVE，Explorer 会不认这次放下。
+    DWORD Hover(POINTL pt, DWORD in) {
+        if (!canDrop_) return DROPEFFECT_NONE;
+        const DWORD allowed = Allowed(in);
+        if (!onHover) return allowed;
+        const DWORD want = onHover(paths_, POINT{pt.x, pt.y}, allowed);
+        if (want == DROPEFFECT_NONE) return DROPEFFECT_NONE;
+        const DWORD both = want & allowed;
+        return both ? both : allowed;
+    }
+
     // 源允许什么我们就报什么；一个都不允许就报「复制或移动」，让光标至少能正常显示
     static DWORD Allowed(DWORD in) {
         const DWORD ok = in & (DROPEFFECT_COPY | DROPEFFECT_MOVE);
@@ -84,14 +99,8 @@ private:
         return f;
     }
 
-    static bool HasHdrop(IDataObject* obj) {
-        if (!obj) return false;
-        FORMATETC f = HdropFormat();
-        return obj->QueryGetData(&f) == S_OK;
-    }
-
-    static std::vector<std::wstring> ReadHdrop(IDataObject* obj) {
-        std::vector<std::wstring> out;
+    static FileDrop::Paths ReadHdrop(IDataObject* obj) {
+        FileDrop::Paths out;
         if (!obj) return out;
 
         FORMATETC f = HdropFormat();
@@ -121,6 +130,7 @@ private:
     LONG ref_ = 1;   // 表里持有一份引用
     HWND hwnd_ = nullptr;
     bool canDrop_ = false;
+    FileDrop::Paths paths_;   // DragEnter 时读一次，DragOver 复用
 };
 
 // hwnd → target。窗口销毁时必须 Detach，否则 OLE 还挂着死窗口。
@@ -135,14 +145,20 @@ void FileDrop::Init() {
     OleInitialize(nullptr);
 }
 
-void FileDrop::Attach(HWND hwnd,
-                      std::function<DWORD(const std::vector<std::wstring>&, POINT)> onDrop) {
+void FileDrop::Attach(HWND hwnd, std::function<DWORD(const Paths&, POINT)> onDrop,
+                      std::function<DWORD(const Paths&, POINT, DWORD)> onHover,
+                      std::function<void()> onLeave) {
     if (!hwnd) return;
     Detach(hwnd);
 
     auto* t = new DropTarget(hwnd);
     t->onDrop = std::move(onDrop);
+    t->onHover = std::move(onHover);
+    t->onLeave = std::move(onLeave);
     if (FAILED(RegisterDragDrop(hwnd, t))) {
+        // 注册失败就是「这个窗口彻底不收拖放」，症状极易被误认成「拖过去没反应」，
+        // 所以一定要留痕。
+        OutputDebugStringW(L"[meow-desk] RegisterDragDrop FAILED\n");
         t->Release();
         return;
     }
