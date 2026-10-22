@@ -168,6 +168,9 @@ set_property(TARGET meow-desk PROPERTY
 
 target_link_libraries(meow-desk PRIVATE
     gdiplus user32 gdi32 shell32 ole32 shlwapi dwmapi comctl32 msimg32 uxtheme imm32
+    # 开机自启 = 登录触发的计划任务（ITaskService）；BSTR 走 oleaut32，
+    # OpenProcessToken / ConvertSidToStringSidW 走 advapi32
+    taskschd oleaut32 advapi32
 )
 
 target_compile_definitions(meow-desk PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)

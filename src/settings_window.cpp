@@ -614,7 +614,10 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         g.DrawString(L"\u5f00\u673a\u81ea\u542f", -1, &fBody,
                      RectF((float)kRowLeft, (float)(rcAutoStart_.top - 10), 320.0f, 26.0f),
                      &sf, &brText);
-        g.DrawString(L"\u767b\u5f55 Windows \u540e\u81ea\u52a8\u542f\u52a8", -1, &fSub,
+        // 「登录时立即启动」——不是老的 Run 键（那个要等 Explorer 按顺序跑完
+        // 一串启动项才轮到我们）。实现见 main.cpp 的 TaskRegister。
+        g.DrawString(L"\u767b\u5f55\u65f6\u5c3d\u65e9\u542f\u52a8\uff08\u8ba1\u5212\u4efb\u52a1\uff09",
+                     -1, &fSub,
                      RectF((float)kRowLeft, (float)(rcAutoStart_.top + 12), 340.0f, 16.0f),
                      &sf, &brSub);
         {
@@ -625,7 +628,10 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         g.DrawString(L"\u9ad8\u4f18\u5148\u7ea7\u8fd0\u884c", -1, &fBody,
                      RectF((float)kRowLeft, (float)(rcHighPriority_.top - 10), 320.0f, 26.0f),
                      &sf, &brText);
-        g.DrawString(L"\u684c\u9762\u91cd\u7ed8\u66f4\u8ddf\u624b\uff0c\u6ee1\u8f7d\u65f6\u4e0d\u6613\u6389\u5e27",
+        // 除了进程自己的优先级类，这个开关还会写进自启计划的 Priority ——
+        // 任务计划默认是 BELOW_NORMAL，开机那会儿根本抢不过别的启动项。
+        g.DrawString(L"\u684c\u9762\u91cd\u7ed8\u66f4\u8ddf\u624b\uff0c\u81ea\u542f\u4e5f\u66f4\u65e9\u88ab"
+                     L"\u8c03\u5ea6",
                      -1, &fSub,
                      RectF((float)kRowLeft, (float)(rcHighPriority_.top + 12), 340.0f, 16.0f),
                      &sf, &brSub);
