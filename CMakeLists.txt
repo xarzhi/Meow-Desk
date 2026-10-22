@@ -127,6 +127,7 @@ add_executable(meow-desk WIN32
     src/rename_box.cpp
     src/rename_dialog.cpp
     src/shell_drag.cpp
+    src/shell_open.cpp
     src/app_icon.cpp
     src/icon_font.cpp
     # exe 图标 / 关于页 logo / 设置页图标字体（见 res/app_res.h）

@@ -27,6 +27,7 @@
 #include "settings_window.h"
 #include "shell_drag.h"
 #include "shell_icons.h"
+#include "shell_open.h"
 #include "storage.h"
 #include "thumb_loader.h"
 #include "tray.h"
@@ -188,10 +189,10 @@ static std::string Narrow(const std::wstring& w) {
 
 static void OpenPath(const std::wstring& path) {
     if (path.empty()) return;
-    const HINSTANCE r =
-        ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    // ShellExecute 的返回值 <= 32 就是失败码（SE_ERR_*），排障时很有用
-    const INT_PTR rc = reinterpret_cast<INT_PTR>(r);
+    // 走 shell_open：直接把无扩展名的路径丢给 ShellExecute，它会按 PATHEXT 补成 .exe
+    // 去跑同名程序（双击 show-your-key 文件夹打开 show-your-key.exe 就是这么来的）。
+    const INT_PTR rc = shell_open::Open(path);
+    // 返回值 <= 32 就是失败码（SE_ERR_*），排障时很有用
     if (rc <= 32) {
         LogStep("open failed rc=" + std::to_string((long long)rc) + " " + Narrow(path));
     } else {

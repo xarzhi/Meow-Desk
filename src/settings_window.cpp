@@ -16,6 +16,7 @@
 #include "icon_font.h"
 #include "icon_render.h"
 #include "screen_util.h"
+#include "shell_open.h"
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -1411,8 +1412,9 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == ID_OPENFOLDER) {
-            ShellExecuteW(nullptr, L"open", AppConfig::Dir().c_str(), nullptr, nullptr,
-                          SW_SHOWNORMAL);
+            // 便携模式下 Dir() 就是 exe 所在目录，而目录名和主程序同名（meow-desk / MeowDesk.exe）
+            // —— 直接 ShellExecute 这个路径会被补成 .exe，等于又启动一个自己。
+            shell_open::Open(AppConfig::Dir());
             return 0;
         }
         if (id == ID_BG_SOLID || id == ID_BG_TRANS || id == ID_BG_ACRYLIC ||
