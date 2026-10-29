@@ -172,6 +172,17 @@ LRESULT CALLBACK SearchWindow::EditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT
         case VK_RETURN:
             self->Activate();
             return 0;
+        case VK_SPACE:
+            // 空格和回车一样，直接打开当前选中的那一项（用户要求）。
+            // 只在**有结果**时拦下来：没结果时空格照常打进搜索框。
+            // 对搜索本身几乎没有影响 —— Filter() 打分走的是 StripSeparators()
+            // 之后的串，空格和连字符本来就被忽略，「visual studio」和
+            // 「visualstudio」命中同一批结果。真要还原成「空格只输入」，删掉这一支即可。
+            if (!self->hits_.empty()) {
+                self->Activate();
+                return 0;
+            }
+            break;
         case VK_UP:
             self->MoveSel(-1);
             return 0;
@@ -648,6 +659,11 @@ LRESULT SearchWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (hot != hot_ || hotLoc != hotLoc_) {
             hot_ = hot;
             hotLoc_ = hotLoc;
+            // 悬停即选中。以前这里只改 hot_，sel_ 还停在键盘上次拨到的那一项 ——
+            // 鼠标指着第 5 项按回车/空格，打开的却是第 1 项，
+            // 用户看到的现象就是「快捷键打开的项不是我高亮的那项」。
+            // 回车的语义一律以 sel_ 为准，所以悬停时必须把它同步过来。
+            if (hot >= 0 && hot < (int)hits_.size()) sel_ = hot;
             Repaint();
         }
         return 0;
