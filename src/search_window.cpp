@@ -172,17 +172,6 @@ LRESULT CALLBACK SearchWindow::EditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT
         case VK_RETURN:
             self->Activate();
             return 0;
-        case VK_SPACE:
-            // 空格和回车一样，直接打开当前选中的那一项（用户要求）。
-            // 只在**有结果**时拦下来：没结果时空格照常打进搜索框。
-            // 对搜索本身几乎没有影响 —— Filter() 打分走的是 StripSeparators()
-            // 之后的串，空格和连字符本来就被忽略，「visual studio」和
-            // 「visualstudio」命中同一批结果。真要还原成「空格只输入」，删掉这一支即可。
-            if (!self->hits_.empty()) {
-                self->Activate();
-                return 0;
-            }
-            break;
         case VK_UP:
             self->MoveSel(-1);
             return 0;
