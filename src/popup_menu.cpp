@@ -7,7 +7,6 @@
 #include <cstring>
 #include <cwchar>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <windowsx.h>
@@ -79,15 +78,27 @@ void AddRoundRect(GraphicsPath& p, const RectF& r, float rad) {
 }
 
 // ---------------------------------------------------------------------------
-// 菜单文字：GDI 栅格化
+// 菜单文字：GDI + ClearType，直接画在缓冲上
 //
-// 以前菜单项走 GDI+ 的 Graphics::DrawString。13px 的汉字在 GDI+ 自己的光栅器里
-// 会被摆到半像素位置上，笔画摊开成两层淡影 —— 用户说的「右键菜单里的文字有点发虚」
-// 就是它。图标标题、待办条目、头部标签走的是 GDI + 灰度抗锯齿，同样的字号实得多，
-// 这里统一成同一条路：GDI 画进一张预乘 DIB，再直接合成到缓冲上。
+// 这条走了三版，记一下为什么最后是它：
 //
-// 为什么不用 ClearType：菜单是分层窗口（per-pixel alpha），ClearType 会在
-// 半透明像素上出彩色边。
+//   v1 GDI+ Graphics::DrawString —— 「有点发虚」。GDI+ 有自己的光栅器，
+//      13px 汉字被摆到半像素位置，一条竖笔摊成两层淡影。
+//   v2 LabelDib（黑底画白字 → 亮度当 alpha → 预乘合成）—— 峰值够了但整体发灰。
+//      这套遮罩只有灰度，13px 中文的笔画太细，峰值压在 ~60% 上，整片灰乎乎
+//      加 1~2px 晕边，用户原话「像用水笔写完字又用手涂抹了一样」。
+//      （离线复现同条件：墨迹里只有 32% 的像素达到接近纯黑。）
+//   v3 现在：菜单卡片是**不透明**的（bg alpha = 255），可以直接用 ClearType
+//      在真实底色上画字 —— 笔画实心、边缘用亚像素锐化，和系统菜单同一档
+//      （离线同条件对比：深墨占比 32% → 42%）。
+//
+// 两个前提，任一不成立就必须退回 v2：
+//   1. 文字盒必须完全落在卡片的**不透明区**内。菜单项左边从 kPadL-4 = 26 起、
+//      上下各留 (kItemH - 行高)/2 ≈ 6，都比圆角半径 kRound = 8 大，所以碰不到
+//      圆角，也不会压到阴影。改 kPadL / kItemH / kRound 时要重新核一遍。
+//   2. GDI 画完要把这一块的 alpha 补回 255。实测 GDI 在 32bpp DIB 上画字会把
+//      墨迹像素的 alpha 写成 0（minA = 0），不补的话分层窗口上那块直接变
+//      透明空洞 —— 文字成了一个个白洞。
 // ---------------------------------------------------------------------------
 const int kTextPx = 13;
 
@@ -97,14 +108,29 @@ HFONT MenuFont() {
     LOGFONTW lf{};
     lf.lfHeight = -kTextPx;
     lf.lfWeight = FW_NORMAL;
-    lf.lfQuality = ANTIALIASED_QUALITY;
+    // 只有这里的 ClearType 是安全的：目标是不透明卡片。
+    // 图标标题压在壁纸上半透明，那边仍走 ANTIALIASED（见 icon_render.cpp）。
+    lf.lfQuality = CLEARTYPE_QUALITY;
     lstrcpynW(lf.lfFaceName, L"Microsoft YaHei UI", LF_FACESIZE);
     f = CreateFontIndirectW(&lf);
     return f;
 }
 
-// 行高（tmHeight）。LabelDib 里 DrawTextW 是 DT_TOP，
-// 「文字盒高度给行高，再按 (行高 - 文字高)/2 贴」就是垂直居中。
+int MenuTextWidth(const std::wstring& s) {
+    if (s.empty()) return 0;
+    HDC dc = GetDC(nullptr);
+    if (!dc) return (int)s.size() * (kTextPx / 2);
+    HGDIOBJ old = SelectObject(dc, MenuFont());
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, s.c_str(), (int)s.size(), &sz);
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
+    return sz.cx;
+}
+
+// 行高（tmHeight）。文字盒按「行高」给，再按 (kItemH - 行高)/2 往下让，
+// 就是行内垂直居中 —— 和上一版（LabelDib）的算法一致，
+// 换栅格化方式时文字位置不会跟着跳一行。
 int MenuFontHeight() {
     static int h = 0;
     if (h) return h;
@@ -120,52 +146,28 @@ int MenuFontHeight() {
     return h;
 }
 
-int MenuTextWidth(const std::wstring& s) {
-    if (s.empty()) return 0;
-    HDC dc = GetDC(nullptr);
-    if (!dc) return (int)s.size() * (kTextPx / 2);
-    HGDIOBJ old = SelectObject(dc, MenuFont());
-    SIZE sz{};
-    GetTextExtentPoint32W(dc, s.c_str(), (int)s.size(), &sz);
-    SelectObject(dc, old);
-    ReleaseDC(nullptr, dc);
-    return sz.cx;
-}
-
-// 一张菜单项文字的 DIB。key 里必须带齐「文字 + 最宽 + 颜色」——
-// 少带一个就会出现「换主题后文字还是旧颜色」这类穿越 bug（和 LabelOf 一个道理）。
-// 菜单开着时鼠标每划过一项就重画一次，十几项全量重建 DIB 太浪费，所以缓存。
-LabelDib* MenuText(const std::wstring& text, int maxW, COLORREF color) {
-    if (text.empty() || maxW <= 8) return nullptr;
-    static std::unordered_map<std::wstring, LabelDib> cache;
-
-    std::wstring key = text;
-    key += L'\x1';
-    key += std::to_wstring(maxW);
-    key += L'c';
-    key += std::to_wstring((unsigned)color);
-
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second.valid() ? &it->second : nullptr;
-    if (cache.size() > 512) cache.clear();
-
-    LabelDib d;
-    // glow = 0：卡片自己有底色，不需要黑描边（图标标题需要是因为它压在壁纸上）。
-    // maxLines = 1：菜单项就是一行，超宽由 LabelDib 自己打省略号。
-    if (!d.Build(text, MenuFont(), maxW, MenuFontHeight(), 0, color, 1)) {
-        cache.insert_or_assign(key, LabelDib{});   // 缓存失败结果，别每次重试
-        return nullptr;
+// GDI 画字会把这一块像素的 alpha 清成 0，画完必须整块补回 255。
+// 只补文字盒：它整个落在卡片的不透明区内，这些像素本来就该是 255，
+// 所以「无条件设 255」不会改坏任何东西。
+void RestoreAlpha(void* bits, int bufW, int bufH, const RECT& r) {
+    if (!bits || bufW <= 0 || bufH <= 0) return;
+    const int x0 = (std::max)(0, (int)r.left);
+    const int x1 = (std::min)(bufW, (int)r.right);
+    const int y0 = (std::max)(0, (int)r.top);
+    const int y1 = (std::min)(bufH, (int)r.bottom);
+    auto* p = reinterpret_cast<BYTE*>(bits);
+    for (int y = y0; y < y1; ++y) {
+        BYTE* row = p + (size_t)y * bufW * 4;
+        for (int x = x0; x < x1; ++x) row[x * 4 + 3] = 255;
     }
-    auto r = cache.insert_or_assign(key, std::move(d));
-    return &r.first->second;
 }
 
-// GDI+ 的 ARGB → GDI 的 COLORREF（LabelDib 只认 COLORREF）
+// GDI+ 的 ARGB → GDI 的 COLORREF
 COLORREF FromArgb(ARGB c) {
     return RGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
 }
 
-// GDI+ 块里只记账，等 Flush 完再统一贴（GDI 不认 GDI+ 的延迟绘制）
+// GDI+ 块里只记账，等 Flush 完再统一画（GDI 不认 GDI+ 的延迟绘制）
 struct MenuTextOut {
     const std::wstring* text;
     COLORREF color;
@@ -352,18 +354,25 @@ void PopupMenu::Paint() {
         g.Flush(FlushIntentionSync);
     }
 
-    // GDI 文字：预先乘好的字形遮罩，直接合成进 bits_。
-    // LabelDib 内部是 DT_CENTER，但它自己会把宽度收窄到「实测文字宽 + 2」，
-    // 所以贴的时候只要对齐左边界，看起来就是左对齐。
-    BYTE* dst = reinterpret_cast<BYTE*>(bits_);
+    // GDI 文字：ClearType 直接画在缓冲上（为什么不用 LabelDib 抠 alpha，
+    // 见 MenuFont 上面那段注释）。必须在 GDI+ 全部出作用域之后，
+    // 否则 GDI 写进去的像素会被 GDI+ 的延迟绘制盖掉。
+    HGDIOBJ oldFont = SelectObject(memDC_, MenuFont());
+    const int oldMode = SetBkMode(memDC_, TRANSPARENT);
     for (const auto& t : textOut) {
-        LabelDib* lab = MenuText(*t.text, t.maxW, t.color);
-        if (!lab || !lab->valid()) continue;
-        const int ch = lab->h - lab->pad * 2;                 // 实际文字高 = 行高
-        const int y = t.boxTop + (kItemH - ch) / 2;           // 行内垂直居中
-        BlendInto(dst, bufW_, bufH_, reinterpret_cast<const BYTE*>(lab->bits), lab->w,
-                  lab->h, t.boxLeft - lab->pad, y - lab->pad);
+        SetTextColor(memDC_, t.color);
+        // 自己算垂直位置而不用 DT_VCENTER：DT_VCENTER 的取整和上一版
+        // 的 (kItemH - 行高)/2 可能差 1px，换了栅格化方式不该让字跟着上下跳。
+        const int ch = MenuFontHeight();
+        const int top = t.boxTop + (kItemH - ch) / 2;
+        RECT rc{t.boxLeft, top, t.boxLeft + t.maxW, top + ch};
+        // 超宽靠 DT_END_ELLIPSIS（以前是 LabelDib 自己打省略号）
+        DrawTextW(memDC_, t.text->c_str(), -1, &rc,
+                  DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        RestoreAlpha(bits_, bufW_, bufH_, rc);
     }
+    SetBkMode(memDC_, oldMode);
+    SelectObject(memDC_, oldFont);
 }
 
 void PopupMenu::Present() {
