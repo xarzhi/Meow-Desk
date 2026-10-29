@@ -6,6 +6,9 @@
 #include <cmath>
 #include <cstring>
 #include <cwchar>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #include <windowsx.h>
 
@@ -75,6 +78,102 @@ void AddRoundRect(GraphicsPath& p, const RectF& r, float rad) {
     p.CloseFigure();
 }
 
+// ---------------------------------------------------------------------------
+// 菜单文字：GDI 栅格化
+//
+// 以前菜单项走 GDI+ 的 Graphics::DrawString。13px 的汉字在 GDI+ 自己的光栅器里
+// 会被摆到半像素位置上，笔画摊开成两层淡影 —— 用户说的「右键菜单里的文字有点发虚」
+// 就是它。图标标题、待办条目、头部标签走的是 GDI + 灰度抗锯齿，同样的字号实得多，
+// 这里统一成同一条路：GDI 画进一张预乘 DIB，再直接合成到缓冲上。
+//
+// 为什么不用 ClearType：菜单是分层窗口（per-pixel alpha），ClearType 会在
+// 半透明像素上出彩色边。
+// ---------------------------------------------------------------------------
+const int kTextPx = 13;
+
+HFONT MenuFont() {
+    static HFONT f = nullptr;
+    if (f) return f;
+    LOGFONTW lf{};
+    lf.lfHeight = -kTextPx;
+    lf.lfWeight = FW_NORMAL;
+    lf.lfQuality = ANTIALIASED_QUALITY;
+    lstrcpynW(lf.lfFaceName, L"Microsoft YaHei UI", LF_FACESIZE);
+    f = CreateFontIndirectW(&lf);
+    return f;
+}
+
+// 行高（tmHeight）。LabelDib 里 DrawTextW 是 DT_TOP，
+// 「文字盒高度给行高，再按 (行高 - 文字高)/2 贴」就是垂直居中。
+int MenuFontHeight() {
+    static int h = 0;
+    if (h) return h;
+    h = kTextPx + 2;
+    HDC dc = GetDC(nullptr);
+    if (dc) {
+        HGDIOBJ old = SelectObject(dc, MenuFont());
+        TEXTMETRICW tm{};
+        if (GetTextMetricsW(dc, &tm)) h = tm.tmHeight;
+        SelectObject(dc, old);
+        ReleaseDC(nullptr, dc);
+    }
+    return h;
+}
+
+int MenuTextWidth(const std::wstring& s) {
+    if (s.empty()) return 0;
+    HDC dc = GetDC(nullptr);
+    if (!dc) return (int)s.size() * (kTextPx / 2);
+    HGDIOBJ old = SelectObject(dc, MenuFont());
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, s.c_str(), (int)s.size(), &sz);
+    SelectObject(dc, old);
+    ReleaseDC(nullptr, dc);
+    return sz.cx;
+}
+
+// 一张菜单项文字的 DIB。key 里必须带齐「文字 + 最宽 + 颜色」——
+// 少带一个就会出现「换主题后文字还是旧颜色」这类穿越 bug（和 LabelOf 一个道理）。
+// 菜单开着时鼠标每划过一项就重画一次，十几项全量重建 DIB 太浪费，所以缓存。
+LabelDib* MenuText(const std::wstring& text, int maxW, COLORREF color) {
+    if (text.empty() || maxW <= 8) return nullptr;
+    static std::unordered_map<std::wstring, LabelDib> cache;
+
+    std::wstring key = text;
+    key += L'\x1';
+    key += std::to_wstring(maxW);
+    key += L'c';
+    key += std::to_wstring((unsigned)color);
+
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second.valid() ? &it->second : nullptr;
+    if (cache.size() > 512) cache.clear();
+
+    LabelDib d;
+    // glow = 0：卡片自己有底色，不需要黑描边（图标标题需要是因为它压在壁纸上）。
+    // maxLines = 1：菜单项就是一行，超宽由 LabelDib 自己打省略号。
+    if (!d.Build(text, MenuFont(), maxW, MenuFontHeight(), 0, color, 1)) {
+        cache.insert_or_assign(key, LabelDib{});   // 缓存失败结果，别每次重试
+        return nullptr;
+    }
+    auto r = cache.insert_or_assign(key, std::move(d));
+    return &r.first->second;
+}
+
+// GDI+ 的 ARGB → GDI 的 COLORREF（LabelDib 只认 COLORREF）
+COLORREF FromArgb(ARGB c) {
+    return RGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+}
+
+// GDI+ 块里只记账，等 Flush 完再统一贴（GDI 不认 GDI+ 的延迟绘制）
+struct MenuTextOut {
+    const std::wstring* text;
+    COLORREF color;
+    int maxW;
+    int boxLeft;
+    int boxTop;
+};
+
 }  // namespace
 
 bool PopupMenu::Create() {
@@ -119,19 +218,15 @@ void PopupMenu::EnsureBuffer(int w, int h) {
 }
 
 void PopupMenu::Layout() {
-    HDC screen = GetDC(nullptr);
-    Graphics probe(screen);
-    FontFamily fam(L"Microsoft YaHei UI");
-    Font font(&fam, 13.0f, FontStyleRegular, UnitPixel);
-
+    // 宽度必须用**和画字同一套 GDI 字体**来量。以前这里走 GDI+ 的 MeasureString，
+    // 换成 GDI 栅格化之后两边字宽会差 1~2px —— 差的那点就够让最后一行文字
+    // 打上省略号，或者右边空出一条。量宽和画字从此共用 MenuFont()。
     int maxText = 40;
     for (const auto& it : items_) {
         if (it.separator) continue;
-        RectF box;
-        probe.MeasureString(it.text.c_str(), -1, &font, PointF(0, 0), &box);
-        maxText = std::max(maxText, (int)std::ceil(box.Width));
+        // +2 和 LabelDib 内部「量宽后 boxW = best + 2」对齐，保证绝不打省略号
+        maxText = std::max(maxText, MenuTextWidth(it.text) + 2);
     }
-    ReleaseDC(nullptr, screen);
 
     contentW_ = kPadL + maxText + kPadR;
     int h = kPadV * 2;
@@ -165,14 +260,18 @@ void PopupMenu::Paint() {
     const ARGB hot = light_ ? 0x1E0067C0 : 0x2E4CC2FF;
     const ARGB accent = light_ ? 0xFF0067C0 : 0xFF60CDFF;
 
+    // 文字不进 GDI+（见 MenuText 的说明），先在下面那个块里记账，
+    // 等 Graphics / Bitmap 都出了作用域再统一贴 —— 顺序反了文字会被
+    // 上面那层卡片底色盖住。
+    std::vector<MenuTextOut> textOut;
+    textOut.reserve(items_.size());
+
     {
         Bitmap target(bufW_, bufH_, bufW_ * 4, PixelFormat32bppPARGB,
                       reinterpret_cast<BYTE*>(bits_));
         Graphics g(&target);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
         g.SetPixelOffsetMode(PixelOffsetModeHighQuality);
-        // 分层窗口 + alpha，不能用 ClearType（会出彩色杂边）
-        g.SetTextRenderingHint(TextRenderingHintAntiAlias);
 
         const RectF body((float)kShadow, (float)kShadow, (float)contentW_, (float)contentH_);
 
@@ -196,13 +295,6 @@ void PopupMenu::Paint() {
         g.FillPath(&bgBrush, &card);
         Pen pen(border, 1.0f);
         g.DrawPath(&pen, &card);
-
-        FontFamily fam(L"Microsoft YaHei UI");
-        Font font(&fam, 13.0f, FontStyleRegular, UnitPixel);
-        StringFormat sf;
-        sf.SetLineAlignment(StringAlignmentCenter);
-        sf.SetTrimming(StringTrimmingEllipsisCharacter);
-        sf.SetFormatFlags(StringFormatFlagsNoWrap);
 
         for (size_t i = 0; i < items_.size(); ++i) {
             const PopupMenuItem& it = items_[i];
@@ -229,7 +321,6 @@ void PopupMenu::Paint() {
             }
 
             const float cy = (float)(r.top + r.bottom) * 0.5f;
-            const ARGB textColor = it.disabled ? fgDim : fg;
 
             // 勾选标记：对勾
             if (it.checked && !it.separator) {
@@ -241,10 +332,11 @@ void PopupMenu::Paint() {
                 g.DrawLine(&cp, cx - 1.0f, cy + 3.5f, cx + 5.0f, cy - 4.0f);
             }
 
-            RectF textRect((float)r.left + kPadL - 4.0f, (float)r.top,
-                           (float)(r.right - r.left - kPadL - kPadR + 4), (float)kItemH);
-            SolidBrush tb(textColor);
-            g.DrawString(it.text.c_str(), -1, &font, textRect, &sf, &tb);
+            // 文字只记账。排版盒和以前一样：左边从 kPadL - 4 起（给勾选标记让位），
+            // 右边留 kPadR（给子菜单箭头让位）。
+            textOut.push_back(MenuTextOut{&it.text, FromArgb(it.disabled ? fgDim : fg),
+                                          r.right - r.left - kPadL - kPadR + 4,
+                                          r.left + kPadL - 4, r.top});
 
             // 子菜单箭头 ›
             if (it.hasSub()) {
@@ -258,6 +350,19 @@ void PopupMenu::Paint() {
         }
 
         g.Flush(FlushIntentionSync);
+    }
+
+    // GDI 文字：预先乘好的字形遮罩，直接合成进 bits_。
+    // LabelDib 内部是 DT_CENTER，但它自己会把宽度收窄到「实测文字宽 + 2」，
+    // 所以贴的时候只要对齐左边界，看起来就是左对齐。
+    BYTE* dst = reinterpret_cast<BYTE*>(bits_);
+    for (const auto& t : textOut) {
+        LabelDib* lab = MenuText(*t.text, t.maxW, t.color);
+        if (!lab || !lab->valid()) continue;
+        const int ch = lab->h - lab->pad * 2;                 // 实际文字高 = 行高
+        const int y = t.boxTop + (kItemH - ch) / 2;           // 行内垂直居中
+        BlendInto(dst, bufW_, bufH_, reinterpret_cast<const BYTE*>(lab->bits), lab->w,
+                  lab->h, t.boxLeft - lab->pad, y - lab->pad);
     }
 }
 
@@ -335,21 +440,15 @@ void PopupMenu::OpenSub(int index) {
     const RECT& ir = itemRects_[index];
     POINT pt{wr.left + ir.right - kShadow - 2, wr.top + ir.top - kShadow - kPadV};
 
-    // 右边放不下就翻到左侧
+    // 右边放不下就翻到左侧。宽度和 Layout() 用同一套量法（GDI 字体），
+    // 以前这里是 GDI+ MeasureString，两边差几像素就会翻错边。
     int needW = 180;
     {
-        HDC screen = GetDC(nullptr);
-        Graphics probe(screen);
-        FontFamily fam(L"Microsoft YaHei UI");
-        Font font(&fam, 13.0f, FontStyleRegular, UnitPixel);
         int maxText = 40;
         for (const auto& s : it.sub) {
             if (s.separator) continue;
-            RectF box;
-            probe.MeasureString(s.text.c_str(), -1, &font, PointF(0, 0), &box);
-            maxText = std::max(maxText, (int)std::ceil(box.Width));
+            maxText = std::max(maxText, MenuTextWidth(s.text) + 2);
         }
-        ReleaseDC(nullptr, screen);
         needW = kPadL + maxText + kPadR + kShadow * 2;
     }
     POINT cursor{};
