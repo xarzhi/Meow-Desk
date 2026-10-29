@@ -29,7 +29,7 @@ std::wstring g_logfile;
 //   v6 — 把全局开关 defaultTelescope 落成 0：新建的盒子默认始终展开，不自己收起
 //   v7 — fence 表加 kind（0 = 收纳盒 / 1 = 待办盒）；新增 todo 表（待办条目）
 //   v8 — fence 表加 collapseDir（收起方向）
-//   v9 — 新增 search_fav 表（搜索窗口右上角的「常用」快捷项，最多 5 条）
+//   v9 — 新增 search_fav 表（搜索窗口右上角的「常用」快捷项，最多 10 条）
 const int kSchemaVersion = 9;
 
 void SetError(const char* what) {
@@ -111,7 +111,7 @@ bool Upgrade(int from) {
         ");"
         // 搜索窗口右上角的「常用」快捷项。
         // 同样用解析名当主键：显示名会重名，path 唯一且稳定；ord 是显示顺序
-        // （满 5 个就不再收，UI 上也只画 5 格）。
+        // （满 10 个就不再收，UI 上也只画 10 格；ord 越大越靠左）。
         "CREATE TABLE IF NOT EXISTS search_fav ("
         "  path TEXT PRIMARY KEY,"
         "  ord  INTEGER NOT NULL"

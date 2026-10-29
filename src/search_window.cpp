@@ -53,14 +53,15 @@ const int kLocateSize = 28;
 
 // ---- 右上角「常用」区 ----
 //
-// 5 个 26px 的方格，间距 6，右端贴着 kWidth - kPad。
-// 起点算成常数（kFavLeft）而不是「按当前个数右对齐」：个数变化时已有项不会
-// 左右跳动，新加的永远在最右端追加。
-const int kFavMax = 5;
+// 10 个 26px 的方格，间距 6，**从右边缘往左排**（第 0 个贴最右边，往后往左长）。
+// 为什么右对齐：常用区在右上角，新加的那一项应该长在「往外侧」，
+// 已有的项原地不动 —— 左对齐的话加第 2 个时第 1 个的位置会让人觉得被挤了一下。
+const int kFavMax = 10;
 const int kFavSize = 26;
 const int kFavGap = 6;
-const int kFavSpan = kFavMax * (kFavSize + kFavGap);          // 5*32 = 160
-const int kFavLeft = kWidth - kPad - kFavSpan + kFavGap;      // = 510
+const int kFavSpan = kFavMax * (kFavSize + kFavGap);          // 10*32 = 320
+// 排满 10 个时最左边那一格的左边界，也是「标题最多能画到哪」的限制。
+const int kFavLeft = kWidth - kPad - kFavSpan + kFavGap;      // = 350
 
 // 「点到面板外面就关掉」的巡检定时器
 const UINT_PTR kWatchTimer = 31;
@@ -139,6 +140,15 @@ void StarPath(GraphicsPath& p, float cx, float cy, float rOut) {
         pts[k] = PointF(cx + r * cosf(ang), cy + dy + r * sinf(ang));
     }
     p.AddPolygon(pts, 10);
+}
+
+// 手型光标（可点元素的 pointer）。LoadCursorW 内部有缓存，但这里也存一份，
+// 免得每次 WM_SETCURSOR 都翻一次系统表。
+HCURSOR HandCursor() {
+    static HCURSOR h = nullptr;
+    if (!h) h = LoadCursorW(nullptr, IDC_HAND);
+    if (!h) h = LoadCursorW(nullptr, IDC_ARROW);   // 极端情况下别让光标消失
+    return h;
 }
 
 // 去掉分隔符再比。搜狗/微软拼音在组合串里会插音节分隔符，比如输入 wyy 时
@@ -309,13 +319,13 @@ RECT SearchWindow::AddFavRect(int i) const {
     return o;
 }
 
-// 右上角第 i 个常用项。位置只看下标，和「有几个」无关 —— 这样加/减一个
-// 不会让其余几个左右乱跳。
+// 右上角第 i 个常用项。**从右往左排**：第 0 个贴着右边缘，下标越大越靠左。
+// 位置只看下标、和「现在有几个」无关 —— 这样加/减一个不会让其余几个左右乱跳。
 RECT SearchWindow::FavBarRect(int i) const {
     RECT o{};
-    o.left = kFavLeft + i * (kFavSize + kFavGap);
+    o.right = kWidth - kPad - i * (kFavSize + kFavGap);
+    o.left = o.right - kFavSize;
     o.top = kPadTop + (kHeaderH - kFavSize) / 2;
-    o.right = o.left + kFavSize;
     o.bottom = o.top + kFavSize;
     return o;
 }
@@ -655,7 +665,7 @@ void SearchWindow::Repaint() {
 
     // ---- 右上角：常用区 ----
     //
-    // 最多 5 格，位置只由下标决定（见 FavBarRect）。存的是解析名，
+    // 最多 10 格、从右往左排，位置只由下标决定（见 FavBarRect）。存的是解析名，
     // 每次弹出面板都重新反查一次图标；反查不到的（文件删了 / 换了盘）
     // 那一格画个很淡的空心小方块占位 —— 位置留着，用户才能看出是「这一格废了」
     // 而不是「怎么少了一个」。
@@ -734,7 +744,7 @@ void SearchWindow::Repaint() {
         {
             const bool faved = IsFav(e);
             const bool fhot = (i == hotFav_);
-            // 已经有 5 个了 → 没收藏的这些画成灰的，点了不响应。
+            // 已经有 kFavMax 个了 → 没收藏的这些画成灰的，点了不响应。
             // 不做「自动替换最旧的那个」：用户点了个星，结果另一项莫名消失，
             // 比「点了没反应」更难理解。
             const bool off = !faved && ((int)favs_.size() >= kFavMax);
@@ -847,6 +857,52 @@ LRESULT SearchWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break;
+
+    // 手型光标：右上角常用项 + 行内那两颗按钮都是「可点的」，悬停时给 pointer。
+    //
+    // 为什么在 WM_SETCURSOR 里做而不是 WM_MOUSEMOVE：鼠标原地不动、只是列表
+    // 因为重新过滤而滚动时，WM_MOUSEMOVE 不会再来一条，光标就停在旧形状上；
+    // WM_SETCURSOR 每次进入/移动都问一遍，形状总能跟当前几何对上。
+    // 注意这里只处理 HTCLIENT：搜索框是子控件 EDIT，鼠标压在它上面时
+    // WM_SETCURSOR 先发给 EDIT（它自己设 I 型光标并吃掉），根本轮不到我们。
+    case WM_SETCURSOR: {
+        if (LOWORD(lp) != HTCLIENT) break;
+        POINT pt{};
+        GetCursorPos(&pt);
+        ScreenToClient(h, &pt);
+
+        bool hand = false;
+        // 常用项：图标还在（真能点开）才给手型；那一格已经废了就不该装成能点
+        const int fn = (std::min)((int)favs_.size(), kFavMax);
+        for (int i = 0; i < fn; ++i) {
+            RECT fr = FavBarRect(i);
+            if (pt.x >= fr.left && pt.x < fr.right && pt.y >= fr.top && pt.y < fr.bottom) {
+                hand = (i < (int)favPtrs_.size()) && favPtrs_[i] != nullptr;
+                break;
+            }
+        }
+        // 行内「★ 收藏」「准星 定位」：一样是可点元素，只给常用区手型会前后不一致
+        if (!hand) {
+            const int rows = RowsVisible();
+            for (int i = 0; i < rows; ++i) {
+                RECT fr = AddFavRect(i);
+                if (pt.x >= fr.left && pt.x < fr.right && pt.y >= fr.top && pt.y < fr.bottom) {
+                    // 已收藏（点了能取消）或者还没满（点了能加）才算可点；
+                    // 满了又没收藏的那颗星是灰的，点了没反应，就不给手型
+                    const bool faved = hits_[i] && IsFav(hits_[i]);
+                    hand = faved || ((int)favs_.size() < kFavMax);
+                    break;
+                }
+                RECT lr = LocateRect(i);
+                if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom) {
+                    hand = true;
+                    break;
+                }
+            }
+        }
+        SetCursor(hand ? HandCursor() : LoadCursorW(nullptr, IDC_ARROW));
+        return TRUE;
+    }
 
     case WM_MOUSEMOVE: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
