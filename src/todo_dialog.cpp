@@ -44,8 +44,11 @@ const int kBtnH = 32;
 const int kBtnGap = 10;
 const int kPadBottom = 22;
 const int kDetailLineH = 21;
-// 详情正文最多 6 行：再多卡片会长到屏幕外
-const int kDetailMaxH = kDetailLineH * 6;
+// 详情正文的行数上限分两档：绝对上限（再多也不给）和「屏幕放得下多少」。
+// 输入改成多行文本域之后，一条待办可能有十几行 —— 详情弹窗是唯一能看全文的地方，
+// 还按原来的 6 行截断就说不过去了。
+const int kDetailMaxLines = 20;
+const int kDetailMinLines = 3;
 
 // 「焦点跑掉了没有」的延迟检查（见 CardProc 的 kMsgCheckFocus）。
 // 和 rename_dialog 的 WM_APP+12 错开，避免万一两条消息串到同一个窗口上。
@@ -80,6 +83,7 @@ POINT g_dragWin0{};         // 按下时的卡片左上角
 
 int g_cardH = 0;
 int g_textH = 0;         // Detail 模式正文块的高度（Layout 前算好）
+int g_detailCap = kDetailLineH * 8;   // Detail 正文最多这么高（ShowDetail 按屏幕算）
 int g_editH = 0;         // Input 模式文本域的高度（跟着行数长）
 int g_editLines = 1;     // 上一帧文本域的显示行数（用来判断要不要重排版）
 RECT g_rcField{};
@@ -201,7 +205,7 @@ int MeasureDetailHeight(const std::wstring& s) {
         }
         ReleaseDC(nullptr, dc);
     }
-    return std::clamp(h, kDetailLineH, kDetailMaxH);
+    return std::clamp(h, kDetailLineH, g_detailCap);
 }
 
 int CardHeight() {
@@ -835,10 +839,9 @@ void EnsureCardClass() {
     RegisterClassExW(&wc);
 }
 
-// 卡片摆放：**居中于屏幕**（用户明确要求「在屏幕中央」），屏幕取 owner 所在那块
-// （待办盒可能在副屏上），没有 owner 就取鼠标所在那块。居中于盒子是不对的 ——
-// 盒子本身就在屏幕角落，卡片贴着角落出来很别扭。
-void PlaceAndShow(HWND owner, bool wantInputFocus) {
+// 卡片该摆在哪个屏幕的哪块可用区。屏幕取 owner 所在那块（待办盒可能在副屏上），
+// 没有 owner 就取鼠标所在那块。
+RECT WorkAreaFor(HWND owner) {
     POINT ref{};
     if (owner) {
         RECT a{};
@@ -849,12 +852,18 @@ void PlaceAndShow(HWND owner, bool wantInputFocus) {
     } else {
         GetCursorPos(&ref);
     }
-
     HMONITOR mon = MonitorFromPoint(ref, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     RECT lim{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
     if (mon && GetMonitorInfoW(mon, &mi)) lim = mi.rcWork;
+    return lim;
+}
+
+// 卡片摆放：**居中于屏幕**（用户明确要求「在屏幕中央」）。
+// 居中于盒子是不对的 —— 盒子本身就在屏幕角落，卡片贴着角落出来很别扭。
+void PlaceAndShow(HWND owner, bool wantInputFocus) {
+    const RECT lim = WorkAreaFor(owner);
 
     int x = ((int)lim.left + (int)lim.right - g_bufW) / 2;
     int y = ((int)lim.top + (int)lim.bottom - g_bufH) / 2;
@@ -982,6 +991,17 @@ void ShowDetail(HWND owner, const std::wstring& text, bool done,
     ResetState(Mode::Detail, L"\u5f85\u529e\u8be6\u60c5");   // 待办详情
     g_text = text;
     g_done = done;
+    // 正文多高由「文字实际多高」和「这块屏放得下多高」共同决定：
+    // 先算出卡片除正文以外的固定高度（chrome），剩下的都留给正文。
+    // 以前是硬编码 6 行 —— 输入还只有单行的时候够用，现在能写十几行就不够了。
+    {
+        const RECT wa = WorkAreaFor(owner);
+        const int chrome = kShadow * 2 + kPadTop + kTitleH + kAfterTitle + kAfterEdit +
+                           kBtnH + kPadBottom;
+        const int room = (int)(wa.bottom - wa.top) - chrome - 32;   // 32 给屏幕上下留余量
+        g_detailCap =
+            std::clamp(room, kDetailLineH * kDetailMinLines, kDetailLineH * kDetailMaxLines);
+    }
     g_textH = MeasureDetailHeight(g_text);   // 卡片高度要先知道正文多高
     EnsureBuffer();
     if (!g_memDC) {
