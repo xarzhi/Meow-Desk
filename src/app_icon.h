@@ -28,3 +28,8 @@ HICON LoadAppIcon(int size);
 // 关于页要画的 logo（128px PNG）。首次调用时解码，之后返回同一个对象。
 // 失败返回 nullptr（关于页就只显示文字）。**不要 delete**。
 Gdiplus::Bitmap* AppLogoBitmap();
+
+// 搜索窗口左上角那个猫爪标记（res/claw.png，230px 正方形）。
+// 用户单独给的图标，整张等比缩放直接用 —— 不是从 logo.png 上裁下来的。
+// 失败返回 nullptr，调用方应退回 AppLogoBitmap()。**不要 delete**。
+Gdiplus::Bitmap* AppClawBitmap();

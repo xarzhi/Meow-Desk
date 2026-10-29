@@ -157,7 +157,7 @@ endif()
 # ninja 认为资源没变，exe 里还是旧图标」—— 而且完全没有任何报错，只有肉眼看出来。
 # 这里手动把它们声明成依赖。
 set_source_files_properties(res/resources.rc PROPERTIES OBJECT_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/res/meow-desk.ico;${CMAKE_CURRENT_SOURCE_DIR}/res/logo-128.png;${CMAKE_CURRENT_SOURCE_DIR}/src/iconfont/iconfont.ttf"
+    "${CMAKE_CURRENT_SOURCE_DIR}/res/meow-desk.ico;${CMAKE_CURRENT_SOURCE_DIR}/res/logo-128.png;${CMAKE_CURRENT_SOURCE_DIR}/res/claw.png;${CMAKE_CURRENT_SOURCE_DIR}/src/iconfont/iconfont.ttf"
 )
 set_source_files_properties(res/setup_res.rc PROPERTIES OBJECT_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/res/meow-desk.ico"

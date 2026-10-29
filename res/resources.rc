@@ -17,4 +17,5 @@
 // relative paths are resolved against the directory of this .rc file (res/)
 IDI_APP      ICON   "meow-desk.ico"
 IDR_LOGO_PNG RCDATA "logo-128.png"
+IDR_CLAW_PNG RCDATA "claw.png"
 IDR_ICONFONT RCDATA "../src/iconfont/iconfont.ttf"

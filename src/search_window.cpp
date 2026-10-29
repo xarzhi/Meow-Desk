@@ -484,30 +484,18 @@ void SearchWindow::Repaint() {
 
     // ---- 顶部：程序 logo + 标题（在搜索框左上方）----
     //
-    // 图标用 logo.png **右下角那一格的猫爪**（用户指定），不是整张四宫格。
-    // 整张缩到 22px 就是四块糊在一起，认不出是什么；单取猫爪才看得清。
-    //
-    // AppLogoBitmap() 给的是 logo-128.png —— 512 原图等比缩到 128，
-    // 所以下面这几个源矩形常量就是「512 坐标 ÷ 4」：
-    //   512 裁切框 = 176x136 @ (284,288)
-    // 这是量着猫爪本体（四个脚趾 + 掌垫）的包围盒定的。左右不能再留白：
-    // 爪子最外缘离那一格的圆角边框只剩 3px，再多留一点就把边框带进来了，
-    // 而 22px 下那道 1px 直线会糊成一圈灰边。
-    //
-    // 不做正方形裁切 —— 爪子本身就是横的（176:136）。按宽度缩、高度按比例、
-    // 在 kLogoPx 的槽里垂直居中，否则四个趾头会被压扁。
+    // 图标用 res/claw.png（用户单独给的猫爪图，RCDATA 编进 exe）。
+    // 它本身就是 230x230 的正方形图标，**整张等比缩放直接用**，
+    // 不裁、不拼、不抠 —— 和以前整张 logo 的画法一致，只是换了张图。
     {
         const int logoX = kPad + 2;
         // 标题行在 kPadTop..kSearchTop 之间，logo 在里面垂直居中
         const int logoY = kPadTop + (kHeaderH - kLogoPx) / 2;
-        if (Bitmap* logo = AppLogoBitmap()) {
-            const int srcX = 71, srcY = 72, srcW = 44, srcH = 34;
-            const int dstW = kLogoPx;
-            const int dstH = (kLogoPx * srcH + srcW / 2) / srcW;   // 保持比例
-            const int dstY = logoY + (kLogoPx - dstH) / 2;
+        Bitmap* mark = AppClawBitmap();
+        if (!mark) mark = AppLogoBitmap();   // 资源没编进来时退回整张 logo，别留空白
+        if (mark) {
             g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-            g.DrawImage(logo, Rect(logoX, dstY, dstW, dstH), srcX, srcY, srcW, srcH,
-                        UnitPixel);
+            g.DrawImage(mark, Rect(logoX, logoY, kLogoPx, kLogoPx));
             g.SetInterpolationMode(InterpolationModeDefault);
         }
         Font fTitle(&family, 13.0f, FontStyleRegular, UnitPixel);

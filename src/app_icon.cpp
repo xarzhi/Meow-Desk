@@ -30,19 +30,17 @@ HICON LoadAppIcon(int size) {
                              size, size, 0);
 }
 
-Gdiplus::Bitmap* AppLogoBitmap() {
-    static Gdiplus::Bitmap* cached = nullptr;
-    static bool tried = false;
-    if (tried) return cached;
-    tried = true;
+namespace {
 
+// RCDATA 里的一张 PNG → GDI+ Bitmap。返回的位图由调用方缓存住，不释放。
+//
+// GDI+ 的 Bitmap 从 IStream 构造是「延迟解码」：流一释放，后面访问像素就失败。
+// 所以先构造、立刻问一次尺寸（触发解码），再释放流。
+Gdiplus::Bitmap* LoadPngOnce(int id) {
     DWORD n = 0;
-    const void* p = AppResourceBytes(IDR_LOGO_PNG, n);
+    const void* p = AppResourceBytes(id, n);
     if (!p || n == 0) return nullptr;
 
-    EnsureGdiplus();
-    // GDI+ 的 Bitmap 从 IStream 构造是「延迟解码」：流一释放，后面访问像素就失败。
-    // 所以先构造、立刻问一次尺寸（触发解码），再释放流。
     IStream* s = SHCreateMemStream(reinterpret_cast<const BYTE*>(p), n);
     if (!s) return nullptr;
     auto* bmp = new Gdiplus::Bitmap(s, FALSE);
@@ -51,6 +49,27 @@ Gdiplus::Bitmap* AppLogoBitmap() {
         bmp = nullptr;
     }
     s->Release();
-    cached = bmp;
+    return bmp;
+}
+
+}  // namespace
+
+Gdiplus::Bitmap* AppLogoBitmap() {
+    static Gdiplus::Bitmap* cached = nullptr;
+    static bool tried = false;
+    if (tried) return cached;
+    tried = true;
+    EnsureGdiplus();
+    cached = LoadPngOnce(IDR_LOGO_PNG);
+    return cached;
+}
+
+Gdiplus::Bitmap* AppClawBitmap() {
+    static Gdiplus::Bitmap* cached = nullptr;
+    static bool tried = false;
+    if (tried) return cached;
+    tried = true;
+    EnsureGdiplus();
+    cached = LoadPngOnce(IDR_CLAW_PNG);
     return cached;
 }
