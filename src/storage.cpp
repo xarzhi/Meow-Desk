@@ -2,7 +2,9 @@
 
 #include <shlobj.h>
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #include "sqlite3.h"
 
@@ -357,6 +359,111 @@ std::wstring Stmt::colText(int i) const {
     if (!p) return std::wstring();
     const int bytes = sqlite3_column_bytes16(st_, i);
     return std::wstring(reinterpret_cast<const wchar_t*>(p), (size_t)bytes / sizeof(wchar_t));
+}
+
+// ---------------------------------------------------------------------------
+// 备份
+// ---------------------------------------------------------------------------
+namespace {
+
+// 保留多少份。14 = 两周的每日快照；每份几十~几百 KB，总共也就几 MB。
+const int kKeepBackups = 14;
+
+// 备份目录里所有 meow-desk-*.db，**升序**（文件名里带 yyyymmdd-hhmmss，
+// 所以字典序就是时间序，不用去翻文件时间）。
+std::vector<std::wstring> ListBackups() {
+    std::vector<std::wstring> out;
+    const std::wstring pat = BackupDir() + L"\\meow-desk-*.db";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        out.push_back(fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+}  // namespace
+
+const std::wstring& BackupDir() {
+    static std::wstring dir;
+    if (dir.empty()) {
+        dir = Dir() + L"\\backup";
+        CreateDirectoryW(dir.c_str(), nullptr);
+    }
+    return dir;
+}
+
+std::wstring BackupNow() {
+    if (!Open()) return std::wstring();
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t base[48]{};
+    swprintf_s(base, L"meow-desk-%04d%02d%02d-%02d%02d%02d", st.wYear, st.wMonth, st.wDay,
+               st.wHour, st.wMinute, st.wSecond);
+
+    // 同一秒里连点两次「立即备份」→ 加后缀，绝不覆盖已有备份
+    std::wstring path = BackupDir() + L"\\" + base + L".db";
+    for (int n = 2; n < 100 && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; ++n) {
+        wchar_t nm[64]{};
+        swprintf_s(nm, L"%s-%d.db", base, n);
+        path = BackupDir() + L"\\" + nm;
+    }
+
+    // sqlite3_open16 直接吃 UTF-16（用户名可能是中文，走 UTF-8 反而多一层错的余地）；
+    // 目标文件必须是新的，open16 会建出来。
+    sqlite3* dst = nullptr;
+    if (sqlite3_open16(path.c_str(), &dst) != SQLITE_OK) {
+        if (dst) sqlite3_close(dst);
+        SetError("backup open");
+        return std::wstring();
+    }
+
+    bool ok = false;
+    if (sqlite3_backup* bk = sqlite3_backup_init(dst, "main", g_db, "main")) {
+        const int rc = sqlite3_backup_step(bk, -1);   // -1 = 一次搬完
+        sqlite3_backup_finish(bk);
+        ok = (rc == SQLITE_DONE);
+    }
+    sqlite3_close(dst);
+
+    if (!ok) {
+        DeleteFileW(path.c_str());   // 半截文件留着只会误导人
+        SetError("backup step");
+        return std::wstring();
+    }
+    return path;
+}
+
+void BackupDaily() {
+    if (!Open()) return;
+
+    // 今天已经备过就不再备（同一天反复启停不该刷出一堆文件）
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t prefix[32]{};
+    swprintf_s(prefix, L"meow-desk-%04d%02d%02d-", st.wYear, st.wMonth, st.wDay);
+    const std::wstring pre = prefix;
+
+    bool today = false;
+    for (const auto& f : ListBackups()) {
+        if (f.rfind(pre, 0) == 0) {
+            today = true;
+            break;
+        }
+    }
+    if (!today) BackupNow();
+
+    // 只留最近 kKeepBackups 份（ListBackups 是升序，砍掉最前面那批）
+    const auto all = ListBackups();
+    if ((int)all.size() > kKeepBackups) {
+        for (int i = 0; i < (int)all.size() - kKeepBackups; ++i)
+            DeleteFileW((BackupDir() + L"\\" + all[i]).c_str());
+    }
 }
 
 }  // namespace storage

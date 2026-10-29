@@ -39,6 +39,22 @@ const int kRowLeft = kContentX + 20;   // 卡片内文字左边
 // （图标格子贴着边角被切），所以滑块到 20 就到头了。加载旧配置时也按这个夹。
 const int kRadiusMax = 20;
 
+// ---- 三个滑块的取值范围：**唯一来源** ----
+//
+// 绘制、拖动、命中判定都必须从这里取。之前绘制写一套、拖动又写另一套
+// （头部高度：画的时候用 26..50，拖动却按 28..72 算），于是圆点永远跑在
+// 鼠标前面 —— 拖到 40% 就已经显示满值，再往后怎么拖都不动。
+const int kHeaderHMin = 26;
+const int kHeaderHMax = 50;
+
+// 透明度上限取 254 而不是 255。
+// 别处的档位判断是 `bgMode = acrylic ? 2 : (alpha >= 255 ? 0 : 1)` ——
+// alpha 一到 255 就被当成「纯色」档，这个滑块当场把自己置灰，
+// 之后拖不动也点不动（用户看到的就是「滑到满就死了」）。
+// 真想要完全不透明请切「纯色」档，那才是它的语义。
+const int kAlphaMin = 40;
+const int kAlphaMax = 254;
+
 enum : int {
     ID_NONE = -1,
     ID_SWATCH0 = 0,   // 0..11
@@ -64,6 +80,9 @@ enum : int {
     ID_AUTOSTART = 43,
     ID_HIGHPRIORITY = 44,
     ID_SNAP = 45,        // 自动吸附
+    ID_HOTKEY = 49,      // 搜索面板的全局快捷键（点击进入录制）
+    ID_BACKUP_NOW = 50,  // 关于页：立即备份
+    ID_OPEN_BACKUP = 51,
     ID_BG_SOLID = 46,    // 盒子背景三档：纯色 / 透明 / 亚克力
     ID_BG_TRANS = 47,
     ID_BG_ACRYLIC = 48,
@@ -135,6 +154,35 @@ RECT TrackRect(const RECT& row, int rightInset = 92) {
     r.bottom = cy + 2;
     r.right -= rightInset;
     return r;
+}
+
+// 滑块 id → 取值区间。绘制和拖动都走这里，别再各写一套字面量。
+void SliderRange(int id, int& lo, int& hi) {
+    switch (id) {
+    case ID_RADIUS:
+        lo = 0;
+        hi = kRadiusMax;
+        break;
+    case ID_ALPHA:
+        lo = kAlphaMin;
+        hi = kAlphaMax;
+        break;
+    default:   // ID_HEADER_H
+        lo = kHeaderHMin;
+        hi = kHeaderHMax;
+        break;
+    }
+}
+
+// 鼠标 x → 滑块值。和 drawSlider 里的 `t01 = (val-lo)/(hi-lo)` 是同一个映射，
+// 两边必须严格互逆，否则圆点就画不到鼠标底下去。
+int SliderValueFromX(const RECT& row, int x, int lo, int hi) {
+    const RECT tr = TrackRect(row);
+    const int span = tr.right - tr.left;
+    if (span <= 0 || hi <= lo) return lo;
+    double t01 = (double)(x - tr.left) / (double)span;
+    t01 = std::clamp(t01, 0.0, 1.0);
+    return lo + (int)std::lround(t01 * (hi - lo));
 }
 
 }  // namespace
@@ -241,12 +289,18 @@ void SettingsWindow::Layout() {
         rcSortAnim_ = RECT{tr - 36, c1 + 98, tr, c1 + 120};
         rcSnap_ = RECT{tr - 36, c1 + 150, tr, c1 + 172};
         rcTabHover_ = RECT{tr - 36, c1 + 202, tr, c1 + 224};
+
+        // 快捷键单独一张卡片（行为开关和「录一个组合键」不是一类东西）。
+        // 键帽做宽一点：要放得下 "CTRL+ALT+SPACE" 这种长组合。
+        rcHotkey_ = RECT{tr - 210, c1 + 376, tr, c1 + 408};
     }
 
     // ---- 关于页 ----
     {
         const int c1 = 100;
         rcOpenFolder_ = RECT{kContentX + 20, c1 + 172, kContentX + 180, c1 + 204};
+        rcBackupNow_ = RECT{kContentX + 188, c1 + 172, kContentX + 308, c1 + 204};
+        rcOpenBackup_ = RECT{kContentX + 316, c1 + 172, kContentX + 468, c1 + 204};
     }
 
     // ---- 整理规则页 ----
@@ -295,6 +349,9 @@ int SettingsWindow::HitTest(POINT pt) const {
         if (in(rcShowFenceTitle_, 150, 16)) return ID_SHOW_FENCE_TITLE;
         break;
     case Page::Interaction:
+        // 键帽只有自己那一块可点（不像开关那样带上整行标签区）——
+        // 整行都能点的话，用户点标签文字也会进入录制状态，很容易误触。
+        if (in(rcHotkey_, 4, 4)) return ID_HOTKEY;
         if (in(rcHoverExpand_, 150, 18)) return ID_HOVER_EXPAND;
         if (in(rcSortAnim_, 150, 18)) return ID_SORT_ANIM;
         if (in(rcSnap_, 150, 18)) return ID_SNAP;
@@ -311,6 +368,8 @@ int SettingsWindow::HitTest(POINT pt) const {
         break;
     case Page::About:
         if (in(rcOpenFolder_, 0, 4)) return ID_OPENFOLDER;
+        if (in(rcBackupNow_, 0, 4)) return ID_BACKUP_NOW;
+        if (in(rcOpenBackup_, 0, 4)) return ID_OPEN_BACKUP;
         break;
     default:
         break;
@@ -723,19 +782,22 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
             wchar_t buf[16];
             if (bgMode == 1) {
                 swprintf_s(buf, L"%d%%", (int)std::lround(alpha * 100.0 / 255.0));
-                drawSlider(rcAlpha_, 40, 255, alpha, buf);
+                drawSlider(rcAlpha_, kAlphaMin, kAlphaMax, alpha, buf);
             } else {
-                // 纯色 / 亚克力档：透明度滑块置灰，不响应
-                drawSlider(rcAlpha_, 40, 255, 255, L"100%");
+                // 纯色 / 亚克力档：透明度滑块置灰，不响应（画在满格）
+                drawSlider(rcAlpha_, kAlphaMin, kAlphaMax, kAlphaMax, L"100%");
             }
         }
 
         g.DrawString(L"\u5934\u90e8\u9ad8\u5ea6", -1, &fBody,
                      RectF((float)kRowLeft, (float)rcHeaderH_.top, 90.0f, 30.0f), &sf,
                      &brText);
-        // 上限 50：再高头部就把内容区挤没了（用户定的上限）
-        drawSlider(rcHeaderH_, 26, 50, std::clamp(g_config.headerHeight, 26, 50),
-                   std::to_wstring(std::clamp(g_config.headerHeight, 26, 50)) + L" px");
+        // 上限 50：再高头部就把内容区挤没了（用户定的上限）。
+        // 区间必须和拖动共用 kHeaderHMin/kHeaderHMax，别在这里另写。
+        drawSlider(rcHeaderH_, kHeaderHMin, kHeaderHMax,
+                   std::clamp(g_config.headerHeight, kHeaderHMin, kHeaderHMax),
+                   std::to_wstring(std::clamp(g_config.headerHeight, kHeaderHMin,
+                                              kHeaderHMax)) + L" px");
 
         // 档位说明 + 内存提示
         {
@@ -832,6 +894,69 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      RectF((float)kRowLeft, (float)(rcTabHover_.top + 12), 420.0f, 16.0f),
                      &sf, &brSub);
         drawToggle(rcTabHover_, g_config.switchTabOnHover != 0);
+
+        // ---- 快捷键 ----
+        {
+            const int c2 = c1 + 330;
+            drawCard(c2, 100);
+            g.DrawString(L"\u5feb\u6377\u952e", -1, &fSection,
+                         RectF((float)kContentX + 20, (float)c2 + 14.0f, 260.0f, 22.0f),
+                         &sf, &brText);
+
+            g.DrawString(L"\u641c\u7d22\u9762\u677f", -1, &fBody,
+                         RectF((float)kRowLeft, (float)(rcHotkey_.top - 10), 360.0f,
+                               26.0f),
+                         &sf, &brText);
+            g.DrawString(hotkeyCapture_ ? L"\u76f4\u63a5\u6309\u4e0b\u4f60"
+                                          L"\u60f3\u7528\u7684\u7ec4\u5408\u952e"
+                                          L"\uff08Esc \u53d6\u6d88\uff09"
+                                        : L"\u4efb\u4f55\u7a0b\u5e8f\u91cc\u6309"
+                                          L"\u4e0b\u5b83\u90fd\u80fd\u5524\u51fa"
+                                          L"\u641c\u7d22\u9762\u677f",
+                         -1, &fSub,
+                         RectF((float)kRowLeft, (float)(rcHotkey_.top + 14), 400.0f, 16.0f),
+                         &sf, &brSub);
+
+            // 键帽
+            GraphicsPath kp;
+            AddRound(kp,
+                     RectF((float)rcHotkey_.left, (float)rcHotkey_.top,
+                           (float)(rcHotkey_.right - rcHotkey_.left),
+                           (float)(rcHotkey_.bottom - rcHotkey_.top)),
+                     8.0f);
+            const bool cap = hotkeyCapture_;
+            SolidBrush kb(C(cap ? t.accent : t.track));
+            g.FillPath(&kb, &kp);
+            Pen kpen(C(cap ? t.accent
+                           : (hot_ == ID_HOTKEY ? t.accent : t.cardBorder)),
+                     1.0f);
+            g.DrawPath(&kpen, &kp);
+            StringFormat cf;
+            cf.SetAlignment(StringAlignmentCenter);
+            cf.SetLineAlignment(StringAlignmentCenter);
+            cf.SetFormatFlags(StringFormatFlagsNoWrap);
+            cf.SetTrimming(StringTrimmingEllipsisCharacter);
+            const std::wstring txt =
+                cap ? std::wstring(L"\u6309\u4e0b\u7ec4\u5408\u952e\u2026")
+                    : g_config.searchHotkey;
+            SolidBrush kt(C(cap ? RGB(255, 255, 255) : t.text));
+            g.DrawString(txt.c_str(), -1, &fBody,
+                         RectF((float)rcHotkey_.left + 8, (float)rcHotkey_.top,
+                               (float)(rcHotkey_.right - rcHotkey_.left) - 16,
+                               (float)(rcHotkey_.bottom - rcHotkey_.top)),
+                         &cf, &kt);
+
+            if (hotkeyFailed_ && !cap) {
+                SolidBrush warn(C(RGB(214, 68, 68)));
+                g.DrawString(L"\u8fd9\u7ec4\u5feb\u6377\u952e\u5df2\u88ab\u5176"
+                             L"\u4ed6\u7a0b\u5e8f\u5360\u7528\uff0c\u8bd5\u8bd5"
+                             L"\u6362\u4e00\u4e2a",
+                             -1, &fSub,
+                             RectF((float)kRowLeft, (float)(rcHotkey_.top + 36), 420.0f,
+                                   16.0f),
+                             &sf, &warn);
+            }
+        }
         break;
     }
 
@@ -846,7 +971,8 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      &fSub, RectF((float)kContentX + 2, 56.0f, 460.0f, 18.0f), &sf, &brSub);
 
         const int c1 = 100;
-        drawCard(c1, 220);
+        // 220 -> 232：按钮行下面还要放一行「自动备份策略」的说明
+        drawCard(c1, 232);
 
         // app 图标 + 右侧说明文字（logo 取自 exe 资源里的 128px PNG，失败就只显示文字）
         const int logoPx = 64;
@@ -885,21 +1011,39 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      RectF((float)kRowLeft, (float)c1 + 146.0f, 520.0f, 18.0f), &sf, &brSub);
 
         {
-            GraphicsPath p;
-            AddRound(p, RectF((float)rcOpenFolder_.left, (float)rcOpenFolder_.top,
-                              (float)(rcOpenFolder_.right - rcOpenFolder_.left),
-                              (float)(rcOpenFolder_.bottom - rcOpenFolder_.top)),
-                     6.0f);
-            SolidBrush fill(C(t.cardBorder));
-            g.FillPath(&fill, &p);
-            Pen pen(C(t.cardBorder), 1.0f);
-            g.DrawPath(&pen, &p);
+            // 三个并排的小按钮。画法完全一致，抽成 lambda —— 三份字面量迟早写歪。
+            auto chip = [&](const RECT& r, int cid, const wchar_t* label) {
+                GraphicsPath cp;
+                AddRound(cp,
+                         RectF((float)r.left, (float)r.top, (float)(r.right - r.left),
+                               (float)(r.bottom - r.top)),
+                         6.0f);
+                SolidBrush cf(C(hot_ == cid ? t.track : t.cardBorder));
+                g.FillPath(&cf, &cp);
+                Pen cpen(C(t.cardBorder), 1.0f);
+                g.DrawPath(&cpen, &cp);
+                g.DrawString(label, -1, &fBody,
+                             RectF((float)r.left, (float)r.top, (float)(r.right - r.left),
+                                   (float)(r.bottom - r.top)),
+                             &sfCenter, &brText);
+            };
             // 现在存的是 meow-desk.db，说「配置文件夹」已经不准确了
-            g.DrawString(L"\u6253\u5f00\u6570\u636e\u6587\u4ef6\u5939", -1, &fBody,
-                         RectF((float)rcOpenFolder_.left, (float)rcOpenFolder_.top,
-                               (float)(rcOpenFolder_.right - rcOpenFolder_.left),
-                               (float)(rcOpenFolder_.bottom - rcOpenFolder_.top)),
-                         &sfCenter, &brText);
+            chip(rcOpenFolder_, ID_OPENFOLDER, L"\u6253\u5f00\u6570\u636e\u6587"
+                                               L"\u4ef6\u5939");
+            chip(rcBackupNow_, ID_BACKUP_NOW,
+                 L"\u7acb\u5373\u5907\u4efd");                          // 立即备份
+            chip(rcOpenBackup_, ID_OPEN_BACKUP,
+                 L"\u6253\u5f00\u5907\u4efd\u76ee\u5f55");            // 打开备份目录
+
+            // 备份策略说明 + 刚点过「立即备份」的反馈
+            g.DrawString(backupDone_ ? L"\u5df2\u5907\u4efd\u5230 backup \u6587"
+                                       L"\u4ef6\u5939"
+                                     : L"\u6bcf\u6b21\u542f\u52a8\u81ea\u52a8"
+                                       L"\u5907\u4efd\uff0c\u4fdd\u7559\u6700"
+                                       L"\u8fd1 14 \u4efd",
+                         -1, &fSub,
+                         RectF((float)kRowLeft, (float)c1 + 212.0f, 520.0f, 16.0f), &sf,
+                         &brSub);
         }
 
         // ---- 开源项目 ----
@@ -1317,6 +1461,44 @@ void SettingsWindow::ScrollRules(int delta) {
 }
 
 LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    // 录制组合键期间，键盘消息一律在这里吃掉。
+    // 不拦的话 Alt+F 会去触发系统菜单（窗口闪一下、还可能响），
+    // 而且我们要的是「按下那一刻」的完整组合，不能让它先被别处处理掉。
+    if (hotkeyCapture_ && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)) {
+        const UINT vk = (UINT)wp;
+        const bool isMod = (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU ||
+                            vk == VK_LWIN || vk == VK_RWIN);
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        const bool win = (GetKeyState(VK_LWIN) & 0x8000) != 0 ||
+                         (GetKeyState(VK_RWIN) & 0x8000) != 0;
+
+        if (vk == VK_ESCAPE && !ctrl && !alt && !win) {
+            hotkeyCapture_ = false;   // Esc 取消，原来那组不动
+            Paint();
+            return 0;
+        }
+        // 只按下修饰键不算「录到了」，继续等主键
+        if (!isMod) {
+            UINT mods = 0;
+            if (ctrl) mods |= MOD_CONTROL;
+            if (alt) mods |= MOD_ALT;
+            if (shift) mods |= MOD_SHIFT;
+            if (win) mods |= MOD_WIN;
+            // 必须带修饰键：拿一个裸字母当全局热键等于把它从所有程序手里抢走
+            if (mods != 0) {
+                g_config.searchHotkey = FormatHotkey(mods, vk);
+                g_config.Save();
+                hotkeyCapture_ = false;
+                hotkeyFailed_ = onHotkeyChanged ? !onHotkeyChanged() : false;
+                NotifyChanged();
+                Paint();
+            }
+        }
+        return 0;
+    }
+
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;
@@ -1411,6 +1593,16 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             Paint();
             return 0;
         }
+        if (id == ID_BACKUP_NOW) {
+            if (onBackupNow) onBackupNow();
+            backupDone_ = true;
+            Paint();
+            return 0;
+        }
+        if (id == ID_OPEN_BACKUP) {
+            if (onOpenBackupDir) onOpenBackupDir();
+            return 0;
+        }
         if (id == ID_OPENFOLDER) {
             // 便携模式下 Dir() 就是 exe 所在目录，而目录名和主程序同名（meow-desk / MeowDesk.exe）
             // —— 直接 ShellExecute 这个路径会被补成 .exe，等于又启动一个自己。
@@ -1472,6 +1664,13 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        if (id == ID_HOTKEY) {
+            hotkeyCapture_ = true;
+            hotkeyFailed_ = false;
+            SetFocus(h);   // 没焦点就收不到 WM_KEYDOWN
+            Paint();
+            return 0;
+        }
         if (id == ID_RADIUS || id == ID_ALPHA || id == ID_HEADER_H) {
             // 透明度滑块只在「透明」档生效；纯色/亚克力档置灰，点它不响应
             if (id == ID_ALPHA) {
@@ -1482,6 +1681,15 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 const int bgMode = acrylic ? 2 : (alpha >= 255 ? 0 : 1);
                 if (bgMode != 1) return 0;
             }
+            // 只在轨道附近起拖（左右各放宽一个圆点半径，方便抓住贴边的圆点）。
+            // 点右侧的数值文本也当「拖到最大」是很反直觉的 —— 那也是用户说的
+            // 「圆点跟点击位置不一样」的一种。
+            const RECT& row = (id == ID_RADIUS) ? rcRadius_
+                              : (id == ID_ALPHA) ? rcAlpha_
+                                                 : rcHeaderH_;
+            const RECT tr = TrackRect(row);
+            if (pt.x < tr.left - 9 || pt.x > tr.right + 9) return 0;
+
             sliderDrag_ = id;
             SetCapture(h);
             SendMessageW(h, WM_MOUSEMOVE, 0, lp);   // 立刻按点击位置设值
@@ -1496,19 +1704,12 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             const RECT& row = (sliderDrag_ == ID_RADIUS) ? rcRadius_
                               : (sliderDrag_ == ID_ALPHA) ? rcAlpha_
                                                           : rcHeaderH_;
-            RECT tr = TrackRect(row);
+            // 区间和绘制共用 SliderRange —— 之前这里对头部高度用的是 28..72，
+            // 而绘制用 26..50，两套比例尺直接导致圆点跑偏 + 显示满值卡死。
             int lo = 0, hi = 100;
-            if (sliderDrag_ == ID_RADIUS) { lo = 0; hi = kRadiusMax; }
-            else if (sliderDrag_ == ID_ALPHA) { lo = 40; hi = 255; }
-            else { lo = 28; hi = 72; }
+            SliderRange(sliderDrag_, lo, hi);
+            const int v = SliderValueFromX(row, pt.x, lo, hi);
 
-            const int span = tr.right - tr.left;
-            int v = lo;
-            if (span > 0) {
-                double t01 = (double)(pt.x - tr.left) / (double)span;
-                t01 = std::clamp(t01, 0.0, 1.0);
-                v = lo + (int)std::lround(t01 * (hi - lo));
-            }
             if (sliderDrag_ == ID_RADIUS) {
                 for (auto& f : g_config.fences) f.radius = v;
             } else if (sliderDrag_ == ID_ALPHA) {
@@ -1537,6 +1738,16 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
+    // 拖动中途 capture 被别人抢走（Alt+Tab、别的程序弹窗、UAC 提示）时，
+    // sliderDrag_ 会一直挂着 —— 之后鼠标随便动一下都在改值，看着就像「滑块坏了」。
+    // 收到这条就把拖动状态收干净并落盘。
+    case WM_CAPTURECHANGED:
+        if (sliderDrag_ >= 0) {
+            sliderDrag_ = -1;
+            g_config.Save();
+        }
+        return 0;
+
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
             POINT pt{};
@@ -1549,6 +1760,15 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             return TRUE;
+        }
+        break;
+
+    // 录制中途丢了焦点（点了别的窗口）→ 放弃这次录制。
+    // 不收的话 hotkeyCapture_ 会一直挂着，之后这个窗口的键盘消息全被吃掉。
+    case WM_KILLFOCUS:
+        if (hotkeyCapture_) {
+            hotkeyCapture_ = false;
+            Paint();
         }
         break;
 
@@ -1626,6 +1846,10 @@ void SettingsWindow::Show() {
     if (!hwnd_) return;
     dark_ = !AppsUseLightTheme();
     if (ruleBrush_) { DeleteObject(ruleBrush_); ruleBrush_ = nullptr; }   // 主题可能变了
+    // 每次显示都清掉「录制中」：上次可能是在录制时被切走/最小化的，
+    // 残留下来的话这个窗口就把键盘全吃了。
+    hotkeyCapture_ = false;
+    hotkeyFailed_ = false;
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd_);
     // 规则页的输入框是懒创建的：每次显示都重建一遍，顺便把配置里的最新内容带进来

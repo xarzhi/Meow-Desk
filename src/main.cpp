@@ -172,6 +172,36 @@ static void LogStep(const char* step) {
 
 static void LogStep(const std::string& s) { LogStep(s.c_str()); }
 
+// 注册（或重注册）唤出搜索面板的全局快捷键。
+//
+// 组合存在 g_config.searchHotkey（"ALT+F" 这种文本）。解析失败就退回 ALT+F ——
+// 快捷键没注册上等于整个搜索面板用不了，宁可回到默认值也别让它空着。
+// 返回 false = RegisterHotKey 被拒（这组键已经被别的程序占了），
+// 设置页据此提示用户「换一个」，但不回滚他刚录的值。
+static bool RegisterSearchHotkey() {
+    UnregisterHotKey(nullptr, kHotkeyId);
+    UINT mods = MOD_ALT;
+    UINT vk = 'F';
+    if (!ParseHotkey(g_config.searchHotkey, mods, vk)) {
+        mods = MOD_ALT;
+        vk = 'F';
+        LogStep("hotkey: config value unparsable, fallback to ALT+F");
+    }
+    if (RegisterHotKey(nullptr, kHotkeyId, mods, vk)) {
+        LogStep("hotkey registered");
+        return true;
+    }
+    // 请求的组合被占了。这里**一定要**退回 ALT+F 再试一次 ——
+    // 上面已经把旧组合 Unregister 掉了，直接 return 会让整个搜索面板
+    // 在本次运行里彻底没有入口（用户只能重启程序）。
+    if (!(mods == MOD_ALT && vk == 'F') && RegisterHotKey(nullptr, kHotkeyId, MOD_ALT, 'F')) {
+        LogStep("hotkey: requested combo taken, fell back to ALT+F");
+        return false;
+    }
+    LogStep("hotkey: RegisterHotKey FAILED (already taken by another app)");
+    return false;
+}
+
 static int SnapTo(int v, int step) {
     if (step <= 0) return v;
     return (int)std::lround((double)v / (double)step) * step;
@@ -3535,6 +3565,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 1. 配置
     g_config.Load();
     ConfigEnsureDefaults();
+    // 每天第一次启动顺手把库快照到 backup\（同一天只做一次，库很小，毫秒级）。
+    // 放在配置加载之后：那时候 storage 已经打开，而且 ConfigEnsureDefaults
+    // 可能刚刚补写过默认值 —— 备份要包含这一步的结果。
+    storage::BackupDaily();
     // 上次开了「高优先级运行」就照办 —— 进程优先级不落盘在系统里，
     // 每次启动都得自己按配置重新设一遍。
     ApplyHighPriority(g_config.highPriority != 0);
@@ -3901,6 +3935,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (TaskQuery(enabled) && enabled) TaskRegister(on);
     };
     g_settings.onOrganize = [] { OrganizeDesktopNow(); };
+    // 设置页改了快捷键 → 立刻重注册。返回 false 让设置页提示「被占用」，
+    // 但不回滚：用户刚录的值留着，他可以再录一个。
+    g_settings.onHotkeyChanged = [] { return RegisterSearchHotkey(); };
+    g_settings.onBackupNow = [] {
+        const std::wstring p = storage::BackupNow();
+        LogStep(p.empty() ? "backup: FAILED" : "backup: done");
+    };
+    g_settings.onOpenBackupDir = [] { shell_open::Open(storage::BackupDir()); };
 
     // 单例：第二个进程双击 exe 时把它的界面叫出来（第二个进程自己不弹任何东西）
     g_surface.onActivateRequest = [] {
@@ -3934,10 +3976,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         fclose(f);
     };
     if (!g_search.Create()) LogStep("search window create FAILED");
-    if (!RegisterHotKey(nullptr, kHotkeyId, MOD_ALT, 'F'))
-        LogStep("RegisterHotKey(Alt+F) FAILED");
-    else
-        LogStep("hotkey Alt+F registered");
+    RegisterSearchHotkey();
 
     g_tray.onSettings = [] {
         if (g_settings.hwnd()) g_settings.Show();

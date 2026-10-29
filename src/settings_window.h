@@ -49,6 +49,14 @@ public:
     std::function<void(bool)> setHighPriority;
     // 整理规则页：「立即整理桌面…」
     std::function<void()> onOrganize;
+    // 改完搜索快捷键 → 让主程序重新 RegisterHotKey。返回 false = 这组键被别的
+    // 程序占用了（界面要提示，但不能把用户刚录的值丢掉，他可以再录一个）。
+    std::function<bool()> onHotkeyChanged;
+    // 关于页：立即备份 / 打开备份目录（实际动作在 main，那边才有 storage 和数据目录）
+    std::function<void()> onBackupNow;
+    std::function<void()> onOpenBackupDir;
+    // 备份成功后临时显示一行「已备份到 …」（只是提示，不落盘）
+    bool backupDone_ = false;
 
 private:
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
@@ -119,6 +127,7 @@ private:
     RECT rcSortAnim_{};
     RECT rcSnap_{};         // 自动吸附：移动盒子 / 改尺寸时贴边
     RECT rcTabHover_{};     // 分组标签：鼠标移入就切 / 点击才切
+    RECT rcHotkey_{};       // 搜索面板的全局快捷键（点击进入录制状态）
 
     // ---- 整理规则 ----
     RECT rcAutoOrganize_{};
@@ -133,7 +142,15 @@ private:
 
     // ---- 关于 ----
     RECT rcOpenFolder_{};
+    RECT rcBackupNow_{};      // 立即备份
+    RECT rcOpenBackup_{};     // 打开备份目录
 
     int hot_ = -1;
     int sliderDrag_ = -1;
+
+    // 正在等用户按组合键。为 true 时 WndProc 把键盘消息全部吃掉，
+    // 由它来组 (mods,vk) —— 不能让 Alt+F 之类的组合漏给系统菜单。
+    bool hotkeyCapture_ = false;
+    // 录制结果：注册失败时显示一行红字（不落盘就没事，用户可再录一个）
+    bool hotkeyFailed_ = false;
 };

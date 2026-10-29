@@ -140,6 +140,11 @@ bool ConfigFromDb(AppConfig& c) {
             else if (k == L"autoOrganize") c.autoOrganize = n;
             else if (k == L"switchTabOnHover") c.switchTabOnHover = n;
             else if (k == L"highPriority") c.highPriority = n;
+            // 唯一一个字符串项：其余都是 int，所以这里单独走 colText。
+            else if (k == L"searchHotkey") {
+                const std::wstring v = st.colText(1);
+                if (!v.empty()) c.searchHotkey = v;
+            }
         }
     }
     {
@@ -238,6 +243,15 @@ void ConfigEnsureDefaults() {
     }
     // 圆角上限 20：滑块到头就 20，但老配置里可能存着 28。
     // 读进来统一夹一次，否则设置页显示 20、盒子上还是画 28，用户会以为没生效。
+    // 头部高度同理：滑块曾经按 28..72 的比例尺写过值（bug，已修），老库里可能存着
+    // 51~72 —— 设置页只画到 50，盒子上却按 72 渲染，看着就是「设置写 50、头部还是很高」。
+    if (g_config.headerHeight < 26) {
+        g_config.headerHeight = 26;
+        dirty = true;
+    } else if (g_config.headerHeight > 50) {
+        g_config.headerHeight = 50;
+        dirty = true;
+    }
     for (auto& f : g_config.fences) {
         if (f.radius < 0) { f.radius = 0; dirty = true; }
         else if (f.radius > 20) { f.radius = 20; dirty = true; }
@@ -365,6 +379,14 @@ void AppConfig::Save() const {
         put(L"autoOrganize", autoOrganize);
         put(L"switchTabOnHover", switchTabOnHover);
         put(L"highPriority", highPriority);
+        // searchHotkey 是字符串，put 只收 int —— 单独写一次。
+        // 空值不落盘（新用户的默认值由 AppConfig 的字段初始值给）。
+        if (st.ok() && !searchHotkey.empty()) {
+            st.bindText(1, L"searchHotkey");
+            st.bindText(2, searchHotkey);
+            st.done();
+            st.reset();
+        }
 
         storage::Stmt fs(
             "INSERT INTO fence(id,x,y,w,h,color,alpha,radius,acrylic,title,"
@@ -447,4 +469,123 @@ void AppConfig::Save() const {
         storage::Rollback();
         LogLine(("config: save failed. " + storage::LastError()).c_str());
     }
+}
+
+// ---------------------------------------------------------------------------
+// 全局快捷键字符串
+//
+// 存 "ALT+F" 这种文本而不是 (mods,vk) 两个整数：db 的 app 表本来就是纯文本 kv，
+// 文本人能看懂、手改也方便，以后加更多快捷键不用动表结构。
+// Parse 和 Format 必须互逆（VkNameOf 对表外的键回退成 VK_0x<hex>，VkFromName
+// 认得这个形式），否则「录一次快捷键 → 重启」就会丢设置。
+// ---------------------------------------------------------------------------
+namespace {
+
+// 顺序 = Format 里的拼接顺序，改这里不影响解析（解析是按名字查的）
+const wchar_t* const kModNames[4] = {L"CTRL", L"ALT", L"SHIFT", L"WIN"};
+const UINT kModBits[4] = {MOD_CONTROL, MOD_ALT, MOD_SHIFT, MOD_WIN};
+
+struct VkName {
+    const wchar_t* name;
+    UINT vk;
+};
+
+// 只收「真的会拿来当快捷键」的键。字母/数字/F1-F24 由代码判断，不进表。
+const VkName kVkNames[] = {
+    {L"SPACE", VK_SPACE},   {L"TAB", VK_TAB},     {L"ENTER", VK_RETURN},
+    {L"ESC", VK_ESCAPE},    {L"LEFT", VK_LEFT},   {L"RIGHT", VK_RIGHT},
+    {L"UP", VK_UP},         {L"DOWN", VK_DOWN},   {L"HOME", VK_HOME},
+    {L"END", VK_END},       {L"PGUP", VK_PRIOR},  {L"PGDN", VK_NEXT},
+    {L"INSERT", VK_INSERT}, {L"DELETE", VK_DELETE},
+};
+
+std::wstring HkTrim(const std::wstring& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == L' ' || s[a] == L'\t')) ++a;
+    while (b > a && (s[b - 1] == L' ' || s[b - 1] == L'\t')) --b;
+    return s.substr(a, b - a);
+}
+
+std::wstring HkUpper(std::wstring s) {
+    for (auto& c : s)
+        if (c >= L'a' && c <= L'z') c = (wchar_t)(c - L'a' + L'A');
+    return s;
+}
+
+std::wstring VkNameOf(UINT vk) {
+    for (const auto& n : kVkNames)
+        if (n.vk == vk) return n.name;
+    if (vk >= 'A' && vk <= 'Z') return std::wstring(1, (wchar_t)vk);
+    if (vk >= '0' && vk <= '9') return std::wstring(1, (wchar_t)vk);
+    if (vk >= VK_F1 && vk <= VK_F24) return L"F" + std::to_wstring((int)(vk - VK_F1 + 1));
+    wchar_t buf[16]{};
+    swprintf_s(buf, L"VK_0x%02X", vk);
+    return buf;
+}
+
+UINT VkFromName(const std::wstring& n) {
+    for (const auto& t : kVkNames)
+        if (n == t.name) return t.vk;
+    if (n.size() == 1 && ((n[0] >= L'A' && n[0] <= L'Z') || (n[0] >= L'0' && n[0] <= L'9')))
+        return (UINT)n[0];
+    if (n.size() >= 2 && n[0] == L'F') {
+        const int idx = _wtoi(n.c_str() + 1);
+        if (idx >= 1 && idx <= 24) return (UINT)(VK_F1 + idx - 1);
+        return 0;
+    }
+    if (n.rfind(L"VK_0X", 0) == 0) {
+        const unsigned long v = wcstoul(n.c_str() + 5, nullptr, 16);
+        return (v > 0 && v < 0x100) ? (UINT)v : 0;
+    }
+    return 0;
+}
+
+}  // namespace
+
+bool ParseHotkey(const std::wstring& s, UINT& mods, UINT& vk) {
+    mods = 0;
+    vk = 0;
+    const std::wstring up = HkUpper(s);
+    if (up.empty()) return false;
+
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    for (;;) {
+        const size_t p = up.find(L'+', start);
+        if (p == std::wstring::npos) {
+            parts.push_back(HkTrim(up.substr(start)));
+            break;
+        }
+        parts.push_back(HkTrim(up.substr(start, p - start)));
+        start = p + 1;
+    }
+    // 必须「至少一个修饰键 + 一个主键」。没有修饰键的全局热键等于把那个键从
+    // 所有程序手里抢走，这种值绝不能落盘（设置页也会拒绝只按一个键）。
+    if (parts.size() < 2) return false;
+
+    for (size_t i = 0; i + 1 < parts.size(); ++i) {
+        bool hit = false;
+        for (int k = 0; k < 4; ++k) {
+            if (parts[i] != kModNames[k]) continue;
+            mods |= kModBits[k];
+            hit = true;
+            break;
+        }
+        if (!hit) return false;
+    }
+    if (mods == 0) return false;
+
+    vk = VkFromName(parts.back());
+    return vk != 0;
+}
+
+std::wstring FormatHotkey(UINT mods, UINT vk) {
+    std::wstring out;
+    for (int k = 0; k < 4; ++k) {
+        if (!(mods & kModBits[k])) continue;
+        out += kModNames[k];
+        out += L'+';
+    }
+    out += VkNameOf(vk);
+    return out;
 }

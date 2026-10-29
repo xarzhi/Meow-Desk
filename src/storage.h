@@ -90,4 +90,16 @@ private:
 // 最近一次错误的可读描述（写日志用）
 std::string LastError();
 
+// ---- 备份 ----
+//
+// 数据库里装着用户全部的「心血」：盒子位置、分组、待办、图标布局、搜索常用。
+// 文件一旦损坏/被误删，等于所有整理工作归零，所以这里做一层兜底：
+// 每次启动（同一天只做一次）把整份快照到 <数据目录>\backup\，只留最近 N 份。
+//
+// 用 sqlite3_backup API 而不是复制文件：库可能正开着（还有 -journal），
+// 直接拷文件会拿到半个事务。backup API 保证是一致性快照。
+const std::wstring& BackupDir();     // 顺带确保目录存在
+std::wstring BackupNow();            // 立刻备份，返回完整路径（失败返回空串）
+void BackupDaily();                  // 启动时调一次：今天没备过就补一份 + 清理旧备份
+
 }  // namespace storage

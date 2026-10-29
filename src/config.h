@@ -115,6 +115,11 @@ struct AppConfig {
     // 以高优先级运行：桌面层要跟手，NORMAL 优先级下偶尔会被别的程序抢 CPU 拖慢重绘
     int highPriority = 0;
 
+    // 唤出搜索面板的全局快捷键，形如 "ALT+F" / "CTRL+ALT+SPACE"。
+    // 存字符串而不是 (mods,vk) 两个整数：db 里可读、以后加项也不用改表结构。
+    // 解析失败时调用方会退回 ALT+F（见 ParseHotkey）。
+    std::wstring searchHotkey = L"ALT+F";
+
     std::vector<FenceConfig> fences;
     std::vector<OrganizeRule> rules;
 
@@ -124,6 +129,17 @@ struct AppConfig {
     static std::wstring Dir();
     static std::wstring File();
 };
+
+// 全局快捷键字符串 ⇄ win32 的 (modifiers, vk)。
+//
+// 为什么用字符串：db 的 app 表是纯文本 kv，存 "ALT+F" 人能看懂、改起来也方便，
+// 以后要加更多快捷键也不用改表结构。
+//
+// 支持的键名：A-Z / 0-9 / F1-F24 / SPACE TAB ENTER ESC LEFT RIGHT UP DOWN
+//             HOME END PGUP PGDN INSERT DELETE 和几个 OEM 符号；
+// 表里没有的一律回退成 `VK_0x<hex>`，所以 Parse 和 Format 永远是互逆的。
+bool ParseHotkey(const std::wstring& s, UINT& mods, UINT& vk);
+std::wstring FormatHotkey(UINT mods, UINT vk);
 
 extern AppConfig g_config;
 
