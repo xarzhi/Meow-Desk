@@ -126,6 +126,7 @@ add_executable(meow-desk WIN32
     src/file_drop.cpp
     src/rename_box.cpp
     src/rename_dialog.cpp
+    src/todo_dialog.cpp
     src/shell_drag.cpp
     src/shell_open.cpp
     src/app_icon.cpp

@@ -321,17 +321,27 @@ public:
     // 行高固定 34px（比图标格矮得多：一条待办就是「一个方块 + 一行字」）。
     static constexpr int kTodoRowH = 34;
     int TodoRowH() const { return kTodoRowH; }
-    // 当前这个 tab 下能看到几行（可见条目数 + 末尾那行「+ 新建待办」）
+    // 当前这个 tab 下能看到几行（= 可见条目数；末尾那行「+ 新建待办」已经去掉，
+    // 新建改成头部右侧的 + 按钮 → 弹出窗口）
     int TodoCount() const;
-    // 第 row 行的客户区矩形（含末尾的「新建」行）
+    // 第 row 行的客户区矩形
     RECT TodoRowRect(int row) const;
     void ToggleTodoAt(int row);    // 勾上 / 取消勾
-    void EditTodoAt(int row);      // 就地改文字；row == TodoCount()-1 表示新增
+    void EditTodoAt(int row);      // 就地改文字（新建走 AddTodo 的弹窗）
     void DeleteTodoAt(int row);
     // 第 row 行右侧那个「×」删除按钮的客户区矩形（行不存在 → 空矩形）。
     RECT TodoDeleteRect(int row) const;
     // 这一点是不是点在那颗「×」上（删除按钮，命中范围比图形本身宽一点，好点）
     bool TodoDeleteHit(int row, POINT clientPt) const;
+    // 第 row 行右侧「详情」胶囊的矩形 / 命中（在 × 左边一格）
+    RECT TodoDetailRect(int row) const;
+    bool TodoDetailHit(int row, POINT clientPt) const;
+    // 头部右侧那颗「＋ 新建待办」的客户区矩形
+    RECT TodoAddRect() const;
+    // 弹窗看这条的详情，弹窗里能直接点「完成 / 恢复」
+    void ShowTodoDetail(int row);
+    // 把第 row 行滚进可视区（新建、改完名字之后用）
+    void ScrollTodoIntoView(int row);
     // 勾掉 / 取消勾的过渡动画：先让这一行淡出并轻微下沉，动画结束再真正写数据
     // —— 数据一改，这一条就属于另一个 tab 了，会当场从列表里消失，没有过渡可言。
     void StartTodoToggle(int row);
@@ -685,6 +695,8 @@ private:
     int todoAnimDur_ = 220;
     bool pressArrow_ = false;
     bool pressLock_ = false;
+    // 待办盒头部那颗「＋ 新建」被按下了（松手时弹新建窗口）
+    bool pressTodoAdd_ = false;
     // 点击标签：松手时（没拖动过）才切
     int pressTab_ = -1;
 

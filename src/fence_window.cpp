@@ -20,6 +20,7 @@
 #include "icon_render.h"
 #include "rename_box.h"
 #include "screen_util.h"
+#include "todo_dialog.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -392,6 +393,8 @@ const int kTabMinW = 40;
 const int kTabMaxW = 152;
 // 头部右侧被锁按钮（width-52±9）和箭头（最右 40px）占掉了，标签不能压过去
 const int kTabRightReserve = 74;
+// 待办盒右边还多一颗「＋ 新建」（中心 width-76），标签再让开一格
+const int kTabRightReserveTodo = kTabRightReserve + 24;
 
 int TabWidthFor(const std::wstring& name, int fontPx) {
     int w = MeasureTabText(name, fontPx) + kTabPadX * 2;
@@ -497,15 +500,41 @@ std::wstring FormatMTime(const FILETIME& ft) {
 // ---------------------------------------------------------------------------
 // 待办盒的内容区
 //
-// 一条待办 = 「圆角勾选框 + 一行字」，完成态画删除线并变灰。
-// 末尾固定一行「＋ 新建待办」，点它就地输入 —— 不另开对话框。
+// 一条待办 = 「圆角勾选框 + 一行字 + 右端两个按钮（详情 / ×）」，
+// 完成态画删除线并变灰。
 // 行高固定（FenceWindow::kTodoRowH），所以滚动量、命中、输入框位置可以
 // 全部用 row * rowH 直接算出来，不需要额外的布局缓存。
+//
+// 注意：末尾那一行「＋ 新建待办」已经去掉了 —— 新建改成**头部右侧的 + 按钮 + 弹窗**。
+// 行右端那两个按钮的几何只能在这里算一次（见 TodoDelCx / TodoDetRectOf），
+// 画出和命中各写一份的话，鼠标明明点在「详情」上却判成「打勾」。
 // ---------------------------------------------------------------------------
 // ARGB（GDI+ 的 Color 值）取分量。注意和 COLORREF 的字节序相反。
 inline BYTE ArgbR(ARGB c) { return (BYTE)((c >> 16) & 0xFF); }
 inline BYTE ArgbG(ARGB c) { return (BYTE)((c >> 8) & 0xFF); }
 inline BYTE ArgbB(ARGB c) { return (BYTE)(c & 0xFF); }
+
+// ---- 行右端按钮几何（唯一来源）----
+const int kTodoActRight = 8;    // × 距行右边界
+const int kTodoDelSz = 18;      // × 命中盒（图形 16px，命中放宽一点）
+const int kTodoDetW = 36;       // 「详情」胶囊宽度
+const int kTodoDetH = 20;       // 「详情」胶囊高度
+const int kTodoActGap = 4;      // 两个按钮之间的间隙
+// 行右端被两个按钮吃掉的总宽度（排版算正文宽时要用）
+const int kTodoActSpan =
+    kTodoActRight + kTodoDelSz + kTodoActGap + kTodoDetW + 6;   // +6 是文字侧留白
+
+int TodoDelCx(int rowRight) { return rowRight - kTodoActRight - kTodoDelSz / 2; }
+
+RECT TodoDetRectOf(int rowRight, int cy) {
+    const int right = TodoDelCx(rowRight) - kTodoDelSz / 2 - kTodoActGap;
+    return RECT{right - kTodoDetW, cy - kTodoDetH / 2, right, cy + kTodoDetH / 2};
+}
+
+// 行太窄时不摆「详情」胶囊（正文优先）：盒子被拉得很细的时候，36px 的胶囊会
+// 直接把待办文字盖住。绘制和命中都问这一句，否则会出现「画了但点不到」。
+// 窄盒子的详情入口还有右键菜单的「查看详情」。
+bool TodoDetailFits(int rowLeft, int rowRight) { return (rowRight - rowLeft) >= 190; }
 
 // 一条要贴的文字。PaintTodoBody 只负责排版（算出文字盒），真正栅格化交给
 // FenceWindow::DrawUiTextDib —— 那里走 GDI，和图标标题同一条路（见 UiText）。
@@ -536,8 +565,9 @@ struct TodoPaintArgs {
     // 这一帧要画的条目（cfg_->todos 的下标）。头部切了「未完成 / 已完成」之后
     // 不是所有条目都在当前 tab 里，所以不能直接遍历 items。
     const std::vector<int>* idx = nullptr;
-    bool showAdd = true;   // 末尾要不要画「＋ 新建待办」（已完成 tab 不画）
-    // 一条都没有时的提示（空 = 不画）。已完成 tab 用它说「还没有已完成的待办」
+    // 一条都没有时的提示（空 = 不画）。未完成 tab 用它引导「点右上角 + 新建」，
+    // 已完成 tab 用它说「还没有已完成的待办」—— 末尾那行「＋ 新建」去掉了，
+    // 空列表必须留句话，否则一整块空白看着像坏了。
     const wchar_t* emptyHint = nullptr;
     // 勾掉动画：这一行整体淡出 + 轻微下沉。row < 0 = 没有动画。
     int animRow = -1;
@@ -560,20 +590,21 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
     const int boxSize = 17;
     const int boxX = a.rowLeft + 10;
     const int textX = boxX + boxSize + 10;
-    // 右边留出「×」删除按钮的位置（18px + 右边距）
-    const int delW = 22;
-    // 文字右边再让出 6px：命中盒比图形宽，贴太紧的话点「最后一个字」会误删
-    const int textW = std::max(16, a.rowRight - delW - 6 - textX);
+    // 右边留出「详情」胶囊 + 「×」删除两个按钮（宽度见 kTodoActSpan，
+    // 和命中判定共用同一份，别在这里另算一套）。行太窄时只留 ×。
+    const bool showDet = TodoDetailFits(a.rowLeft, a.rowRight);
+    const int actSpan =
+        showDet ? kTodoActSpan : (kTodoActRight + kTodoDelSz + 6);
+    const int textW = std::max(16, a.rowRight - actSpan - textX);
 
-    const int n = (int)a.idx->size();
-    const int total = n + (a.showAdd ? 1 : 0);
+    const int total = (int)a.idx->size();
     auto pushText = [&](const std::wstring& s, RECT box, ARGB c, bool strike, bool left,
-                        int alpha) {
+                        int alpha, int pxPx = 0) {
         if (!a.texts) return;
         TodoTextOut t;
         t.text = s;
         t.box = box;
-        t.px = rowPx;
+        t.px = (pxPx > 0) ? pxPx : rowPx;   // 0 = 正文默认 13px（「详情」胶囊用 12px）
         t.strike = strike;
         t.leftAlign = left;
         t.alpha = alpha;
@@ -593,7 +624,6 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
         // 整行落在内容区里才画：滚到边上时不出现「半行」
         if (y < a.clipTop || y + a.rowH > a.clipBottom) continue;
 
-        const bool addRow = a.showAdd && (i == n);
         const bool hot = (a.hot == i);
         const int cy = y + a.rowH / 2;
 
@@ -623,20 +653,6 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
             g.FillPath(&hb, &hp);
         }
 
-        if (addRow) {
-            // 末尾「＋ 新建待办」：不画勾选框，画一个加号 + 灰字，悬停变主题色
-            Pen plus{hot ? Color(a.accent) : Color(a.fgDim), 1.6f};
-            plus.SetStartCap(LineCapRound);
-            plus.SetEndCap(LineCapRound);
-            const float cx = (float)boxX + (float)boxSize * 0.5f;
-            g.DrawLine(&plus, cx - 4.5f, (float)rcy, cx + 4.5f, (float)rcy);
-            g.DrawLine(&plus, cx, (float)rcy - 4.5f, cx, (float)rcy + 4.5f);
-            pushText(L"\u65b0\u5efa\u5f85\u529e",   // 新建待办
-                     RECT{textX, ry, textX + textW, ry + a.rowH},
-                     hot ? a.accent : a.fgDim, false, true, rowA);
-            continue;
-        }
-
         const TodoItem& it = (*a.items)[(*a.idx)[i]];
         // 这一行正在放勾选动画：勾选框先按新状态画（数据还没改）
         const bool animating = (a.animRow == i);
@@ -660,12 +676,30 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
         pushText(it.text, RECT{textX, ry, textX + textW, ry + a.rowH},
                  done ? a.fgDim : a.fg, done, true, rowA);
 
-        // ---- 右侧「×」删除按钮 ----
-        // 悬停这一行时实一点、带一圈淡底，平时很淡 —— 一直画着，但不去抢内容。
+        // ---- 右侧两个按钮：「详情」胶囊 + 「×」删除 ----
+        // 平时都很淡，悬停这一行时实起来 —— 一直画着，但不去抢内容。
+        // 几何全部来自 TodoDetRectOf / TodoDelCx，和命中判定共用同一份。
         {
-            const int ds = 16;
-            const int dx = a.rowRight - (delW - 6) - ds / 2;   // 右边留 8px
-            const float cx = (float)dx + ds * 0.5f;
+            if (showDet) {
+                const RECT dr = TodoDetRectOf(a.rowRight, rcy);
+                const RectF drf((float)dr.left, (float)dr.top, (float)(dr.right - dr.left),
+                                (float)(dr.bottom - dr.top));
+                GraphicsPath dp;
+                AddRoundRect(dp, drf, 6.0f);
+                if (hot) {
+                    SolidBrush db{Color(a.light ? 0x12000000 : 0x1CFFFFFF)};
+                    g.FillPath(&db, &dp);
+                }
+                const ARGB dc = hot ? a.accent : a.fgDim;
+                const BYTE da = (BYTE)std::min(255, (int)((hot ? 255 : 150) * rowA / 255));
+                Pen dpen{Color(da, ArgbR(dc), ArgbG(dc), ArgbB(dc)), 1.0f};
+                g.DrawPath(&dpen, &dp);
+                pushText(L"\u8be6\u60c5",   // 详情
+                         RECT{dr.left + 2, dr.top, dr.right - 2, dr.bottom}, dc, false, false,
+                         (int)((hot ? 255 : 150) * rowA / 255), 12);
+            }
+
+            const float cx = (float)TodoDelCx(a.rowRight);
             const float cyy = (float)rcy;
             const float r = 4.0f;
             if (hot) {
@@ -748,10 +782,12 @@ int FenceWindow::TodoIndexOfRow(int row) const {
 
 bool FenceWindow::TodoRowIsItem(int row) const { return TodoIndexOfRow(row) >= 0; }
 
-// 行数 = 可见条目数 + 末尾那一行「＋ 新建待办」（已完成 tab 没有这一行）
+// 行数 = 当前 tab 的可见条目数。
+// （末尾那一行「＋ 新建待办」已经去掉：新建改成「头部右侧的 + 按钮 → 弹出窗口」，
+//   所以这里不再 +1。HitTodoRow / MaxScroll / hot_ 的上界全靠它，别在别处另算。）
 int FenceWindow::TodoCount() const {
     if (!isTodo()) return 0;
-    return VisibleTodoCount() + (todoFilter_ == 0 ? 1 : 0);
+    return VisibleTodoCount();
 }
 
 RECT FenceWindow::TodoRowRect(int row) const {
@@ -774,14 +810,11 @@ int FenceWindow::HitTodoRow(POINT clientPt) const {
 
 void FenceWindow::ClickTodoRow(int row) {
     if (!isTodo() || row < 0 || row >= TodoCount()) return;
-    if (!TodoRowIsItem(row)) {
-        EditTodoAt(row);   // 末尾那行 = 新增
-        return;
-    }
+    if (!TodoRowIsItem(row)) return;   // 空行（理论上不会出现）
     StartTodoToggle(row);
 }
 
-// 第 row 行右边那颗「×」：图形本身 16px，命中盒给到 18px（好点一点）。
+// 第 row 行右边那颗「×」：圆心由 TodoDelCx 算（和绘制共用同一份几何）。
 // 中心和 PaintTodoBody 里画的那个椭圆**必须**一致 —— 两处各写一份的话
 // 鼠标明明点在 × 上却判成「打勾」。
 RECT FenceWindow::TodoDeleteRect(int row) const {
@@ -789,13 +822,32 @@ RECT FenceWindow::TodoDeleteRect(int row) const {
     const RECT r = TodoRowRect(row);
     if (r.bottom <= r.top) return RECT{0, 0, 0, 0};
     const int cy = (r.top + r.bottom) / 2;
-    const int cx = r.right - 16;
-    return RECT{cx - 9, cy - 9, cx + 9, cy + 9};
+    const int cx = TodoDelCx(r.right);
+    return RECT{cx - kTodoDelSz / 2, cy - kTodoDelSz / 2, cx + kTodoDelSz / 2,
+                cy + kTodoDelSz / 2};
+}
+
+// 「详情」胶囊（在 × 左边一格）。同样是绘制/命中唯一的几何来源。
+// 行太窄时返回空矩形（不画、也点不到），详情仍可从右键菜单进。
+RECT FenceWindow::TodoDetailRect(int row) const {
+    if (!isTodo() || row < 0) return RECT{0, 0, 0, 0};
+    const RECT r = TodoRowRect(row);
+    if (r.bottom <= r.top) return RECT{0, 0, 0, 0};
+    if (!TodoDetailFits(r.left, r.right)) return RECT{0, 0, 0, 0};
+    return TodoDetRectOf(r.right, (r.top + r.bottom) / 2);
 }
 
 bool FenceWindow::TodoDeleteHit(int row, POINT clientPt) const {
-    if (!TodoRowIsItem(row)) return false;   // 「＋ 新建」那行没有 ×
+    if (!TodoRowIsItem(row)) return false;   // 只有条目行才有 × / 详情
     const RECT d = TodoDeleteRect(row);
+    if (d.right <= d.left) return false;
+    return clientPt.x >= d.left && clientPt.x < d.right && clientPt.y >= d.top &&
+           clientPt.y < d.bottom;
+}
+
+bool FenceWindow::TodoDetailHit(int row, POINT clientPt) const {
+    if (!TodoRowIsItem(row)) return false;
+    const RECT d = TodoDetailRect(row);
     if (d.right <= d.left) return false;
     return clientPt.x >= d.left && clientPt.x < d.right && clientPt.y >= d.top &&
            clientPt.y < d.bottom;
@@ -870,12 +922,90 @@ void FenceWindow::DeleteTodoAt(int row) {
     Redraw();
 }
 
+// 滚动到第 row 行（新建 / 改完名字之后用）。视口高度和 MaxScroll 共用一套算法。
+void FenceWindow::ScrollTodoIntoView(int row) {
+    if (!isTodo() || row < 0) return;
+    const int rh = TodoRowH();
+    const int top = HeadH() + kPad;
+    const int viewH = std::max(1, curH_ - kPad - top);
+    const int rowTop = row * rh;
+    const int rowBottom = rowTop + rh;
+    int want = scrollY_;
+    if (rowTop < scrollY_)
+        want = rowTop;
+    else if (rowBottom > scrollY_ + viewH)
+        want = rowBottom - viewH;
+    if (want != scrollY_) {
+        scrollY_ = want;
+        ClampScroll();
+        Redraw();
+    }
+}
+
+// 新建待办：头部右侧的 + / 右键菜单「新建待办」都走这里 —— 弹一个居中的输入窗口，
+// 点了「确定」才真的往盒子里加。（以前是列表末尾就地输入，用户要求换成弹窗。）
 void FenceWindow::AddTodo() {
-    if (!isTodo()) return;
-    // 新增的一定是「没做的」：在已完成 tab 里按新建，先切回未完成再开输入框，
-    // 否则输入框会出现在一个不属于当前 tab 的行位置。
+    if (!isTodo() || !hwnd_) return;
+    // 新建的一定是「没做的」：在已完成 tab 里新建先切回未完成，
+    // 否则刚加的这条根本不在当前列表里，用户会以为「没加上」。
     if (todoFilter_ != 0) SetTodoFilter(0);
-    EditTodoAt(VisibleTodoCount());
+    if (todoAnimRow_ >= 0) FinishTodoAnim();   // 挂起的勾选先落地，行号才准
+
+    SetInteractionHold(true);   // 弹窗期间别让伸缩模式的盒子收起来
+    TodoDialog::ShowInput(
+        hwnd_, std::wstring(),
+        [this](const std::wstring& s) {
+            if (!cfg_ || !isTodo() || s.empty()) return;
+            cfg_->todos.push_back(TodoItem{s, 0});
+            if (onStateChanged) onStateChanged();
+            hot_ = -1;
+            // 刚加的在列表末尾，滚过去让人看见
+            ScrollTodoIntoView(VisibleTodoCount() - 1);
+            Redraw();
+        },
+        [this] {
+            SetInteractionHold(false);
+            if (hwnd_) SetForegroundWindow(hwnd_);
+        });
+}
+
+// 查看详情：弹窗里能直接点「完成」（已完成的那条是「恢复」）。
+// 传的是 cfg_->todos 的下标而不是行号 —— 弹窗开着的时候用户切了 tab 也不会指错。
+void FenceWindow::ShowTodoDetail(int row) {
+    if (!isTodo() || !hwnd_) return;
+    if (todoAnimRow_ >= 0) FinishTodoAnim();   // 行号/下标会整体变一次，先落地
+    const int sub = TodoIndexOfRow(row);
+    if (sub < 0 || sub >= (int)cfg_->todos.size()) return;
+    // 弹窗开着的时候用户仍可能去点别的（盒子窗口不抢前台）：切 tab 没事（下标稳定），
+    // 但删掉一条就会让下标整体前移。留一份文字当指纹，回调里对不上就重新找一次。
+    const std::wstring want = cfg_->todos[sub].text;
+
+    SetInteractionHold(true);
+    TodoDialog::ShowDetail(
+        hwnd_, cfg_->todos[sub].text, cfg_->todos[sub].done != 0,
+        [this, sub, want] {
+            if (!cfg_ || !isTodo()) return;
+            int i = sub;
+            if (i >= (int)cfg_->todos.size() || cfg_->todos[i].text != want) {
+                i = -1;
+                for (size_t k = 0; k < cfg_->todos.size(); ++k) {
+                    if (cfg_->todos[k].text == want) {
+                        i = (int)k;
+                        break;
+                    }
+                }
+            }
+            if (i < 0 || i >= (int)cfg_->todos.size()) return;
+            cfg_->todos[i].done = cfg_->todos[i].done ? 0 : 1;
+            if (onStateChanged) onStateChanged();
+            ClampScroll();
+            hot_ = -1;
+            Redraw();
+        },
+        [this] {
+            SetInteractionHold(false);
+            if (hwnd_) SetForegroundWindow(hwnd_);
+        });
 }
 
 void FenceWindow::SetTodoFilter(int f) {
@@ -907,25 +1037,8 @@ void FenceWindow::EditTodoAt(int row) {
         scrollY_ = 0;
     }
 
-    // 新加的那一行可能还在可视区外面：先把它滚进来，否则输入框会贴着卡片外面
-    {
-        const int rh = TodoRowH();
-        const int top = HeadH() + kPad;
-        // 和 MaxScroll 用同一个视口高度（curH_ 是当前实际高度，展开动画中途也对得上）
-        const int viewH = std::max(1, curH_ - kPad - top);
-        const int rowTop = row * rh;
-        const int rowBottom = rowTop + rh;
-        int want = scrollY_;
-        if (rowTop < scrollY_)
-            want = rowTop;
-        else if (rowBottom > scrollY_ + viewH)
-            want = rowBottom - viewH;
-        if (want != scrollY_) {
-            scrollY_ = want;
-            ClampScroll();
-            Redraw();
-        }
-    }
+    // 这一行可能还在可视区外面：先把它滚进来，否则输入框会贴着卡片外面
+    ScrollTodoIntoView(row);
 
     RECT r = TodoRowRect(row);
     // 输入框正好盖住「文字」那一段（和 PaintTodoBody 里的 textX 对齐：
@@ -1131,6 +1244,15 @@ RECT FenceWindow::LockRect() const {
     return RECT{cx - 9, cy - 9, cx + 9, cy + 9};
 }
 
+// 待办盒头部右侧的「＋ 新建待办」按钮：再往锁左边一格（锁中心 width_-52，
+// 箭头占最右 40px）。命中盒和锁一样 18px，好点一点。
+// 列表末尾那行「＋ 新建待办」已经去掉，新建入口只有这一个 + 和右键菜单。
+RECT FenceWindow::TodoAddRect() const {
+    const int cy = HeadH() / 2;
+    const int cx = width_ - 76;
+    return RECT{cx - 9, cy - 9, cx + 9, cy + 9};
+}
+
 void FenceWindow::SetLocked(bool on) {
     if (!cfg_) return;
     const bool was = cfg_->locked != 0;
@@ -1203,6 +1325,7 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
     pressTodoRow_ = -1;
     pressArrow_ = false;
     pressLock_ = false;
+    pressTodoAdd_ = false;
     pressTab_ = -1;
     pressHeader_ = false;
     pressBody_ = false;
@@ -1223,8 +1346,17 @@ void FenceWindow::BeginPress(HWND h, POINT pt) {
             SetCapture(h);
             return;
         }
+        // 待办盒头部那颗「＋ 新建待办」：和锁一样的优先级 —— 点它不能算「拖头部」，
+        // 也不能落到下面的 pressTab_ 上（它压在标签右边）。
+        if (isTodo()) {
+            const RECT ar = TodoAddRect();
+            if (pt.x >= ar.left && pt.x < ar.right && pt.y >= ar.top && pt.y < ar.bottom) {
+                pressTodoAdd_ = true;
+                SetCapture(h);
+                return;
+            }
+        }
         // 点在标签上：先记下来，松手时（没拖动过）再切分组。
-        // 注意不能在这里直接切 —— 用户可能只是想按住头部拖盒子。
         pressTab_ = HitTab(pt);
     }
 
@@ -1904,7 +2036,8 @@ std::vector<RECT> FenceWindow::TodoTabRects() const {
 
     int w[2] = {TabWidthFor(HeadTabName(0), fontPx), TabWidthFor(HeadTabName(1), fontPx)};
     const int leftLim = kTabLeft;
-    const int rightLim = width_ - kTabRightReserve;
+    // 右边要给锁按钮、箭头、还有「＋ 新建」让位（待办盒比收纳盒多一颗 +）
+    const int rightLim = width_ - kTabRightReserveTodo;
     const int avail = std::max(kTabMinW * 2 + kTabGap, rightLim - leftLim);
     if (w[0] + w[1] + kTabGap > avail) {
         const int each = std::max(kTabMinW, (avail - kTabGap) / 2);
@@ -2616,7 +2749,10 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             pressTodoRow_ = -1;
             pressTab_ = -1;    // 双击 tab 不是「改 tab 名字」，别留给后面那条分支
             pressBody_ = false;
-            if (row >= 0) EditTodoAt(row);
+            // 连点行右端的「详情 / ×」不算「双击改文字」：这两个按钮在第一次松手时
+            // 就已经各自生效了（打开详情 / 删除），再叠一层改名会莫名其妙。
+            if (row >= 0 && !TodoDeleteHit(row, pt) && !TodoDetailHit(row, pt))
+                EditTodoAt(row);
             return 0;
         }
 
@@ -2665,7 +2801,25 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
                 }
+                // 待办盒头部那颗「＋ 新建」也要手型，否则和「拖头部」分不清
+                if (isTodo()) {
+                    const RECT ar = TodoAddRect();
+                    if (pt.x >= ar.left && pt.x < ar.right && pt.y >= ar.top &&
+                        pt.y < ar.bottom) {
+                        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                        return TRUE;
+                    }
+                }
                 if (HitTab(pt) >= 0) {
+                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    return TRUE;
+                }
+            }
+            // 待办行右端那两个按钮（详情 / ×）也给手型：
+            // 它们和「点整行勾掉」只差几像素，没有手型很容易误点。
+            if (isTodo() && !collapsed_ && pt.y >= HeadH()) {
+                const int trow = HitTodoRow(pt);
+                if (trow >= 0 && (TodoDeleteHit(trow, pt) || TodoDetailHit(trow, pt))) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
                 }
@@ -2978,6 +3132,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         const int todoRow = pressTodoRow_;
         const bool arrow = pressArrow_;
         const bool lockPress = pressLock_;
+        const bool todoAddPress = pressTodoAdd_;
         const int tabPress = pressTab_;
         const bool wasDragging = dragging_;
         const bool wasItemDrag = itemDragging_;
@@ -2992,6 +3147,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         pressTodoRow_ = -1;
         pressArrow_ = false;
         pressLock_ = false;
+        pressTodoAdd_ = false;
         pressTab_ = -1;
         pressHeader_ = false;
         pressBody_ = false;
@@ -3058,6 +3214,13 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             Redraw();
             return 0;
         }
+        // 待办盒头部的「＋ 新建」：弹窗输入，确认后才加进列表。
+        // 放在 arrow / tab 之前 —— 它压在这两者左边，但按下时已经单独标记过，
+        // 这里只按标记处理，不会再和标签切换抢。
+        if (todoAddPress) {
+            AddTodo();
+            return 0;
+        }
         if (arrow) {
             // 箭头 = 展开方式开关，两态互切：
             //   展开模式（始终展开）→ 点一下变伸缩模式，当场收起来给个反馈
@@ -3092,11 +3255,15 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // 必须放在图标分支前面 —— todo 盒的 pressItem_ 恒为 -1，会一路漏到
         // 最后那条「点空白取消选中」上，什么都点不动。
         if (isTodo() && todoRow >= 0 && !wasDragging) {
-            // 先判右边那颗「×」：点在它上面是删除，绝不能顺带把这一条勾掉
+            // 行右端两个按钮要先判：点在它们上面既不能勾掉这一条、也不能当成点击整行。
             POINT upPt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             if (TodoDeleteHit(todoRow, upPt)) {
                 hot_ = -1;
                 DeleteTodoAt(todoRow);
+                return 0;
+            }
+            if (TodoDetailHit(todoRow, upPt)) {
+                ShowTodoDetail(todoRow);
                 return 0;
             }
             ClickTodoRow(todoRow);
@@ -3877,6 +4044,21 @@ void FenceWindow::Paint() {
             }
         }
 
+        // ---- 待办盒的「＋ 新建待办」（头部右侧，锁按钮左边一格）----
+        // 内容区末尾那行「＋ 新建待办」已经去掉，新建的唯一入口就是这颗 +（和右键菜单）。
+        // 颜色跟头部文字走（深色卡片上白、浅色卡片上黑），淡出跟 headFade 一起走。
+        if (drawHead && isTodo()) {
+            const RECT ar = TodoAddRect();
+            const float ax = (float)(ar.left + ar.right) * 0.5f;
+            const float ay = (float)(ar.top + ar.bottom) * 0.5f;
+            const ARGB addC = (fg & 0x00FFFFFFu) | ((ARGB)fadeA << 24);
+            Pen pp(Color(addC), 1.7f);
+            pp.SetStartCap(LineCapRound);
+            pp.SetEndCap(LineCapRound);
+            gfx.DrawLine(&pp, ax - 5.5f, ay, ax + 5.5f, ay);
+            gfx.DrawLine(&pp, ax, ay - 5.5f, ax, ay + 5.5f);
+        }
+
         // ---- 展开方式箭头（点击在两种模式之间切）----
         // 同一个 V 形，只转 180°：
         //   展开模式（始终展开）→ 朝下的 V：躺开不动
@@ -4006,8 +4188,8 @@ void FenceWindow::Paint() {
         }
 
         // ---- 空状态提示 ----
-        // 待办盒不算「空」：它有自己的末尾「＋ 新建待办」行，不该顶着
-        // 「把桌面图标拖进来」（拖进来也不会被收下）。
+        // 待办盒不算「空」：它有自己的空列表提示（「点右上角的 + 新建一条待办」），
+        // 不该顶着「把桌面图标拖进来」（拖进来也不会被收下）。
         std::vector<DesktopIconView*> mineEmpty;
         CollectVisible(mineEmpty);
         if (!collapsed_ && !isTodo() && mineEmpty.empty()) {
@@ -4054,9 +4236,12 @@ void FenceWindow::Paint() {
             a.hot = hot_;
             a.items = &cfg_->todos;
             a.idx = &vis;
-            a.showAdd = (todoFilter_ == 0);
-            a.emptyHint = (todoFilter_ == 1) ? L"\u8fd8\u6ca1\u6709\u5df2\u5b8c\u6210\u7684\u5f85\u529e"
-                                             : nullptr;   // 还没有已完成的待办
+            // 空列表提示：末尾那行「＋ 新建待办」已经去掉，一条都没有时必须留句话
+            // 引导（否则一整块空白看着像坏了）。已完成 tab 说的是另一件事。
+            a.emptyHint =
+                (todoFilter_ == 1)
+                    ? L"\u8fd8\u6ca1\u6709\u5df2\u5b8c\u6210\u7684\u5f85\u529e"          // 还没有已完成的待办
+                    : L"\u70b9\u53f3\u4e0a\u89d2\u7684 + \u65b0\u5efa\u4e00\u6761\u5f85\u529e";  // 点右上角的 + 新建一条待办
             // 勾选过渡：这一行淡出 + 轻微下沉
             a.animRow = todoAnimRow_;
             a.animDone = todoAnimDone_;

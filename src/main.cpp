@@ -2054,6 +2054,7 @@ enum {
     kCmdTodoAdd = 4053,                // 待办盒：新加一条
     kCmdTodoEdit = 4054,               // 待办盒：改这一条的文字
     kCmdTodoDelete = 4055,             // 待办盒：删掉这一条
+    kCmdTodoDetail = 4056,             // 待办盒：弹窗看这一条的详情
     kCmdMoveToGroup = 4100,   // 4100..4127：盒内图标「移动到第 N 个分组」
     // 收缩方向：4060..4063 = 上 / 下 / 左 / 右。收起后只剩一条 4px 的把手，
     // 方向决定这条把手停在哪一面（见 FenceWindow::collapseDir）。
@@ -2538,6 +2539,8 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
     if (todo) {
         items.push_back(PopupMenuItem(L"\u65b0\u5efa\u5f85\u529e", kCmdTodoAdd));   // 新建待办
         if (f->TodoRowIsItem(item)) {
+            // 详情也能从这里进：盒子被拉得很窄时行内那颗「详情」胶囊会隐藏
+            items.push_back(PopupMenuItem(L"\u67e5\u770b\u8be6\u60c5", kCmdTodoDetail));  // 查看详情
             items.push_back(PopupMenuItem(L"\u7f16\u8f91\u5f85\u529e", kCmdTodoEdit));    // 编辑
             items.push_back(PopupMenuItem(L"\u5220\u9664\u5f85\u529e", kCmdTodoDelete));  // 删除
         }
@@ -2664,6 +2667,7 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
         if (id == kCmdNewFenceTodo) { NewFenceNear(fi, 1); return; }
         // 待办盒：item 就是行号（-1 = 点在空白 / 头部）
         if (id == kCmdTodoAdd) { w->AddTodo(); return; }
+        if (id == kCmdTodoDetail) { w->ShowTodoDetail(item); return; }
         if (id == kCmdTodoEdit) { w->EditTodoAt(item); return; }
         if (id == kCmdTodoDelete) { w->DeleteTodoAt(item); return; }
         if (id == kCmdNewFolder) { NewDesktopFolder(); return; }
