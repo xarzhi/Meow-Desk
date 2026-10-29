@@ -184,6 +184,18 @@ public:
         if (on && collapsed_) SetCollapsed(false);
     }
 
+    // 自绘右键菜单开着（主程序在菜单关闭时回调关掉）。
+    //
+    // 原生菜单（图标右键）是**模态阻塞**的，窗口自己围着 TrackPopupMenu 设/清就够了；
+    // 我们自己的 PopupMenu 是**异步**的 —— Show() 只是把窗口显示出来就返回，
+    // 菜单这时才刚打开。所以那个标志不能由窗口自己在这里清，必须由主程序在
+    // 菜单真正关掉时（PopupMenu::onClose）调这里。
+    // 不清的后果：鼠标从盒子挪到菜单上 → WM_MOUSELEAVE → 盒子当场缩成 4px。
+    //
+    // 这里**不**顺便把收起的盒子展开：右键一条 4px 的把手只是想开菜单，
+    // 弹个菜单就整块摊开会很突然。已经展开的盒子靠这个标志保持展开就够了。
+    void SetMenuOpen(bool on) { menuOpen_ = on; }
+
     // ---- 布局尺寸（右键菜单的「查看」会改这些）----
     int headerH() const { return headerH_; }
     int cellH() const;

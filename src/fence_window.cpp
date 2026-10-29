@@ -2934,7 +2934,15 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         const bool nativeMenu = (it >= 0);
         // 两种菜单（系统原生 / 我们自绘）开着的时候都别让看门狗收盒子：
         // 自绘菜单是弹出在光标处的，鼠标在里面挪来挪去很可能就出了盒子矩形。
-        menuOpen_ = true;
+        //
+        // 【关键区别】原生菜单是**模态阻塞**的（TrackPopupMenu 一直转到这里关掉），
+        // 所以围着这次调用设/清就够。自绘菜单是**异步**的 —— onContextMenu 只是
+        // 把菜单窗口显示出来就立刻返回，菜单这时才刚打开；以前这里紧跟着就把
+        // menuOpen_ 清成 false，于是鼠标从盒子挪到菜单上那一瞬 WM_MOUSELEAVE 就把
+        // 盒子收成了 4px（用户 2026-10-29 报的「右键菜单，鼠标移上去盒子就收缩了」）。
+        // 现在自绘菜单的开关交给主程序：菜单 Show 之前 SetMenuOpen(true)，
+        // 菜单真正关掉时（PopupMenu::onClose）再 SetMenuOpen(false) + CollapseIfIdle()。
+        if (nativeMenu) menuOpen_ = true;
         if (isTodo()) {
             // 待办盒：右键的是「某一行」还是内容区空白，交给主程序弹菜单
             const int row = (pt.y >= HeadH() && !collapsed_) ? HitTodoRow(pt) : -1;
@@ -2942,7 +2950,7 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (onContextMenu) {
             onContextMenu(it, sp);
         }
-        menuOpen_ = false;
+        if (nativeMenu) menuOpen_ = false;
         // 菜单关掉之后鼠标多半还停在外面：该收就收，别留一个开着却没人操作的盒子。
         //
         // **但 holdOpen_ 为真时绝不能收** —— 用户刚才点的可能就是「重命名」，

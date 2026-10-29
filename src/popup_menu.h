@@ -42,7 +42,8 @@ public:
     // 桌面框选之后那个「创建盒子」菜单用它 —— 菜单跟着那个蓝框走，
     // 而不是钉在松手时的鼠标位置（手一抖菜单就飘到框外去了）。
     void ShowAnchoredToRect(const RECT& rect, std::vector<PopupMenuItem> items);
-    void Hide();
+    // notify=false：只把窗口藏掉，**不**触发 onClose（Invoke 用：命令跑完再通知）
+    void Hide(bool notify = true);
     bool visible() const { return visible_; }
     HWND hwnd() const { return hwnd_; }
 
@@ -50,6 +51,10 @@ public:
 
     // 点中某个叶子项（id > 0）时回调
     std::function<void(int id)> onCommand;
+    // 菜单**真正关掉**时回调一次（点了某一项、点外面、Esc 都算）。
+    // 用来在菜单开着期间占住宿主窗口（比如伸缩模式的盒子不能被自动收起）。
+    // 回调只触发一次，触发后就自动清空，不会串到下一个菜单。
+    std::function<void()> onClose;
 
 private:
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
@@ -62,6 +67,8 @@ private:
     // Show / ShowAnchoredToRect 只负责算这个坐标。
     void PresentAt(int x, int y);
     void EnsureBuffer(int w, int h);
+    // 摘下来再调：回调里即使重设 onClose 也不会在执行中把 std::function 自己析构掉
+    void NotifyClosed();
     int HitTest(POINT client) const;
     void OpenSub(int index);
     void CloseSub();

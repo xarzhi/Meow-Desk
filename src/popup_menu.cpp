@@ -369,8 +369,19 @@ void PopupMenu::Invoke(int index) {
         return;
     }
     const int id = it.id;
-    Hide();
+    // 先不通知「关闭」：命令跑完再通知，宿主才知道「菜单关了、这单点了什么」。
+    // 顺序反了的话，宿主的 onClose 会先把盒子收起来，紧接着命令又把它展开
+    // （重命名类命令要占住盒子），视觉上闪一下。
+    Hide(false);
     if (onCommand && id > 0) onCommand(id);
+    NotifyClosed();
+}
+
+void PopupMenu::NotifyClosed() {
+    if (!onClose) return;
+    auto cb = std::move(onClose);
+    onClose = nullptr;   // 只触发一次，别串到下一个菜单
+    cb();
 }
 
 void PopupMenu::Show(POINT screenPt, std::vector<PopupMenuItem> items) {
@@ -435,7 +446,7 @@ void PopupMenu::PresentAt(int x, int y) {
     SetTimer(hwnd_, kWatchTimer, 80, nullptr);
 }
 
-void PopupMenu::Hide() {
+void PopupMenu::Hide(bool notify) {
     CloseSub();
     if (hwnd_ && visible_) {
         KillTimer(hwnd_, kWatchTimer);
@@ -443,6 +454,7 @@ void PopupMenu::Hide() {
         visible_ = false;
         hover_ = -1;
         if (owner_ && IsWindow(owner_)) SetForegroundWindow(owner_);
+        if (notify) NotifyClosed();
     }
 }
 

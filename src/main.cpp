@@ -2589,6 +2589,20 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
 
     if (!g_fenceMenu.Create()) return;
     g_fenceMenu.SetOwner(f->hwnd());
+    // 菜单**开着期间**占住盒子（伸缩模式不能收）。自绘菜单是异步的，Show 返回时
+    // 菜单才刚出来，所以要在这里置位，等菜单真正关掉时在 onClose 里放开。
+    f->SetMenuOpen(true);
+    // 关掉之后：光标不在盒子里就收起来 —— 用户要的就是「点完 / 关掉菜单再收」。
+    // 捕获**指针**而不是 fi 下标：菜单里可能点「删除盒子」，那条命令跑完之后
+    // g_fences 已经重排过了，fi 会指到别的盒子上去；指针比对则天然失效。
+    g_fenceMenu.onClose = [f] {
+        for (auto& g : g_fences) {
+            if (g.get() != f) continue;
+            g->SetMenuOpen(false);
+            g->CollapseIfIdle();
+            return;
+        }
+    };
     g_fenceMenu.onCommand = [fi, item](int id) {
         FenceWindow* w = (fi < (int)g_fences.size()) ? g_fences[fi].get() : nullptr;
         if (!w) return;
@@ -2676,6 +2690,12 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
         }
     };
     g_fenceMenu.Show(sp, std::move(items));
+    // 菜单没弹出来（建窗口失败等）就不会有 onClose，得马上放开，否则这个盒子
+    // 永远不再自动收起
+    if (!g_fenceMenu.visible()) {
+        g_fenceMenu.onClose = nullptr;
+        f->SetMenuOpen(false);
+    }
     LogStep("fence menu #" + std::to_string(fi));
 }
 
