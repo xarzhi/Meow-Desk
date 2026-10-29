@@ -7,8 +7,11 @@
 //     并且可以在弹窗内直接点击完成代办按钮」
 //
 // 所以这里两个模式共用同一张卡片的画法（和 rename_dialog / confirm_dialog 同一套配方）：
-//   · Input  ：标题 + 输入框 + 取消/确定（输入框是真正的 EDIT，中文要能打）
+//   · Input  ：标题 + 多行文本域 + 取消/确定（文本域是真正的 EDIT，中文要能打）
 //   · Detail ：标题 + 自动换行的正文 + 关闭/完成
+//
+// 两张卡片都能**拖动**（用户要求）：没有标题栏，所以卡片上除按钮以外的空白处
+// 都能按住拖着走，空白区的光标是四向箭头作为暗示。
 //
 // 为什么正文用 GDI+ DrawString 而盒子里用 GDI 栅格化：
 // 卡片底色是**不透明**的（这里没有 per-pixel 半透明底），不存在「笔画摊到壁纸上发灰」
@@ -29,7 +32,8 @@
 namespace TodoDialog {
 
 // 新建待办。owner 非空就居中于 owner 所在的那块屏（待办盒），否则居中于鼠标所在屏。
-// 回车 / 点「确定」→ onOk(去掉首尾空白的文字)；Esc / 点「取消」/ 焦点跑掉 → 放弃。
+// Ctrl+Enter / 点「确定」→ onOk(去掉首尾空白的文字，换行统一成 LF)；
+// Esc / 点「取消」/ 焦点跑掉 → 放弃。单独一个 Enter 是换行（文本域）。
 // onDone：**两条路都会调一次**（在 onOk 之后），用来解除「弹窗期间别自动收盒子」。
 void ShowInput(HWND owner, const std::wstring& initial,
                std::function<void(const std::wstring&)> onOk,

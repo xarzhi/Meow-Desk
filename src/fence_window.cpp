@@ -500,14 +500,14 @@ std::wstring FormatMTime(const FILETIME& ft) {
 // ---------------------------------------------------------------------------
 // 待办盒的内容区
 //
-// 一条待办 = 「圆角勾选框 + 一行字 + 右端两个按钮（详情 / ×）」，
+// 一条待办 = 「圆角勾选框 + 一行字 + 右端两个按钮（详情图标 / ×）」，
 // 完成态画删除线并变灰。
 // 行高固定（FenceWindow::kTodoRowH），所以滚动量、命中、输入框位置可以
 // 全部用 row * rowH 直接算出来，不需要额外的布局缓存。
 //
 // 注意：末尾那一行「＋ 新建待办」已经去掉了 —— 新建改成**头部右侧的 + 按钮 + 弹窗**。
 // 行右端那两个按钮的几何只能在这里算一次（见 TodoDelCx / TodoDetRectOf），
-// 画出和命中各写一份的话，鼠标明明点在「详情」上却判成「打勾」。
+// 画出和命中各写一份的话，鼠标明明点在详情上却判成「打勾」。
 // ---------------------------------------------------------------------------
 // ARGB（GDI+ 的 Color 值）取分量。注意和 COLORREF 的字节序相反。
 inline BYTE ArgbR(ARGB c) { return (BYTE)((c >> 16) & 0xFF); }
@@ -517,24 +517,36 @@ inline BYTE ArgbB(ARGB c) { return (BYTE)(c & 0xFF); }
 // ---- 行右端按钮几何（唯一来源）----
 const int kTodoActRight = 8;    // × 距行右边界
 const int kTodoDelSz = 18;      // × 命中盒（图形 16px，命中放宽一点）
-const int kTodoDetW = 36;       // 「详情」胶囊宽度
-const int kTodoDetH = 20;       // 「详情」胶囊高度
+const int kTodoDetSz = 20;      // 「详情」图标按钮（正方形命中盒）
+const int kTodoIconPx = 15;     // 详情图标在图标字体里的字号
 const int kTodoActGap = 4;      // 两个按钮之间的间隙
 // 行右端被两个按钮吃掉的总宽度（排版算正文宽时要用）
-const int kTodoActSpan =
-    kTodoActRight + kTodoDelSz + kTodoActGap + kTodoDetW + 6;   // +6 是文字侧留白
+const int kTodoActSpan = kTodoActRight + kTodoDelSz + kTodoActGap + kTodoDetSz + 6;
 
 int TodoDelCx(int rowRight) { return rowRight - kTodoActRight - kTodoDelSz / 2; }
 
 RECT TodoDetRectOf(int rowRight, int cy) {
     const int right = TodoDelCx(rowRight) - kTodoDelSz / 2 - kTodoActGap;
-    return RECT{right - kTodoDetW, cy - kTodoDetH / 2, right, cy + kTodoDetH / 2};
+    return RECT{right - kTodoDetSz, cy - kTodoDetSz / 2, right, cy + kTodoDetSz / 2};
 }
 
-// 行太窄时不摆「详情」胶囊（正文优先）：盒子被拉得很细的时候，36px 的胶囊会
+// 行太窄时不摆「详情」按钮（正文优先）：盒子被拉得很细的时候，那颗按钮会
 // 直接把待办文字盖住。绘制和命中都问这一句，否则会出现「画了但点不到」。
 // 窄盒子的详情入口还有右键菜单的「查看详情」。
-bool TodoDetailFits(int rowLeft, int rowRight) { return (rowRight - rowLeft) >= 190; }
+bool TodoDetailFits(int rowLeft, int rowRight) { return (rowRight - rowLeft) >= 180; }
+
+// 待办文字现在允许换行（新建走多行文本域，存的是 LF）。但列表里一行只有
+// kTodoRowH 那么高、标题走的是单行排版，所以**画到行里之前**要把换行符摊成空格 ——
+// 否则 LabelDib 会把 \n 当普通字符画成一个空心方块。
+// 全文（含换行）留给详情弹窗和就地改名的首行。
+std::wstring TodoRowText(const std::wstring& s) {
+    if (s.find_first_of(L"\r\n\t") == std::wstring::npos) return s;   // 绝大多数是单行，直接逃逸
+    std::wstring out = s;
+    for (wchar_t& c : out) {
+        if (c == L'\r' || c == L'\n' || c == L'\t') c = L' ';
+    }
+    return out;
+}
 
 // 一条要贴的文字。PaintTodoBody 只负责排版（算出文字盒），真正栅格化交给
 // FenceWindow::DrawUiTextDib —— 那里走 GDI，和图标标题同一条路（见 UiText）。
@@ -590,7 +602,7 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
     const int boxSize = 17;
     const int boxX = a.rowLeft + 10;
     const int textX = boxX + boxSize + 10;
-    // 右边留出「详情」胶囊 + 「×」删除两个按钮（宽度见 kTodoActSpan，
+    // 右边留出「详情」图标 + 「×」删除两个按钮（宽度见 kTodoActSpan，
     // 和命中判定共用同一份，别在这里另算一套）。行太窄时只留 ×。
     const bool showDet = TodoDetailFits(a.rowLeft, a.rowRight);
     const int actSpan =
@@ -599,12 +611,12 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
 
     const int total = (int)a.idx->size();
     auto pushText = [&](const std::wstring& s, RECT box, ARGB c, bool strike, bool left,
-                        int alpha, int pxPx = 0) {
+                        int alpha) {
         if (!a.texts) return;
         TodoTextOut t;
         t.text = s;
         t.box = box;
-        t.px = (pxPx > 0) ? pxPx : rowPx;   // 0 = 正文默认 13px（「详情」胶囊用 12px）
+        t.px = rowPx;
         t.strike = strike;
         t.leftAlign = left;
         t.alpha = alpha;
@@ -673,30 +685,36 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
             g.DrawPath(&edge, &bp);
         }
 
-        pushText(it.text, RECT{textX, ry, textX + textW, ry + a.rowH},
+        pushText(TodoRowText(it.text), RECT{textX, ry, textX + textW, ry + a.rowH},
                  done ? a.fgDim : a.fg, done, true, rowA);
 
-        // ---- 右侧两个按钮：「详情」胶囊 + 「×」删除 ----
+        // ---- 右侧两个按钮：「详情」图标 + 「×」删除 ----
         // 平时都很淡，悬停这一行时实起来 —— 一直画着，但不去抢内容。
         // 几何全部来自 TodoDetRectOf / TodoDelCx，和命中判定共用同一份。
         {
             if (showDet) {
                 const RECT dr = TodoDetRectOf(a.rowRight, rcy);
-                const RectF drf((float)dr.left, (float)dr.top, (float)(dr.right - dr.left),
-                                (float)(dr.bottom - dr.top));
-                GraphicsPath dp;
-                AddRoundRect(dp, drf, 6.0f);
+                const float dcx = (float)(dr.left + dr.right) * 0.5f;
+                const float dcy = (float)(dr.top + dr.bottom) * 0.5f;
                 if (hot) {
                     SolidBrush db{Color(a.light ? 0x12000000 : 0x1CFFFFFF)};
-                    g.FillPath(&db, &dp);
+                    g.FillEllipse(&db, dcx - 10.0f, dcy - 10.0f, 20.0f, 20.0f);
                 }
                 const ARGB dc = hot ? a.accent : a.fgDim;
                 const BYTE da = (BYTE)std::min(255, (int)((hot ? 255 : 150) * rowA / 255));
-                Pen dpen{Color(da, ArgbR(dc), ArgbG(dc), ArgbB(dc)), 1.0f};
-                g.DrawPath(&dpen, &dp);
-                pushText(L"\u8be6\u60c5",   // 详情
-                         RECT{dr.left + 2, dr.top, dr.right - 2, dr.bottom}, dc, false, false,
-                         (int)((hot ? 255 : 150) * rowA / 255), 12);
+                const ARGB dic = ((ARGB)da << 24) | (dc & 0x00FFFFFFu);
+                // 图标字体里的「查看」（iconfont：e600）。以前是 36px 的「详情」胶囊，
+                // 待办行本来就窄，两个字的胶囊比「×」重得多；换成方形图标按钮之后
+                // 两个操作视觉重量一致，正文也能多放 16px。
+                if (IconFont::Ready()) {
+                    IconFont::Draw(g, IconCode::kView, dcx, dcy, (float)kTodoIconPx, dic);
+                } else {
+                    // 字体没加载出来（资源缺失）：手搓一只眼睛，意思一样、同样省地方
+                    Pen ep{Color(da, ArgbR(dc), ArgbG(dc), ArgbB(dc)), 1.3f};
+                    g.DrawEllipse(&ep, dcx - 7.0f, dcy - 4.5f, 14.0f, 9.0f);
+                    SolidBrush pb{Color(da, ArgbR(dc), ArgbG(dc), ArgbB(dc))};
+                    g.FillEllipse(&pb, dcx - 2.0f, dcy - 2.0f, 4.0f, 4.0f);
+                }
             }
 
             const float cx = (float)TodoDelCx(a.rowRight);
@@ -827,8 +845,8 @@ RECT FenceWindow::TodoDeleteRect(int row) const {
                 cy + kTodoDelSz / 2};
 }
 
-// 「详情」胶囊（在 × 左边一格）。同样是绘制/命中唯一的几何来源。
-// 行太窄时返回空矩形（不画、也点不到），详情仍可从右键菜单进。
+// 「详情」按钮（在 × 左边一格，iconfont 的 icon-chakan）。同样是绘制/命中
+// 唯一的几何来源。行太窄时返回空矩形（不画、也点不到），详情仍可从右键菜单进。
 RECT FenceWindow::TodoDetailRect(int row) const {
     if (!isTodo() || row < 0) return RECT{0, 0, 0, 0};
     const RECT r = TodoRowRect(row);
@@ -1050,8 +1068,11 @@ void FenceWindow::EditTodoAt(int row) {
     const RECT scr{tl.x, tl.y, br.x, br.y};
 
     SetInteractionHold(true);
+    // 就地改名的输入框是**单行**的（RenameBox）：多行待办贴进去只显示摊平后的
+    // 一行，提交后换行也就没了。想保留换行只能去详情弹窗看 / 重新新建一条 ——
+    // 列表里本来也只展示一行，摊平比塞进去一堆看不见的换行符更不容易出意外。
     RenameBox::ShowInPlace(
-        scr, adding ? std::wstring() : cfg_->todos[ci].text,
+        scr, adding ? std::wstring() : TodoRowText(cfg_->todos[ci].text),
         [this, ci, adding](const std::wstring& s) {
             if (!cfg_ || !isTodo()) return;
             // 去掉首尾空白：输入框里只有空格时按「没写」处理

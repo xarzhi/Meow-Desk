@@ -39,6 +39,8 @@ constexpr wchar_t kAbout = L'\ue60b';        // 关于
 // —— 盒子头部 ——
 constexpr wchar_t kLock = L'\ue635';         // 锁定
 constexpr wchar_t kUnlock = L'\ue616';       // 解锁
+// —— 待办行 ——
+constexpr wchar_t kView = L'\ue600';         // 查看（详情）
 }  // namespace IconCode
 
 namespace IconFont {
