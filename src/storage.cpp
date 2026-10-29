@@ -32,7 +32,8 @@ std::wstring g_logfile;
 //   v7 — fence 表加 kind（0 = 收纳盒 / 1 = 待办盒）；新增 todo 表（待办条目）
 //   v8 — fence 表加 collapseDir（收起方向）
 //   v9 — 新增 search_fav 表（搜索窗口右上角的「常用」快捷项，最多 10 条）
-const int kSchemaVersion = 9;
+//   v10 — todo 表加 created（待办创建时间；老条目标移时回填成迁移那一刻）
+const int kSchemaVersion = 10;
 
 void SetError(const char* what) {
     g_lastError = what ? what : "";
@@ -82,11 +83,13 @@ bool Upgrade(int from) {
         ");"
         // 待办盒的条目。ord 是显示顺序（用户可能上下挪），done = 勾没勾掉。
         // 和 fence_group 一样按 (fence, ord) 存，读出来按 ord 顺序塞回配置。
+        // created = 创建时间（Unix 秒）。详情弹窗里要显示「创建于 …」。
         "CREATE TABLE IF NOT EXISTS todo ("
         "  fence INTEGER NOT NULL,"
         "  ord   INTEGER NOT NULL,"
         "  text  TEXT NOT NULL DEFAULT '',"
         "  done  INTEGER NOT NULL DEFAULT 0,"
+        "  created INTEGER NOT NULL DEFAULT 0,"
         "  PRIMARY KEY(fence, ord)"
         ");"
         // 盒子内的分组（头部那一排标签）。ord=0 就是盒子自己的标题，
@@ -163,6 +166,14 @@ bool Upgrade(int from) {
         // v8：收起方向。老库默认 0 = 向上收（把手留在上边），
         // 和以前只会往上收的位置完全一致，用户不会看到盒子忽然换了个地方。
         AddColumn("fence", "collapseDir", "INTEGER NOT NULL DEFAULT 0");
+    }
+    if (from < 10) {
+        // v10：待办创建时间。新库由上面的 kSchema 直接建出这一列，
+        // 老库走 ALTER；建完把老条目的 created 补成「现在」——
+        // 留 0 的话详情里那条时间就永远是空的，给个迁移时刻至少能用。
+        AddColumn("todo", "created", "INTEGER NOT NULL DEFAULT 0");
+        sqlite3_exec(g_db, "UPDATE todo SET created = strftime('%s','now') WHERE created <= 0",
+                     nullptr, nullptr, nullptr);
     }
 
     const std::string ver = "PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";";

@@ -176,7 +176,7 @@ bool ConfigFromDb(AppConfig& c) {
     }
     {
         // 待办条目：一个盒子可能有 0..N 条，按 ord 排好塞回各自的 FenceConfig
-        storage::Stmt st("SELECT fence,ord,text,done FROM todo ORDER BY fence,ord");
+        storage::Stmt st("SELECT fence,ord,text,done,created FROM todo ORDER BY fence,ord");
         if (st.ok()) {
             while (st.step()) {
                 const int fi = st.colInt(0);
@@ -184,6 +184,7 @@ bool ConfigFromDb(AppConfig& c) {
                 TodoItem t;
                 t.text = st.colText(2);
                 t.done = st.colInt(3);
+                t.created = st.colInt64(4);
                 c.fences[fi].todos.push_back(std::move(t));
             }
         }
@@ -418,7 +419,8 @@ void AppConfig::Save() const {
         }
 
         if (ok) {
-            storage::Stmt ts("INSERT INTO todo(fence,ord,text,done) VALUES(?1,?2,?3,?4)");
+            storage::Stmt ts(
+                "INSERT INTO todo(fence,ord,text,done,created) VALUES(?1,?2,?3,?4,?5)");
             for (size_t i = 0; i < fences.size() && ts.ok(); ++i) {
                 const FenceConfig& c = fences[i];
                 if (c.kind != 1) continue;
@@ -427,6 +429,7 @@ void AppConfig::Save() const {
                     ts.bindInt(2, (int)k);
                     ts.bindText(3, c.todos[k].text);
                     ts.bindInt(4, c.todos[k].done ? 1 : 0);
+                    ts.bindInt64(5, c.todos[k].created);
                     ok = ts.done() && ok;
                     ts.reset();
                 }

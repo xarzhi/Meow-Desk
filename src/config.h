@@ -17,6 +17,9 @@
 struct TodoItem {
     std::wstring text;
     int done = 0;   // 1 = 已勾掉（画一条删除线 + 变灰）
+    // 创建时间：Unix 秒（UTC），显示时按本地时区换算。
+    // 0 = 不知道（老库迁移时统一回填过一次，正常不会出现）。
+    long long created = 0;
 };
 
 // 一个盒子的外观与位置

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <utility>
 #include <vector>
 
@@ -59,12 +60,17 @@ const UINT kMsgRelayout = WM_APP + 14;
 enum class Mode { Input, Detail };
 
 HWND g_card = nullptr;
-HWND g_edit = nullptr;   // 只有 Input 模式有
+HWND g_edit = nullptr;   // 两个模式都有（详情未完成时是可编辑的）
 Mode g_mode = Mode::Input;
 std::wstring g_title;
-std::wstring g_text;     // Detail 模式的正文
+std::wstring g_text;     // Detail 模式的**原始**正文（关窗时用来判断有没有改过）
 bool g_done = false;     // Detail 模式：这条待办当前是不是已完成
+// Detail 且已完成 = 正文只读（用户要求「完成了就不可编辑」）。
+// 只读时也不让 Ctrl+Enter 去切完成状态 —— 已完成的那条按回车应该是关窗。
+bool g_readOnly = false;
+long long g_created = 0;   // Detail：创建时间（Unix 秒；0 = 老数据不知道）
 std::function<void(const std::wstring&)> g_onOk;
+std::function<void(const std::wstring&)> g_onSave;   // Detail 可编辑且内容改过才回调
 std::function<void()> g_onToggle;
 std::function<void()> g_onDone;
 
@@ -73,18 +79,17 @@ bool g_dark = false;
 int g_hover = -1;        // 0 = 次要按钮，1 = 主按钮，-1 = 空白
 int g_press = -1;
 
-// 拖窗口：卡片空白处按下滑动 = 搬走整张卡片（用户要求两个弹窗都能拖）。
-// 文本域自己是另一个顶层窗口，压在卡片上面，点它在 EDIT 里根本收不到 ——
-// 所以「能拖的区域」自然就是卡片上除两个按钮以外的部分。
-bool g_dragArmed = false;   // 在空白处按下了（还没确定是不是拖动）
+// 拖窗口：**只有头部（标题那一行）**能按着拖（用户要求），正文/按钮区按了不动。
+// 光标也不做特殊处理 —— 用户明确说「不需要改变鼠标样式」。
+bool g_dragArmed = false;   // 在头部按下了（还没确定是不是拖动）
 bool g_dragging = false;    // 已经超过死区，正在搬
 POINT g_dragAnchor{};       // 按下时的光标（屏幕坐标）
 POINT g_dragWin0{};         // 按下时的卡片左上角
 
 int g_cardH = 0;
-int g_textH = 0;         // Detail 模式正文块的高度（Layout 前算好）
+int g_textH = 0;         // Detail 模式正文量出来的高度（换算文本域高度用）
 int g_detailCap = kDetailLineH * 8;   // Detail 正文最多这么高（ShowDetail 按屏幕算）
-int g_editH = 0;         // Input 模式文本域的高度（跟着行数长）
+int g_editH = 0;         // 文本域的高度（Input 跟着行数长；Detail 按正文长度定死）
 int g_editLines = 1;     // 上一帧文本域的显示行数（用来判断要不要重排版）
 RECT g_rcField{};
 RECT g_rcEdit{};
@@ -97,7 +102,15 @@ void* g_bits = nullptr;
 int g_bufW = 0;
 int g_bufH = 0;
 
-HBRUSH g_editBgDark = nullptr;
+HBRUSH g_brEdit = nullptr;       // 可编辑文本域的底刷（缓存，不删）
+HBRUSH g_brReadOnly = nullptr;   // 只读文本域的底刷
+
+// 文本域底色。只读（= 已完成的详情）给一层很淡的灰 —— 光靠「点了打不进字」
+// 用户才知道不能改，太晚了；底色浅灰一眼就能看出来这块是只读的。
+COLORREF EditBgColor() {
+    if (g_readOnly) return g_dark ? RGB(30, 30, 35) : RGB(245, 245, 247);
+    return g_dark ? RGB(35, 35, 41) : RGB(255, 255, 255);
+}
 
 // ---------------------------------------------------------------------------
 // 配色 / 字体 / 画法
@@ -177,17 +190,31 @@ int EditLineCountNow() {
     return n > 0 ? (int)n : 1;
 }
 
+// 「创建于 2026-10-29 15:48」。created 存的是 Unix 秒（UTC），显示按本地时区换算。
+// <= 0 表示没有（老数据迁移时已经回填过一次，正常走不到这里）。
+std::wstring CreatedLabel(long long secs) {
+    if (secs <= 0) return std::wstring();
+    const time_t t = (time_t)secs;
+    tm lt{};
+    if (localtime_s(&lt, &t) != 0) return std::wstring();
+    wchar_t buf[80]{};
+    // 创建于 YYYY-MM-DD HH:MM
+    swprintf_s(buf, L"\u521b\u5efa\u4e8e %04d-%02d-%02d %02d:%02d", lt.tm_year + 1900,
+               lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
+    return std::wstring(buf);
+}
+
 HBRUSH EditBgBrush() {
-    if (g_dark) {
-        if (!g_editBgDark) g_editBgDark = CreateSolidBrush(RGB(35, 35, 41));
-        return g_editBgDark;
-    }
-    return (HBRUSH)GetStockObject(WHITE_BRUSH);
+    HBRUSH& slot = g_readOnly ? g_brReadOnly : g_brEdit;
+    if (!slot) slot = CreateSolidBrush(EditBgColor());
+    return slot;
 }
 
 // 详情正文「按卡片宽度换行后有多高」。卡片高度要在建缓冲之前定下来，所以必须先量。
 int MeasureDetailHeight(const std::wstring& s) {
-    const int textW = kCardW - kPadX * 2;
+    // 宽度要按**真正显示文字的那块**算：卡片内宽减掉文本域左右内边距，再减掉右侧
+    // 那条竖向滚动条。按卡片内宽量会少折一行 → 建出来的 EDIT 一出场就带滚动条。
+    const int textW = kCardW - kPadX * 2 - kFieldPadX * 2 - 16;
     int h = kDetailLineH;
     HDC dc = GetDC(nullptr);
     if (dc) {
@@ -208,9 +235,9 @@ int MeasureDetailHeight(const std::wstring& s) {
     return std::clamp(h, kDetailLineH, g_detailCap);
 }
 
+// 两个模式现在是同一套骨架：标题 + 文本域 + 按钮。差别只在文本域里的内容
+// 能不能改、按钮写什么、以及标题右边那颗状态徽标。
 int CardHeight() {
-    if (g_mode == Mode::Detail)
-        return kPadTop + kTitleH + kAfterTitle + g_textH + kAfterEdit + kBtnH + kPadBottom;
     return kPadTop + kTitleH + kAfterTitle + g_editH + kAfterEdit + kBtnH + kPadBottom;
 }
 
@@ -233,19 +260,14 @@ void Layout() {
     g_cardH = CardHeight();
     const int cx = kShadow, cy = kShadow;
 
-    if (g_mode == Mode::Input) {
-        const int fieldTop = cy + kPadTop + kTitleH + kAfterTitle;
-        g_rcField = RECT{cx + kPadX, fieldTop, cx + kCardW - kPadX, fieldTop + g_editH};
+    const int fieldTop = cy + kPadTop + kTitleH + kAfterTitle;
+    g_rcField = RECT{cx + kPadX, fieldTop, cx + kCardW - kPadX, fieldTop + g_editH};
 
-        // 多行 EDIT 是从客户区顶部往下排字的，所以上下各留 kEditPadY 就正好；
-        // 别再像单行那样「只占一行高、垂直居中」—— 那套是为了单行居中，
-        // 换成文本域之后按行高算会把下面的行切掉。
-        g_rcEdit = RECT{g_rcField.left + kFieldPadX, fieldTop + kEditPadY,
-                        g_rcField.right - kFieldPadX, fieldTop + g_editH - kEditPadY};
-    } else {
-        g_rcField = RECT{};
-        g_rcEdit = RECT{};
-    }
+    // 多行 EDIT 是从客户区顶部往下排字的，所以上下各留 kEditPadY 就正好；
+    // 别再像单行那样「只占一行高、垂直居中」—— 那套是为了单行居中，
+    // 换成文本域之后按行高算会把下面的行切掉。
+    g_rcEdit = RECT{g_rcField.left + kFieldPadX, fieldTop + kEditPadY,
+                    g_rcField.right - kFieldPadX, fieldTop + g_editH - kEditPadY};
 
     const int btnTop = cy + g_cardH - kPadBottom - kBtnH;
     const int okRight = cx + kCardW - kPadX;
@@ -261,6 +283,14 @@ int HitTest(POINT c) {
     if (in(g_rcOk)) return 1;
     if (in(g_rcCancel)) return 0;
     return -1;
+}
+
+// 「头部」= 标题那一行（含上方内边距）。用户要求：**只有头部**能按着拖，
+// 而且不要改鼠标样式。正文区本来就是另一个顶层 EDIT（点它这边收不到），
+// 这一条是把标题下面那条空缝和按钮行也排除掉。
+bool InDragHeader(POINT c) {
+    if (c.y < kShadow) return false;
+    return c.y <= kShadow + kPadTop + kTitleH;
 }
 
 void Paint() {
@@ -307,7 +337,6 @@ void Paint() {
         FontFamily fam(L"Microsoft YaHei UI");
         Font fTitle(&fam, 15.0f, FontStyleBold, UnitPixel);
         Font fBtn(&fam, 13.0f, FontStyleRegular, UnitPixel);
-        Font fBody(&fam, 14.0f, FontStyleRegular, UnitPixel);
 
         StringFormat oneLine;
         oneLine.SetLineAlignment(StringAlignmentCenter);
@@ -349,48 +378,54 @@ void Paint() {
             }
         }
 
-        if (g_mode == Mode::Input) {
-            // 输入底槽：圆角 + 1px 描边；真正画字的是嵌在里面的 EDIT
+        // 底槽：圆角 + 1px 描边。真正的字由嵌在里面的 EDIT 画 —— 两个模式都是，
+        // 详情模式的正文现在也是一个 EDIT（未完成时可编辑）。
+        {
             const RectF field((float)g_rcField.left, (float)g_rcField.top,
                               (float)(g_rcField.right - g_rcField.left),
                               (float)(g_rcField.bottom - g_rcField.top));
             GraphicsPath fp;
             AddRoundRect(fp, field, 8.0f);
             // 底色必须和 WM_CTLCOLOREDIT 给 EDIT 的刷子一模一样，否则会有色差补丁
-            SolidBrush fb(light ? 0xFFFFFFFF : 0xFF232329);
+            SolidBrush fb(g_readOnly ? (g_dark ? 0xFF1E1E23 : 0xFFF5F5F7)
+                                     : (g_dark ? 0xFF232329 : 0xFFFFFFFF));
             g.FillPath(&fb, &fp);
             Pen fpen(light ? 0xFFD6D6DC : 0xFF3E3E46, 1.0f);
             g.DrawPath(&fpen, &fp);
 
-            // 换成文本域之后 Enter 是换行、提交要 Ctrl+Enter，得说一句，
-            // 否则用户敲完一行顺手回车，等来的是第二行，会以为「确定没反应」。
-            // 位置选在文本域和按钮之间那条 20px 的空缝里、右对齐 ——
-            // 不占额外高度，也不会把按钮挤窄。
+            // 文本域和按钮之间那条 20px 的空缝：左边放创建时间（详情模式），
+            // 右边放快捷键提示。两头都不占额外高度，也不会把按钮挤窄。
             Font fHint(&fam, 12.0f, FontStyleRegular, UnitPixel);
-            StringFormat hf;
-            hf.SetAlignment(StringAlignmentFar);
-            hf.SetLineAlignment(StringAlignmentCenter);
-            hf.SetFormatFlags(StringFormatFlagsNoWrap);
-            SolidBrush hb{light ? Color(0x88000000) : Color(0x88FFFFFF)};
             const RectF hr((float)kShadow + kPadX,
                            (float)(kShadow + kPadTop + kTitleH + kAfterTitle + g_editH),
                            (float)kCardW - kPadX * 2, (float)kAfterEdit);
-            // Enter 换行 · Ctrl+Enter 确定
-            g.DrawString(L"Enter \u6362\u884c \u00b7 Ctrl+Enter \u786e\u5b9a", -1, &fHint,
-                         hr, &hf, &hb);
-        } else {
-            // 详情正文：自动换行，最多 6 行，超出打省略号
-            const int textTop = kShadow + kPadTop + kTitleH + kAfterTitle;
-            const RectF tr((float)kShadow + kPadX, (float)textTop,
-                           (float)kCardW - kPadX * 2, (float)g_textH);
-            StringFormat wrap;
-            wrap.SetFormatFlags(StringFormatFlagsLineLimit);
-            wrap.SetTrimming(StringTrimmingEllipsisCharacter);
-            wrap.SetAlignment(StringAlignmentNear);
-            // 注意花括号初始化：`SolidBrush tb(Color(fg));` 会被当成**函数声明**
-            // （most vexing parse），然后 &tb 就成了函数指针，编译期报「没有重载」。
-            SolidBrush tb{Color(fg)};
-            g.DrawString(g_text.c_str(), -1, &fBody, tr, &wrap, &tb);
+            SolidBrush hb{light ? Color(0x88000000) : Color(0x88FFFFFF)};
+
+            if (g_mode == Mode::Detail) {
+                const std::wstring when = CreatedLabel(g_created);
+                if (!when.empty()) {
+                    StringFormat lf;
+                    lf.SetAlignment(StringAlignmentNear);
+                    lf.SetLineAlignment(StringAlignmentCenter);
+                    lf.SetFormatFlags(StringFormatFlagsNoWrap);
+                    g.DrawString(when.c_str(), -1, &fHint, hr, &lf, &hb);
+                }
+            }
+
+            // 详情里没完成才提「Ctrl+Enter 完成」—— 已完成的那条按回车是关窗，
+            // 提了反而误导。
+            const wchar_t* tip = nullptr;
+            if (g_mode == Mode::Input)
+                tip = L"Enter \u6362\u884c \u00b7 Ctrl+Enter \u786e\u5b9a";   // Enter 换行 · Ctrl+Enter 确定
+            else if (!g_readOnly)
+                tip = L"Ctrl+Enter \u5b8c\u6210";   // Ctrl+Enter 完成
+            if (tip) {
+                StringFormat rf;
+                rf.SetAlignment(StringAlignmentFar);
+                rf.SetLineAlignment(StringAlignmentCenter);
+                rf.SetFormatFlags(StringFormatFlagsNoWrap);
+                g.DrawString(tip, -1, &fHint, hr, &rf, &hb);
+            }
         }
 
         auto drawButton = [&](const RECT& r, const wchar_t* label, bool primary, bool hot) {
@@ -454,7 +489,8 @@ void Present() {
 // 拆窗 + 把回调取出来。两条收尾路径（确定 / 取消 / 点主按钮）都走这里，
 // 先清状态再 DestroyWindow —— 销毁过程中还会收到 WM_KILLFOCUS / WM_ACTIVATE，
 // 不清就会递归回来。
-void Teardown(std::function<void(const std::wstring&)>& ok, std::function<void()>& toggle,
+void Teardown(std::function<void(const std::wstring&)>& ok,
+              std::function<void(const std::wstring&)>& save, std::function<void()>& toggle,
               std::function<void()>& done, std::wstring& text) {
     HWND card = g_card;
     HWND edit = g_edit;
@@ -468,9 +504,11 @@ void Teardown(std::function<void(const std::wstring&)>& ok, std::function<void()
     g_editLines = 1;
 
     ok = std::move(g_onOk);
+    save = std::move(g_onSave);
     toggle = std::move(g_onToggle);
     done = std::move(g_onDone);
     g_onOk = nullptr;
+    g_onSave = nullptr;
     g_onToggle = nullptr;
     g_onDone = nullptr;
     text = g_text;
@@ -496,49 +534,65 @@ std::wstring NormalizeNewlines(const std::wstring& s) {
     return out;
 }
 
+// 读文本域里的文字：CRLF 收成 LF、去掉首尾空白。空内容返回空字符串。
+// 新建（提交）和详情（改完保存）两条路都用这一份，语义才不会分叉。
+std::wstring ReadEditText() {
+    if (!g_edit) return std::wstring();
+    // 先问长度再取：文本域可能是多行（几百个字符），固定栈缓冲会被截断，
+    // 而 WM_GETTEXT 只会老老实实拷进缓冲那么多。
+    std::wstring s;
+    const int n = GetWindowTextLengthW(g_edit);
+    if (n > 0) {
+        std::vector<wchar_t> buf((size_t)n + 2, L'\0');
+        const int got =
+            (int)SendMessageW(g_edit, WM_GETTEXT, (WPARAM)(n + 1), (LPARAM)buf.data());
+        if (got > 0) s.assign(buf.data(), (size_t)got);
+    }
+    s = NormalizeNewlines(s);
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == L' ' || s[a] == L'\t' || s[a] == L'\r' || s[a] == L'\n')) ++a;
+    while (b > a && (s[b - 1] == L' ' || s[b - 1] == L'\t' || s[b - 1] == L'\r' ||
+                     s[b - 1] == L'\n'))
+        --b;
+    return s.substr(a, b - a);
+}
+
 // 新建待办：commit = true 时把输入框里的文字交出去（空字符串 = 当没写）
 void FinishInput(bool commit) {
     if (!g_card) return;
-    std::wstring input;
-    if (commit && g_edit) {
-        // 先问长度再取：文本域可能是多行（几千个字符也可能），固定栈缓冲会被截断，
-        // 而 WM_GETTEXT 只会老老实实拷进缓冲那么多。
-        const int n = GetWindowTextLengthW(g_edit);
-        if (n > 0) {
-            std::vector<wchar_t> buf((size_t)n + 2, L'\0');
-            const int got = (int)SendMessageW(g_edit, WM_GETTEXT, (WPARAM)(n + 1),
-                                              (LPARAM)buf.data());
-            if (got > 0) input.assign(buf.data(), (size_t)got);
-        }
-        input = NormalizeNewlines(input);
-        size_t a = 0, b = input.size();
-        while (a < b && (input[a] == L' ' || input[a] == L'\t' || input[a] == L'\r' ||
-                         input[a] == L'\n'))
-            ++a;
-        while (b > a && (input[b - 1] == L' ' || input[b - 1] == L'\t' ||
-                         input[b - 1] == L'\r' || input[b - 1] == L'\n'))
-            --b;
-        input = input.substr(a, b - a);
-    }
+    const std::wstring input = commit ? ReadEditText() : std::wstring();
 
-    std::function<void(const std::wstring&)> ok;
+    std::function<void(const std::wstring&)> ok, save;
     std::function<void()> toggle, done;
     std::wstring ignored;
-    Teardown(ok, toggle, done, ignored);
+    Teardown(ok, save, toggle, done, ignored);
 
     // 回调放在窗口销毁之后：里面会存配置、重画盒子
     if (commit && !input.empty() && ok) ok(input);
     if (done) done();
 }
 
-// 详情：toggle = true 表示点了主按钮（完成 / 恢复）
+// 详情：toggle = true 表示点了主按钮（完成 / 恢复）。
+// 未完成的详情正文是可编辑的 —— 关窗时把改过的内容交回去（onSave）。
 void FinishDetail(bool toggleNow) {
     if (!g_card) return;
-    std::function<void(const std::wstring&)> ok;
+
+    // 空内容不保存：清空大概率是手滑（真想删有 × 和右键菜单），
+    // 把一条待办悄悄变成空白，比「改不上去」更让人难受。
+    std::wstring edited;
+    const bool canEdit = (g_edit && !g_readOnly);
+    if (canEdit) edited = ReadEditText();
+    const bool changed = canEdit && !edited.empty() && edited != g_text;
+
+    std::function<void(const std::wstring&)> ok, save;
     std::function<void()> toggle, done;
     std::wstring ignored;
-    Teardown(ok, toggle, done, ignored);
+    Teardown(ok, save, toggle, done, ignored);
+
+    // **先切完成状态，再存文字**：两个回调都是靠「下标 + 原文字指纹」找到那条的，
+    // 保存会把文字改掉、指纹随之失效，反过来就切不动了。
     if (toggleNow && toggle) toggle();
+    if (changed && save) save(edited);
     if (done) done();
 }
 
@@ -547,6 +601,17 @@ void CloseCard() {
         FinishDetail(false);
     else
         FinishInput(false);
+}
+
+// 文本域里按 Ctrl+Enter 该干什么。三个状态三种答案：
+//   新建 → 提交；详情未完成 → 直接完成；详情已完成 → 什么都不做
+//（只读的时候提「再完成一次」没意义，完成/恢复请点按钮）。
+void SubmitFromEdit() {
+    if (g_mode == Mode::Detail) {
+        if (!g_readOnly) FinishDetail(true);
+    } else {
+        FinishInput(true);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,13 +693,15 @@ LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PT
             // 文本域里单独一个 Enter 是**换行**（ES_WANTRETURN），提交要 Ctrl+Enter。
             // 用 GetKeyState 而不是查 WM_CHAR 的字符，和输入法 / 键盘布局无关。
             if (GetKeyState(VK_CONTROL) & 0x8000) {
-                FinishInput(true);
+                SubmitFromEdit();
                 return 0;
             }
             break;
         }
         if (w == VK_ESCAPE) {
-            FinishInput(false);
+            // 详情未完成时 Esc = 关窗，但**改动照样保存**（这里不叫「取消」，
+            // 弹窗里只有两颗按钮，没有一个叫取消）。走 CloseCard 统一收尾。
+            CloseCard();
             return 0;
         }
         break;
@@ -642,6 +709,9 @@ LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PT
         // 多行 EDIT 收到 '\r' 就是插一个换行，千万别拦（拦了文本域就没法换行了）；
         // Esc 还是会「叮」一声，那个要吃掉。
         if (w == 27) return 0;
+        // 只读时把字符吞掉：ES_READONLY 自己会拒绝，但会「叮」一声。
+        // Ctrl+C / Ctrl+A 走 WM_KEYDOWN，不受这里影响。
+        if (g_readOnly) return 0;
         break;
     case WM_GETDLGCODE:
         return DLGC_WANTALLKEYS;
@@ -694,15 +764,15 @@ LRESULT CALLBACK CardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return MA_ACTIVATE;
 
     case WM_KEYDOWN:
-        // 详情模式没有输入框，键盘得卡片自己接（Esc 关掉、回车 = 主按钮）。
-        // 新建模式走 EDIT 的 EditProc，这里别把按键吃掉（否则 Tab / 方向键全哑）。
+        // 一般按键都走 EDIT 的 EditProc（它有焦点）。这里只兜「焦点不在文本域」
+        // 的漏网情况，语义和 EditProc 保持一致，别在两处写出两种行为。
         if (g_mode == Mode::Detail) {
             if (w == VK_ESCAPE) {
-                FinishDetail(false);
+                CloseCard();
                 return 0;
             }
             if (w == VK_RETURN) {
-                FinishDetail(true);
+                SubmitFromEdit();
                 return 0;
             }
             return 0;
@@ -761,10 +831,8 @@ LRESULT CALLBACK CardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 SetCursor(LoadCursorW(nullptr, IDC_HAND));
                 return TRUE;
             }
-            // 空白处能拖着窗口跑（四个箭头）。这里没有标题栏，不给这个暗示
-            // 用户根本不知道弹窗还能拖 —— 是他明确要求的功能。
-            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
-            return TRUE;
+            // 头部之外不给任何特殊光标 —— 用户明确说拖动「不需要改变鼠标样式」，
+            // 光标交给类里注册的箭头。
         }
         break;
     }
@@ -774,8 +842,8 @@ LRESULT CALLBACK CardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_press = HitTest(pt);
         if (g_press >= 0) {
             SetCapture(h);
-        } else {
-            // 空白处按下 = 准备拖窗口。此时先不算「在拖」，动过 3px 才算。
+        } else if (InDragHeader(pt)) {
+            // 头部按下 = 准备拖窗口。此时先不算「在拖」，动过 3px 才算。
             RECT wr{};
             if (GetWindowRect(h, &wr)) {
                 g_dragArmed = true;
@@ -784,7 +852,7 @@ LRESULT CALLBACK CardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 g_dragWin0 = POINT{(int)wr.left, (int)wr.top};
                 SetCapture(h);
             }
-            // 点卡片空白处会把焦点从输入框抢走，还给输入框，否则之后打不了字
+            // 点头部会把焦点从文本域抢走，还回去，否则拖完打不了字
             if (g_edit) SetFocus(g_edit);
         }
         return 0;
@@ -809,7 +877,7 @@ LRESULT CALLBACK CardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)w;
         SetTextColor(dc, g_dark ? RGB(240, 240, 244) : RGB(27, 27, 31));
-        SetBkColor(dc, g_dark ? RGB(35, 35, 41) : RGB(255, 255, 255));
+        SetBkColor(dc, EditBgColor());
         return (LRESULT)EditBgBrush();
     }
 
@@ -862,7 +930,7 @@ RECT WorkAreaFor(HWND owner) {
 
 // 卡片摆放：**居中于屏幕**（用户明确要求「在屏幕中央」）。
 // 居中于盒子是不对的 —— 盒子本身就在屏幕角落，卡片贴着角落出来很别扭。
-void PlaceAndShow(HWND owner, bool wantInputFocus) {
+void PlaceAndShow(HWND owner) {
     const RECT lim = WorkAreaFor(owner);
 
     int x = ((int)lim.left + (int)lim.right - g_bufW) / 2;
@@ -876,28 +944,25 @@ void PlaceAndShow(HWND owner, bool wantInputFocus) {
                              GetModuleHandleW(nullptr), nullptr);
     if (!g_card) return;
 
-    if (wantInputFocus) {
-        // 输入框是「卡片拥有的顶层弹出窗口」：分层窗口不能放子控件（不会被合成），
-        // owned 窗口永远压在 owner 上面，而且键盘焦点 / 光标 / 输入法全是系统原生的。
-        // 多行文本域：ES_MULTILINE + ES_WANTRETURN（Enter 换行）+ WS_VSCROLL/
-        // ES_AUTOVSCROLL（超出行数时能滚）。滚动条是常驻的（内容不够时灰着），
-        // 换来的是「一条待办写到 500 字也翻得动」—— 6 行 × 每行 20 来个字
-        // 其实挡不住多少字，不加滚动条就得靠光标盲猜。
-        g_edit = CreateWindowExW(
-            WS_EX_TOOLWINDOW, L"EDIT", L"",
-            WS_POPUP | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL |
-                WS_VSCROLL | ES_NOHIDESEL,
-            x + (int)g_rcEdit.left, y + (int)g_rcEdit.top,
-            (int)(g_rcEdit.right - g_rcEdit.left), (int)(g_rcEdit.bottom - g_rcEdit.top),
-            g_card, nullptr, GetModuleHandleW(nullptr), nullptr);
-        if (g_edit) {
-            SendMessageW(g_edit, WM_SETFONT, (WPARAM)DialogFont(), TRUE);
-            SendMessageW(g_edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                         MAKELPARAM(0, 0));
-            SendMessageW(g_edit, EM_SETLIMITTEXT, (WPARAM)kEditLimit, 0);
-            SetWindowSubclass(g_edit, EditProc, 1, 0);
-            g_editLines = EditLineCountNow();
-        }
+    // 两个模式都有文本域：新建可编辑；详情在「未完成」时可编辑、完成了只读
+    // （用户要求：已完成的那条不允许改内容）。
+    // 输入框是「卡片拥有的顶层弹出窗口」：分层窗口不能放子控件（不会被合成），
+    // owned 窗口永远压在 owner 上面，而且键盘焦点 / 光标 / 输入法全是系统原生的。
+    // 多行：ES_MULTILINE + ES_WANTRETURN（Enter 换行）+ WS_VSCROLL/ES_AUTOVSCROLL
+    // （超出行数时能滚）。滚动条常驻（内容不够时灰着），换来的是「写到 500 字也翻得动」。
+    DWORD st = WS_POPUP | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL |
+               WS_VSCROLL | ES_NOHIDESEL;
+    if (g_readOnly) st |= ES_READONLY;
+    g_edit = CreateWindowExW(
+        WS_EX_TOOLWINDOW, L"EDIT", L"", st, x + (int)g_rcEdit.left, y + (int)g_rcEdit.top,
+        (int)(g_rcEdit.right - g_rcEdit.left), (int)(g_rcEdit.bottom - g_rcEdit.top), g_card,
+        nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (g_edit) {
+        SendMessageW(g_edit, WM_SETFONT, (WPARAM)DialogFont(), TRUE);
+        SendMessageW(g_edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(0, 0));
+        SendMessageW(g_edit, EM_SETLIMITTEXT, (WPARAM)kEditLimit, 0);
+        SetWindowSubclass(g_edit, EditProc, 1, 0);
+        g_editLines = EditLineCountNow();
     }
 
     SetWindowPos(g_card, HWND_TOPMOST, x, y, g_bufW, g_bufH, SWP_SHOWWINDOW | SWP_NOACTIVATE);
@@ -914,6 +979,7 @@ void PlaceAndShow(HWND owner, bool wantInputFocus) {
 
     // 主窗口都是 WS_EX_NOACTIVATE，进程得做一次「真正激活」这个弹窗，
     // 输入框才拿得到键盘焦点（右键菜单刚关掉，前台权利还在我们手上）。
+    // 只读（已完成的详情）也给文本域焦点：能选中复制，Esc 也和另外两种状态走同一条路。
     HWND target = g_edit ? g_edit : g_card;
     SetForegroundWindow(target);
     SetActiveWindow(target);
@@ -931,6 +997,8 @@ void ResetState(Mode mode, const std::wstring& title) {
     g_dragging = false;
     g_text.clear();
     g_done = false;
+    g_readOnly = false;
+    g_created = 0;
     g_textH = 0;
     g_editLines = 1;
     // 文本域的高度必须在 EnsureBuffer 之前定下来：卡片高度靠它算，
@@ -962,7 +1030,7 @@ void ShowInput(HWND owner, const std::wstring& initial,
     g_onOk = onOk;       // 拷一份，别 move：下面几条失败路径还要用原来的 onDone
     g_onDone = onDone;
     Layout();
-    PlaceAndShow(owner, /*wantInputFocus=*/true);
+    PlaceAndShow(owner);
     if (!g_card) {
         g_onOk = nullptr;
         g_onDone = nullptr;
@@ -983,7 +1051,8 @@ void ShowInput(HWND owner, const std::wstring& initial,
     Present();
 }
 
-void ShowDetail(HWND owner, const std::wstring& text, bool done,
+void ShowDetail(HWND owner, const std::wstring& text, bool done, long long created,
+                std::function<void(const std::wstring&)> onSave,
                 std::function<void()> onToggleDone, std::function<void()> onDone) {
     Close();
     EnsureGdiplus();
@@ -991,6 +1060,8 @@ void ShowDetail(HWND owner, const std::wstring& text, bool done,
     ResetState(Mode::Detail, L"\u5f85\u529e\u8be6\u60c5");   // 待办详情
     g_text = text;
     g_done = done;
+    g_readOnly = done;   // 已完成的不许改内容（用户要求）
+    g_created = created;
     // 正文多高由「文字实际多高」和「这块屏放得下多高」共同决定：
     // 先算出卡片除正文以外的固定高度（chrome），剩下的都留给正文。
     // 以前是硬编码 6 行 —— 输入还只有单行的时候够用，现在能写十几行就不够了。
@@ -1003,20 +1074,40 @@ void ShowDetail(HWND owner, const std::wstring& text, bool done,
             std::clamp(room, kDetailLineH * kDetailMinLines, kDetailLineH * kDetailMaxLines);
     }
     g_textH = MeasureDetailHeight(g_text);   // 卡片高度要先知道正文多高
+    // 正文也用文本域显示（未完成时可编辑），高度 = 量出来的正文高 + 文本域上下内边距，
+    // 最少给 3 行那么高 —— 一条只有一行字的待办弹出来只有一条缝会很怪。
+    g_editH = std::max(EditHeightFor(kDetailMinLines), g_textH + kEditPadY * 2);
     EnsureBuffer();
     if (!g_memDC) {
         if (onDone) onDone();
         return;
     }
+    g_onSave = onSave;
     g_onToggle = onToggleDone;
     g_onDone = onDone;
     Layout();
-    PlaceAndShow(owner, /*wantInputFocus=*/false);
+    PlaceAndShow(owner);
     if (!g_card) {
+        g_onSave = nullptr;
         g_onToggle = nullptr;
         g_onDone = nullptr;
         if (onDone) onDone();
+        return;
     }
+    if (!g_edit) {
+        // 文本域没建出来（极端情况）：至少别让弹窗卡在那儿
+        FinishDetail(false);
+        return;
+    }
+    SetWindowTextW(g_edit, g_text.c_str());
+    // 老数据可能比现在的限长还长：把限长抬到「现有长度」，否则用户在这条待办里
+    // 一个字符都敲不进去（EM_SETLIMITTEXT 只限制用户输入，WM_SETTEXT 不受它约束）。
+    if ((int)g_text.size() > kEditLimit)
+        SendMessageW(g_edit, EM_SETLIMITTEXT, (WPARAM)(g_text.size() + 1), 0);
+    // 不设选区：光标落在开头、视图停在顶部，看详情就该从第一行看起。
+    g_editLines = EditLineCountNow();
+    Paint();
+    Present();
 }
 
 }  // namespace TodoDialog

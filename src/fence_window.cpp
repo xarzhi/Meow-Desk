@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <vector>
 
@@ -548,6 +549,10 @@ std::wstring TodoRowText(const std::wstring& s) {
     return out;
 }
 
+// 待办创建时间（Unix 秒，UTC）。新建的两条路（弹窗 / 就地改名的新增分支）都取自这里，
+// 格式才统一；显示时由 TodoDialog 的 CreatedLabel 换成「创建于 2026-10-29 15:48」。
+long long NowSecs() { return (long long)std::time(nullptr); }
+
 // 一条要贴的文字。PaintTodoBody 只负责排版（算出文字盒），真正栅格化交给
 // FenceWindow::DrawUiTextDib —— 那里走 GDI，和图标标题同一条路（见 UiText）。
 struct TodoTextOut {
@@ -974,7 +979,7 @@ void FenceWindow::AddTodo() {
         hwnd_, std::wstring(),
         [this](const std::wstring& s) {
             if (!cfg_ || !isTodo() || s.empty()) return;
-            cfg_->todos.push_back(TodoItem{s, 0});
+            cfg_->todos.push_back(TodoItem{s, 0, NowSecs()});
             if (onStateChanged) onStateChanged();
             hot_ = -1;
             // 刚加的在列表末尾，滚过去让人看见
@@ -987,7 +992,8 @@ void FenceWindow::AddTodo() {
         });
 }
 
-// 查看详情：弹窗里能直接点「完成」（已完成的那条是「恢复」）。
+// 查看详情：弹窗里能直接点「完成」（已完成的那条是「恢复」），
+// 未完成时还能**直接改内容**（用户要求；已完成的只读）。
 // 传的是 cfg_->todos 的下标而不是行号 —— 弹窗开着的时候用户切了 tab 也不会指错。
 void FenceWindow::ShowTodoDetail(int row) {
     if (!isTodo() || !hwnd_) return;
@@ -997,23 +1003,37 @@ void FenceWindow::ShowTodoDetail(int row) {
     // 弹窗开着的时候用户仍可能去点别的（盒子窗口不抢前台）：切 tab 没事（下标稳定），
     // 但删掉一条就会让下标整体前移。留一份文字当指纹，回调里对不上就重新找一次。
     const std::wstring want = cfg_->todos[sub].text;
+    const bool wasDone = cfg_->todos[sub].done != 0;
+    const long long created = cfg_->todos[sub].created;
+
+    // 「改文字」和「切完成状态」两个回调都要在数组里重新定位那条待办，共用这一份。
+    // 文字被别处改过 / 条目已被删掉 → 返回 -1，宁可不动手也别改到别人头上。
+    auto locate = [this, sub, want]() -> int {
+        if (!cfg_) return -1;
+        if (sub >= 0 && sub < (int)cfg_->todos.size() && cfg_->todos[sub].text == want)
+            return sub;
+        for (size_t k = 0; k < cfg_->todos.size(); ++k) {
+            if (cfg_->todos[k].text == want) return (int)k;
+        }
+        return -1;
+    };
 
     SetInteractionHold(true);
     TodoDialog::ShowDetail(
-        hwnd_, cfg_->todos[sub].text, cfg_->todos[sub].done != 0,
-        [this, sub, want] {
+        hwnd_, want, wasDone, created,
+        [this, locate](const std::wstring& now) {   // 改了内容（空内容弹窗那边已经挡掉）
             if (!cfg_ || !isTodo()) return;
-            int i = sub;
-            if (i >= (int)cfg_->todos.size() || cfg_->todos[i].text != want) {
-                i = -1;
-                for (size_t k = 0; k < cfg_->todos.size(); ++k) {
-                    if (cfg_->todos[k].text == want) {
-                        i = (int)k;
-                        break;
-                    }
-                }
-            }
-            if (i < 0 || i >= (int)cfg_->todos.size()) return;
+            const int i = locate();
+            if (i < 0 || cfg_->todos[i].text == now) return;
+            cfg_->todos[i].text = now;
+            if (onStateChanged) onStateChanged();
+            hot_ = -1;
+            Redraw();
+        },
+        [this, locate] {   // 点了「完成 / 恢复未完成」
+            if (!cfg_ || !isTodo()) return;
+            const int i = locate();
+            if (i < 0) return;
             cfg_->todos[i].done = cfg_->todos[i].done ? 0 : 1;
             if (onStateChanged) onStateChanged();
             ClampScroll();
@@ -1090,7 +1110,7 @@ void FenceWindow::EditTodoAt(int row) {
                 return;
             }
             if (adding) {
-                cfg_->todos.push_back(TodoItem{t, 0});
+                cfg_->todos.push_back(TodoItem{t, 0, NowSecs()});
             } else if (ci >= 0 && ci < (int)cfg_->todos.size()) {
                 cfg_->todos[ci].text = t;
             }
