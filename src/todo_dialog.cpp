@@ -9,6 +9,7 @@
 
 #include <windowsx.h>
 #include <commctrl.h>   // SetWindowSubclass / DefSubclassProc
+#include <dwmapi.h>     // DwmSetWindowAttribute：挡住 Win11 给窗口自己切圆角
 
 // GDI+ 头文件顺序：Image / PropertyItem 需要 IStream / PROPID
 #include <objidl.h>
@@ -27,7 +28,11 @@ const wchar_t* kCardClass = L"MeowDeskTodoCard";
 // ---- 几何（和 rename_dialog / confirm_dialog 同一套口径）----
 const int kShadow = 14;      // 阴影留白：客户区比卡片每边大这么多
 const int kRound = 10;
-const int kCardW = 420;      // 比改名弹窗宽一点：详情正文要放得下一整行话
+const int kInitCardW = 420;  // 卡片初始宽度：详情正文要放得下一整行话
+// 卡片尺寸现在是**用户的**（第 51 批：允许拖边框调整大小）：
+// 窗口尺寸变化时，多出来/少掉的高度全部给文本域，宽度同理。
+const int kMinCardW = 340;   // 再窄两颗按钮就挤在一起了
+const int kMaxCardW = 980;   // 太宽一行字读起来累（不是硬限制，屏幕更窄时以屏幕为准）
 const int kPadX = 24;
 const int kPadTop = 22;
 const int kTitleH = 22;
@@ -51,10 +56,8 @@ const int kDetailLineH = 21;
 const int kDetailMaxLines = 20;
 const int kDetailMinLines = 3;
 
-// 「焦点跑掉了没有」的延迟检查（见 CardProc 的 kMsgCheckFocus）。
-// 和 rename_dialog 的 WM_APP+12 错开，避免万一两条消息串到同一个窗口上。
-const UINT kMsgCheckFocus = WM_APP + 13;
 // 文本域行数变了 → 卡片要重新排版（见 EditProc 末尾那段「顺手量一下行数」）。
+// 编号沿用原来的 +14，别和 rename_dialog 的 WM_APP+12 撞上。
 const UINT kMsgRelayout = WM_APP + 14;
 
 enum class Mode { Input, Detail };
@@ -86,10 +89,19 @@ bool g_dragging = false;    // 已经超过死区，正在搬
 POINT g_dragAnchor{};       // 按下时的光标（屏幕坐标）
 POINT g_dragWin0{};         // 按下时的卡片左上角
 
-int g_cardH = 0;
-int g_textH = 0;         // Detail 模式正文量出来的高度（换算文本域高度用）
+int g_cardW = kInitCardW;   // 卡片（不含阴影）的宽
+int g_cardH = 0;            // 卡片（不含阴影）的高 —— 由内容或用户拖边框决定
+// 用户拖过一次边框之后就不再按内容自动长高了：尺寸从此由他说了算，
+// 否则用户刚拉大、一打字又被程序缩回去。
+bool g_userSized = false;
+// 正处在系统的「拖动边框改大小」模态循环里（WM_ENTERSIZEMOVE ~ WM_EXITSIZEMOVE）。
+// 这期间 WM_SIZE 会连发几十次，不能让内容排版插进来抢尺寸。
+bool g_sizing = false;
+int g_sizeW0 = 0;           // 进循环时的卡片尺寸，退出时比一比就知道有没有真的改过
+int g_sizeH0 = 0;
+int g_textH = 0;         // Detail 模式正文量出来的高度（换算初始卡片高度用）
 int g_detailCap = kDetailLineH * 8;   // Detail 正文最多这么高（ShowDetail 按屏幕算）
-int g_editH = 0;         // 文本域的高度（Input 跟着行数长；Detail 按正文长度定死）
+int g_editH = 0;         // 文本域的高度（= 卡片高 - 那圈固定的间距，见 ChromeH）
 int g_editLines = 1;     // 上一帧文本域的显示行数（用来判断要不要重排版）
 RECT g_rcField{};
 RECT g_rcEdit{};
@@ -182,6 +194,11 @@ int EditHeightFor(int lines) {
     return FieldLineHeight() * n + kEditPadY * 2;
 }
 
+// 卡片里「文本域以外」那一圈固定高度：上内边距 + 标题 + 间距 + 按钮行 + 下内边距。
+// 卡片高度减去它就是文本域的高度 —— 换句话说，用户拖边框多出来的高度全给文本域。
+int ChromeH() { return kPadTop + kTitleH + kAfterTitle + kAfterEdit + kBtnH + kPadBottom; }
+int MinCardH() { return ChromeH() + EditHeightFor(kEditLines); }
+
 // 文本域当前显示几行。EM_GETLINECOUNT 对多行 EDIT 返回的就是**显示行**（含折行），
 // 单行 EDIT 恒等于 1（这里只有多行，放心用）。
 int EditLineCountNow() {
@@ -214,7 +231,7 @@ HBRUSH EditBgBrush() {
 int MeasureDetailHeight(const std::wstring& s) {
     // 宽度要按**真正显示文字的那块**算：卡片内宽减掉文本域左右内边距，再减掉右侧
     // 那条竖向滚动条。按卡片内宽量会少折一行 → 建出来的 EDIT 一出场就带滚动条。
-    const int textW = kCardW - kPadX * 2 - kFieldPadX * 2 - 16;
+    const int textW = g_cardW - kPadX * 2 - kFieldPadX * 2 - 16;
     int h = kDetailLineH;
     HDC dc = GetDC(nullptr);
     if (dc) {
@@ -235,15 +252,12 @@ int MeasureDetailHeight(const std::wstring& s) {
     return std::clamp(h, kDetailLineH, g_detailCap);
 }
 
-// 两个模式现在是同一套骨架：标题 + 文本域 + 按钮。差别只在文本域里的内容
-// 能不能改、按钮写什么、以及标题右边那颗状态徽标。
-int CardHeight() {
-    return kPadTop + kTitleH + kAfterTitle + g_editH + kAfterEdit + kBtnH + kPadBottom;
-}
-
+// 两个模式是同一套骨架：标题 + 文本域 + 按钮。差别只在文本域里的内容能不能改、
+// 按钮写什么、以及标题右边那颗状态徽标。
+// 高度不再是算出来的 —— 它是 g_cardH（用户能拖边框改），Layout 里反过来推文本域高度。
 void EnsureBuffer() {
-    const int w = kCardW + kShadow * 2;
-    const int h = CardHeight() + kShadow * 2;
+    const int w = g_cardW + kShadow * 2;
+    const int h = g_cardH + kShadow * 2;
     if (g_memDC && g_bufW == w && g_bufH == h) return;
     if (g_memDC) { DeleteDC(g_memDC); g_memDC = nullptr; }
     if (g_dib) { DeleteObject(g_dib); g_dib = nullptr; }
@@ -257,11 +271,12 @@ void EnsureBuffer() {
 }
 
 void Layout() {
-    g_cardH = CardHeight();
+    // 文本域吃掉剩下的所有高度：用户把窗口拉高多少，能看到的正文就多多少。
+    g_editH = std::max(EditHeightFor(1), g_cardH - ChromeH());
     const int cx = kShadow, cy = kShadow;
 
     const int fieldTop = cy + kPadTop + kTitleH + kAfterTitle;
-    g_rcField = RECT{cx + kPadX, fieldTop, cx + kCardW - kPadX, fieldTop + g_editH};
+    g_rcField = RECT{cx + kPadX, fieldTop, cx + g_cardW - kPadX, fieldTop + g_editH};
 
     // 多行 EDIT 是从客户区顶部往下排字的，所以上下各留 kEditPadY 就正好；
     // 别再像单行那样「只占一行高、垂直居中」—— 那套是为了单行居中，
@@ -270,7 +285,7 @@ void Layout() {
                     g_rcField.right - kFieldPadX, fieldTop + g_editH - kEditPadY};
 
     const int btnTop = cy + g_cardH - kPadBottom - kBtnH;
-    const int okRight = cx + kCardW - kPadX;
+    const int okRight = cx + g_cardW - kPadX;
     g_rcOk = RECT{okRight - kBtnW, btnTop, okRight, btnTop + kBtnH};
     g_rcCancel =
         RECT{g_rcOk.left - kBtnGap - kBtnW, btnTop, g_rcOk.left - kBtnGap, btnTop + kBtnH};
@@ -295,7 +310,14 @@ bool InDragHeader(POINT c) {
 
 void Paint() {
     if (!g_memDC || !g_bits || g_bufW <= 0 || g_bufH <= 0) return;
-    std::memset(g_bits, 0, (size_t)g_bufW * (size_t)g_bufH * 4);
+    // 底色不能 memset 0：分层窗口的鼠标命中是**按 alpha 判**的，alpha=0 的像素点击会
+    // 直接穿透到后面的窗口。可拖边框的那一圈恰好落在阴影留白里（真正画出阴影的只有
+    // 卡片外 6px 左右，再外面几圈是全透明的），alpha=0 的话那条边根本点不到。
+    // 铺一层 alpha=1 的黑：肉眼完全看不出来（0.4%），但 WM_NCHITTEST 收得到。
+    {
+        DWORD* px = static_cast<DWORD*>(g_bits);
+        std::fill(px, px + (size_t)g_bufW * (size_t)g_bufH, 0x01000000u);
+    }
 
     const bool light = !g_dark;
     const ARGB bg = light ? 0xFFFBFBFD : 0xFF2C2C30;
@@ -313,7 +335,7 @@ void Paint() {
         // 分层窗口 + alpha：不能用 ClearType，会出彩色杂边
         g.SetTextRenderingHint(TextRenderingHintAntiAlias);
 
-        const RectF body((float)kShadow, (float)kShadow, (float)kCardW, (float)g_cardH);
+        const RectF body((float)kShadow, (float)kShadow, (float)g_cardW, (float)g_cardH);
 
         // 阴影：由外到内叠几层，越外越淡（和确认框 / 改名弹窗同一个配方）
         for (int i = kShadow; i >= 1; --i) {
@@ -346,9 +368,12 @@ void Paint() {
         // 标题
         {
             SolidBrush tb(fg);
+            // 详情模式的标题右边挂着状态徽标，标题的可用宽度要把那块**让出来** ——
+            // 窗口现在能被拖窄（最小 340），不让的话「待办详情」四个字会压到「未完成」上。
+            const float badgeReserve = (g_mode == Mode::Detail) ? 66.0f : 0.0f;   // 56 + 10
             g.DrawString(g_title.c_str(), -1, &fTitle,
                          RectF((float)kShadow + kPadX, (float)kShadow + kPadTop,
-                               (float)kCardW - kPadX * 2, (float)kTitleH),
+                               (float)g_cardW - kPadX * 2 - badgeReserve, (float)kTitleH),
                          &oneLine, &tb);
 
             // 详情模式：标题右边一个小徽标标状态 —— 弹窗里除了正文，用户最想知道
@@ -356,7 +381,7 @@ void Paint() {
             if (g_mode == Mode::Detail) {
                 Font fBadge(&fam, 12.0f, FontStyleRegular, UnitPixel);
                 const float bw = 56.0f, bh = 20.0f;
-                const float bx = (float)(kShadow + kCardW - kPadX) - bw;
+                const float bx = (float)(kShadow + g_cardW - kPadX) - bw;
                 const float by = (float)kShadow + kPadTop + ((float)kTitleH - bh) * 0.5f;
                 const RectF br(bx, by, bw, bh);
                 GraphicsPath bp;
@@ -398,7 +423,7 @@ void Paint() {
             Font fHint(&fam, 12.0f, FontStyleRegular, UnitPixel);
             const RectF hr((float)kShadow + kPadX,
                            (float)(kShadow + kPadTop + kTitleH + kAfterTitle + g_editH),
-                           (float)kCardW - kPadX * 2, (float)kAfterEdit);
+                           (float)g_cardW - kPadX * 2, (float)kAfterEdit);
             SolidBrush hb{light ? Color(0x88000000) : Color(0x88FFFFFF)};
 
             if (g_mode == Mode::Detail) {
@@ -639,26 +664,64 @@ void ClampToWorkArea(int& x, int& y) {
 
 // 文本域行数变了：卡片高度跟着变、缓冲重建、按钮整体下移、EDIT 跟着改尺寸。
 // **卡片顶边不动**，只往下长 —— 打字的时候窗口自己上下跳会很难受。
+//
+// 第 51 批：尺寸现在也能由用户拖边框决定（g_userSized）。他说了算之后就不再抢了，
+// 否则「刚拉大 → 打个字 → 被缩回 3 行」。
 void RelayoutInput() {
     if (!g_card || g_mode != Mode::Input || !g_edit) return;
-    const int want = EditHeightFor(EditLineCountNow());
-    if (want == g_editH) return;
-    g_editH = want;
+    if (g_userSized || g_sizing) return;
+    const int wantH = ChromeH() + EditHeightFor(EditLineCountNow());
+    if (wantH == g_cardH) return;
 
     RECT wr{};
     if (!GetWindowRect(g_card, &wr)) return;
+    g_cardH = wantH;
     Layout();
     EnsureBuffer();
     if (!g_memDC) return;
 
+    // 这里不用 ApplyWindowSize：它是给 WM_SIZE 用的（从窗口尺寸倒推卡片尺寸），
+    // 而这条路径是「先定卡片高度、再去改窗口」，方向相反。
     SetWindowPos(g_card, HWND_TOPMOST, wr.left, wr.top, g_bufW, g_bufH,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    SetWindowPos(g_edit, HWND_TOPMOST, wr.left + (int)g_rcEdit.left,
-                 wr.top + (int)g_rcEdit.top, (int)(g_rcEdit.right - g_rcEdit.left),
-                 (int)(g_rcEdit.bottom - g_rcEdit.top),
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (g_edit) {
+        SetWindowPos(g_edit, HWND_TOPMOST, wr.left + (int)g_rcEdit.left,
+                     wr.top + (int)g_rcEdit.top, (int)(g_rcEdit.right - g_rcEdit.left),
+                     (int)(g_rcEdit.bottom - g_rcEdit.top),
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
     Paint();
     Present();
+}
+
+// 窗口被改成 cw×ch（卡片尺寸，不含阴影）之后重新排版并重贴位图。
+// 拖边框（WM_SIZE 连发）、显示器的 DPI 变化，最后都汇到这一个入口。
+// 文本域是「卡片拥有的顶层弹出窗口」不是子控件，**它不会跟着动**，必须手动搬。
+// 返回 true 表示真的按新尺寸重排了（尺寸没变就什么都不做，返回 false）。
+bool ApplyWindowSize(int cw, int ch) {
+    if (!g_card) return false;
+    if (cw < kMinCardW) cw = kMinCardW;
+    if (ch < MinCardH()) ch = MinCardH();
+    if (cw == g_cardW && ch == g_cardH) return false;
+
+    RECT wr{};
+    if (!GetWindowRect(g_card, &wr)) return false;
+
+    g_cardW = cw;
+    g_cardH = ch;
+    Layout();
+    EnsureBuffer();
+    if (!g_memDC) return false;
+
+    if (g_edit) {
+        SetWindowPos(g_edit, HWND_TOPMOST, wr.left + (int)g_rcEdit.left,
+                     wr.top + (int)g_rcEdit.top, (int)(g_rcEdit.right - g_rcEdit.left),
+                     (int)(g_rcEdit.bottom - g_rcEdit.top),
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    Paint();
+    Present();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -719,8 +782,8 @@ LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PT
         g_activated = true;   // 真正拿到键盘焦点才算立住
         break;
     case WM_KILLFOCUS:
-        // 焦点可能刚跑到卡片按钮（同线程）也可能跑到别的程序，等这轮消息走完再看
-        if (g_card) PostMessageW(g_card, kMsgCheckFocus, 0, 0);
+        // 以前这里会把「焦点跑了就关窗」的检查 Post 给卡片。第 51 批起窗口要在任务栏
+        // 留一个 tab（用户要求），点别的程序就自我销毁等于那个 tab 白加了，检查已去掉。
         break;
     case WM_NCDESTROY:
         RemoveWindowSubclass(h, EditProc, 1);
@@ -744,17 +807,83 @@ LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PT
 
 LRESULT CALLBACK CardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case kMsgCheckFocus:
-        // 点卡片自己的按钮时前台还是这张卡片，不能当「跑了」
-        if (g_card && g_activated) {
-            HWND fg = GetForegroundWindow();
-            if (fg != g_card && fg != g_edit) CloseCard();
-        }
-        return 0;
-
     case kMsgRelayout:
         RelayoutInput();
         return 0;
+
+    // ---- 有边框但看不见边框（第 51 批：允许拖边框改大小）----------------------
+    // 加了 WS_THICKFRAME 才有「拖四条边」的能力，但那样 DefWindowProc 会真的算出一圈
+    // 非客户区：`UpdateLayeredWindow` 是按**窗口矩形**贴图的，客户区一旦比窗口小，
+    // 整张卡片就会往下右各错开几像素。所以直接把客户区撑满整个窗口 ——
+    // 边框只剩「拿来拖」这一个作用，视觉上仍是那张无边框圆角卡片。
+    case WM_NCCALCSIZE:
+        if (w) return 0;
+        break;
+
+    // 边框既然被吃掉了，WM_NCHITTEST 就得自己判：客户区以外的**整圈阴影留白**都算边框。
+    // 正好卡片本体是从 kShadow 处开始的，留白宽度就是 kShadow，所以中间没有「点了没反应」
+    // 的死区。其余一律交回 HTCLIENT：头部拖动是自己实现的（HTCAPTION 会让系统接管拖动，
+    // 而文本域是独立顶层窗口、不会跟着窗口走，用系统拖动会把输入框留在原地）。
+    case WM_NCHITTEST: {
+        if (g_bufW <= 0 || g_bufH <= 0) break;
+        POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};   // 这里是屏幕坐标
+        ScreenToClient(h, &pt);
+        const bool left = pt.x < kShadow;
+        const bool right = pt.x >= g_bufW - kShadow;
+        const bool top = pt.y < kShadow;
+        const bool bottom = pt.y >= g_bufH - kShadow;
+        if (top && left) return HTTOPLEFT;
+        if (top && right) return HTTOPRIGHT;
+        if (bottom && left) return HTBOTTOMLEFT;
+        if (bottom && right) return HTBOTTOMRIGHT;
+        if (left) return HTLEFT;
+        if (right) return HTRIGHT;
+        if (top) return HTTOP;
+        if (bottom) return HTBOTTOM;
+        return HTCLIENT;
+    }
+
+    case WM_GETMINMAXINFO: {
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(l);
+        if (!mmi) break;
+        DefWindowProcW(h, m, w, l);   // 先让系统把默认值（屏幕尺寸等）填上
+        mmi->ptMinTrackSize.x = kMinCardW + kShadow * 2;
+        mmi->ptMinTrackSize.y = MinCardH() + kShadow * 2;
+        // 太宽一行字读起来累。默认值比这个还小时（小屏幕/高缩放）以默认值为准。
+        const int maxW = kMaxCardW + kShadow * 2;
+        if (mmi->ptMaxTrackSize.x > maxW) mmi->ptMaxTrackSize.x = maxW;
+        return 0;
+    }
+
+    case WM_SIZE: {
+        // 客户区 = 整窗，所以窗口尺寸减掉两圈阴影就是卡片尺寸
+        if (!g_card || w == SIZE_MINIMIZED) return 0;
+        const bool relaid = ApplyWindowSize((int)LOWORD(l) - kShadow * 2,
+                                            (int)HIWORD(l) - kShadow * 2);
+        // 从最小化恢复时尺寸没变（relaid=false），但分层窗口的表面可能是空的，补一次
+        if (!relaid && w == SIZE_RESTORED) {
+            Paint();
+            Present();
+        }
+        return 0;
+    }
+
+    case WM_ENTERSIZEMOVE:
+        g_sizing = true;
+        g_sizeW0 = g_cardW;
+        g_sizeH0 = g_cardH;
+        return 0;
+
+    case WM_EXITSIZEMOVE:
+        g_sizing = false;
+        // 真的改过尺寸才算「用户定了大小」，之后不再按内容自动长高
+        if (g_cardW != g_sizeW0 || g_cardH != g_sizeH0) g_userSized = true;
+        return 0;
+
+    case WM_SYSCOMMAND:
+        // 分层窗口最大化会散架（客户区 = 整窗，会盖住任务栏），这条直接不给
+        if ((w & 0xFFF0) == SC_MAXIMIZE) return 0;
+        break;
 
     case WM_ACTIVATE:
         if (LOWORD(w) != WA_INACTIVE) g_activated = true;
@@ -939,10 +1068,27 @@ void PlaceAndShow(HWND owner) {
     if (x < (int)lim.left) x = (int)lim.left;
     if (y < (int)lim.top) y = (int)lim.top;
 
-    g_card = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kCardClass, L"",
-                             WS_POPUP, x, y, g_bufW, g_bufH, nullptr, nullptr,
-                             GetModuleHandleW(nullptr), nullptr);
+    // 窗口样式（第 51 批）：
+    // - **去掉 WS_EX_TOOLWINDOW**：工具窗口在任务栏上永远不会有按钮，而用户要求
+    //   「这个窗口要在任务栏创建 tab」。这张卡片本来就是无 owner 的顶层窗口，
+    //   去掉这一位任务栏按钮自然就出来了。
+    // - **加 WS_THICKFRAME**：拿到拖四条边改大小的能力。边框本身在 WM_NCCALCSIZE
+    //   里被吃掉了，看到的仍然是那张无边框圆角卡片。
+    // - WS_MINIMIZEBOX | WS_SYSMENU：任务栏右键菜单里的「最小化 / 关闭」才可用，
+    //   不然那个 tab 只有「显示」一个用处。最大化由 WM_SYSCOMMAND 挡掉。
+    g_card = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST, kCardClass, L"",
+                             WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_SYSMENU, x, y,
+                             g_bufW, g_bufH, nullptr, nullptr, GetModuleHandleW(nullptr),
+                             nullptr);
     if (!g_card) return;
+
+    // 有了 WS_THICKFRAME，Win11 会想按「带标题栏的窗口」给这个窗口自己切个圆角 ——
+    // 那会把我们画好的阴影四角削掉。明确告诉它别动（1 = DWMWCP_DONOTROUND）。
+    {
+        DWORD corner = 1;
+        DwmSetWindowAttribute(g_card, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/, &corner,
+                              sizeof(corner));
+    }
 
     // 两个模式都有文本域：新建可编辑；详情在「未完成」时可编辑、完成了只读
     // （用户要求：已完成的那条不允许改内容）。
@@ -965,7 +1111,8 @@ void PlaceAndShow(HWND owner) {
         g_editLines = EditLineCountNow();
     }
 
-    SetWindowPos(g_card, HWND_TOPMOST, x, y, g_bufW, g_bufH, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    ShowWindow(g_card, SW_SHOWNOACTIVATE);   // 先真的「显示」：任务栏按钮靠这个出现
+    SetWindowPos(g_card, HWND_TOPMOST, x, y, g_bufW, g_bufH, SWP_NOACTIVATE);
     Paint();
     Present();
 
@@ -979,10 +1126,12 @@ void PlaceAndShow(HWND owner) {
 
     // 主窗口都是 WS_EX_NOACTIVATE，进程得做一次「真正激活」这个弹窗，
     // 输入框才拿得到键盘焦点（右键菜单刚关掉，前台权利还在我们手上）。
-    // 只读（已完成的详情）也给文本域焦点：能选中复制，Esc 也和另外两种状态走同一条路。
+    // **前台要给卡片本身**：任务栏按钮的高亮跟的是前台窗口，前台给了文本域的话
+    // 那个 tab 会一直显示成「未激活」。同一线程里 SetFocus 到文本域就够打字了。
+    // 只读（已完成的详情）也给文本域焦点：能选中复制，Esc 也和另外几种状态走同一条路。
     HWND target = g_edit ? g_edit : g_card;
-    SetForegroundWindow(target);
-    SetActiveWindow(target);
+    SetForegroundWindow(g_card);
+    SetActiveWindow(g_card);
     SetFocus(target);
 }
 
@@ -1001,9 +1150,15 @@ void ResetState(Mode mode, const std::wstring& title) {
     g_created = 0;
     g_textH = 0;
     g_editLines = 1;
-    // 文本域的高度必须在 EnsureBuffer 之前定下来：卡片高度靠它算，
-    // 定晚了会先按 0 建一块缓冲、再整块重建。
-    g_editH = (mode == Mode::Input) ? EditHeightFor(kEditLines) : 0;
+    // 卡片尺寸回到默认：每次弹窗都是一张「刚开出来」的卡片，不记住上次拖成多大。
+    // g_cardH 由调用方（ShowInput / ShowDetail）按内容定下来，然后再 EnsureBuffer。
+    g_cardW = kInitCardW;
+    g_cardH = 0;
+    g_editH = 0;
+    g_userSized = false;
+    g_sizing = false;
+    g_sizeW0 = 0;
+    g_sizeH0 = 0;
 }
 
 }  // namespace
@@ -1021,6 +1176,9 @@ void ShowInput(HWND owner, const std::wstring& initial,
     EnsureGdiplus();
     EnsureCardClass();
     ResetState(Mode::Input, L"\u65b0\u5efa\u5f85\u529e");   // 新建待办
+    // 新建：初始高度就按「最小高度」= 除文本域以外那一圈固定高度 + 3 行文本域。
+    // 传进来的 initial 本身是多行时，ShowInput 末尾的 RelayoutInput 再往下长。
+    g_cardH = MinCardH();
     EnsureBuffer();
     if (!g_memDC) {
         // 建不出位图（极端内存压力）：别把调用方的收尾回调丢了
@@ -1075,8 +1233,11 @@ void ShowDetail(HWND owner, const std::wstring& text, bool done, long long creat
     }
     g_textH = MeasureDetailHeight(g_text);   // 卡片高度要先知道正文多高
     // 正文也用文本域显示（未完成时可编辑），高度 = 量出来的正文高 + 文本域上下内边距，
-    // 最少给 3 行那么高 —— 一条只有一行字的待办弹出来只有一条缝会很怪。
-    g_editH = std::max(EditHeightFor(kDetailMinLines), g_textH + kEditPadY * 2);
+    // 最少给 3 行那么高 —— 一条只有一行字的待办弹出来只有一条缝会很怪；
+    // 最多到 g_detailCap（这块屏放得下的高度），再长就在文本域里自己滚。
+    g_editH = std::clamp(g_textH + kEditPadY * 2, EditHeightFor(kDetailMinLines),
+                         std::max(EditHeightFor(kDetailMinLines), g_detailCap));
+    g_cardH = ChromeH() + g_editH;
     EnsureBuffer();
     if (!g_memDC) {
         if (onDone) onDone();
