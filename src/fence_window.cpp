@@ -4010,7 +4010,7 @@ void FenceWindow::Paint() {
                     t.text = cfg_->title;
                     t.box = tb;
                     t.px = fontPx;
-                    t.bold = true;          // 标题给粗一点，和 tab 的层级分开
+                    t.bold = false;         // 用户要求不加粗（原先靠粗体跟 tab 分层次，现在同字重）
                     t.leftAlign = true;
                     t.alpha = fadeA8;
                     t.color = RGB((fg >> 16) & 0xFF, (fg >> 8) & 0xFF, fg & 0xFF);
