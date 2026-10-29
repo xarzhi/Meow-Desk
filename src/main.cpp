@@ -3344,6 +3344,81 @@ static int AutoStartSelfTest() {
 }
 
 // ---------------------------------------------------------------------------
+// 兜底：启动时没等到图标 —— 等桌面视图就绪后自己补一次
+// ---------------------------------------------------------------------------
+// 上面最多等 15 秒。更慢的机器（或者被别的启动项拖住的 Explorer）还是可能超时；
+// 那种情况下不能就这么空着跑一天，也不能让用户去「退出重开」。
+// 所以先空着跑起来，后面由 500ms 心跳继续探：一旦枚举拿得到东西，就
+//   重新枚举 → 按 meow-desk.db 里的布局把图标发回各个盒子 → 全部重画。
+// 只在「启动时一个图标都没拿到」时武装，正常运行一分钱不花。
+static DWORD g_layoutRetryAt = 0;         // 0 = 不在重试
+static int g_layoutRetryTries = 0;
+static const int kLayoutRetryMax = 90;    // 90 × 500ms ≈ 45 秒
+
+static bool DirHasEntry(const std::wstring& dir) {
+    if (dir.empty()) return false;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool any = false;
+    do {
+        if (wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L"..")) {
+            any = true;
+            break;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return any;
+}
+
+// 桌面上到底有没有东西？用来区分「shell 还没填好」和「用户桌面本来就是空的」——
+// 后者不该让程序傻探 45 秒。
+static bool DesktopFolderHasItems() {
+    if (DirHasEntry(DesktopFolderPath())) return true;
+    wchar_t pub[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"PUBLIC", pub, MAX_PATH) > 0)
+        return DirHasEntry(std::wstring(pub) + L"\\Desktop");
+    return false;
+}
+
+static void ArmLateIconRecovery() {
+    if (!g_icons.empty()) return;
+    if (!DesktopFolderHasItems()) {
+        LogStep("late icons: desktop folder empty, nothing to recover");
+        return;
+    }
+    g_layoutRetryAt = GetTickCount() + 500;
+    g_layoutRetryTries = 0;
+    LogStep("late icons: armed (desktop has items, shell view not ready yet)");
+}
+
+static void LateIconRecoveryTick() {
+    if (!g_layoutRetryAt) return;
+    if ((int)(GetTickCount() - g_layoutRetryAt) < 0) return;
+    g_layoutRetryAt = GetTickCount() + 500;
+    if (++g_layoutRetryTries > kLayoutRetryMax) {
+        g_layoutRetryAt = 0;
+        LogStep("late icons: gave up after " + std::to_string(kLayoutRetryMax) + " tries");
+        return;
+    }
+    // 先探一次。枚举失败时也返回空列表，所以要看 diag 才分得清「好了但是空」和「没好」
+    auto probe = EnumerateDesktopIcons();
+    const bool okEnum = std::strncmp(LastEnumDiag(), "ok ", 3) == 0;
+    for (auto& it : probe)
+        if (it.pidl) FreeDesktopPidl(it.pidl);   // 探针的 pidl 必须还回去，否则每 500ms 漏一批
+    if (probe.empty() || !okEnum) return;
+
+    g_layoutRetryAt = 0;
+    ReloadDesktopIcons(true);
+    ApplyIconLayout();   // 把图标按上次保存的归属发回各个盒子
+    for (auto& f : g_fences)
+        if (f) f->Redraw();
+    if (g_surfaceVisible) g_surface.Redraw();
+    LogStep("late icons: recovered " + std::to_string(g_icons.size()) + " icons at try " +
+            std::to_string(g_layoutRetryTries));
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
@@ -3426,15 +3501,33 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 真正开始抓由心跳里的 SetBackdropFrameWanted 决定（没开磨砂就一分钱不花）。
     InitBackdropFramePump(GetCurrentThreadId(), kMsgBackdropReady);
     auto items = EnumerateDesktopIcons();
-    // shell 刚起来的那一下枚举偶尔会空手而归（桌面视图还没填满 ItemCount）。
-    // 只在「枚举失败」时重试 —— 用户桌面真的是空的就别白等。
-    for (int attempt = 0; attempt < 2 && items.empty() &&
-                          std::strncmp(LastEnumDiag(), "ok ", 3) != 0;
-         ++attempt) {
-        LogStep("enum empty (" + std::string(LastEnumDiag()) + "), retry " +
-                std::to_string(attempt + 1));
-        Sleep(300);
-        items = EnumerateDesktopIcons();
+    // 一直等到「桌面列表视图」真的可用再往下走（最多 5 秒，超了先空着跑起来，
+    // 后面由 LateIconRecoveryTick 补 —— 见下方「兜底」）。
+    //
+    // 【为什么要等】登录任务比 Run 键早得多。上面那段「等 shell」只盯 Progman /
+    // Shell_TrayWnd，登录那一刻它们已经在（所以 640ms 就通过了），但 Explorer 还没把
+    // **桌面列表视图（SysListView32）** 建出来 —— 枚举会返回 `FindWindowSW hr=0x1`、
+    // 0 个图标。以前只重试 2×300ms 就放弃，于是跑完初始化：盒子建出来了、
+    // 里面一个图标都没有，退出重开（那时 shell 早好了）才有。
+    // 2026-10-29 的自启现场日志就是这个：`enum empty (FindWindowSW hr=0x00000001)` ×2
+    // → `enum icons: 0` → `layout: 0 in fences`。
+    //
+    // 只在「枚举失败」时等：`ok count=0` 说明桌面是真的空，别白等。
+    {
+        const DWORD t0 = GetTickCount();
+        int tries = 0;
+        while (items.empty() && std::strncmp(LastEnumDiag(), "ok ", 3) != 0 &&
+               GetTickCount() - t0 < 5000) {
+            // 头几帧快一点（登录后视图通常 1~3 秒就绪），后面放慢别烧 CPU
+            Sleep(tries < 5 ? 120 : 350);
+            ++tries;
+            items = EnumerateDesktopIcons();
+        }
+        if (tries > 0) {
+            LogStep("enum waited " + std::to_string(GetTickCount() - t0) + "ms/" +
+                    std::to_string(tries + 1) + " tries -> " + LastEnumDiag() + " (" +
+                    std::to_string(items.size()) + " icons)");
+        }
     }
     LogStep("enum icons: " + std::to_string(items.size()) + " diag: " + LastEnumDiag());
     // 诊断用：跳过位图加载，用来分离「图标数据」占的内存
@@ -3452,6 +3545,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         g_iconStore.push_back(std::move(e));
     }
     LogStep("icons ready: " + std::to_string(g_icons.size()));
+    // 一个都没拿到（桌面视图还没建好）→ 交给心跳慢慢补，别让用户看到一排空盒子
+    ArmLateIconRecovery();
     {
         size_t totalBytes = 0, maxW = 0, maxH = 0, nonStd = 0;
         for (auto* e : g_icons) {
@@ -3818,6 +3913,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (!busy) TrimWorkingSetIfIdle();
         // 登录那会儿没注册上的自启任务，趁这次会话补齐（见 ScheduleAutoStartRetry）
         AutoStartRetryTick();
+        // 启动时桌面视图还没建好、一个图标都没拿到 → 等它就绪后把图标补回去
+        LateIconRecoveryTick();
     };
 
     RestoreZOrder();
