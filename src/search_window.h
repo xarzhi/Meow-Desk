@@ -58,6 +58,24 @@ private:
     RECT RowRect(int i) const;
     RECT LocateRect(int i) const;
 
+    // ---- 常用（右上角）----
+    //
+    // 列表每行右侧有一个星形按钮，点一下把这个图标收进右上角的「常用」区，
+    // 最多 5 个。常用项按 path（解析名）落盘，重启后还在；点击常用项直接打开它。
+    //
+    // 为什么只存 path：DesktopIconView* 是每次枚举重建的，存指针跨会话必悬垂；
+    // name 可能重名，path 才唯一且稳定（和 icon_layout 表同一套理由）。
+    RECT FavBarRect(int i) const;        // 右上角第 i 个常用项（0..kFavMax-1）
+    RECT AddFavRect(int i) const;        // 第 i 行右侧的「加入常用」按钮
+    bool IsFav(const DesktopIconView* e) const;
+    void ToggleFav(DesktopIconView* e);  // 已在常用里 → 移除；否则（未满）追加
+    void OpenFav(int i);                 // 点常用项：关面板 + 打开它
+    // 把 favs_ 里的 path 反查成当前的 DesktopIconView*（找不到的留 nullptr）。
+    // 面板每次弹出时算一次就够了：面板开着的时候图标列表不会变。
+    void ResolveFavPtrs();
+    void LoadFavs();
+    void SaveFavs();
+
     // 输入法组合串（未上屏的拼音）。面板要能在组字过程中实时过滤，
     // 同时组合态下 ESC 会被 IME 吃掉，所以顺手装个低级键盘钩子兜住 Esc。
     void SyncImeComposition(HWND edit);
@@ -78,6 +96,15 @@ private:
     int sel_ = 0;
     int hot_ = -1;
     int hotLoc_ = -1;   // 光标压在哪一行的「定位」按钮上（-1 = 没有）
+    int hotFav_ = -1;   // 光标压在哪一行的「加入常用」按钮上（-1 = 没有）
+    int hotFavBar_ = -1;  // 光标压在第几个常用项上（-1 = 没有）
+
+    // 常用项（解析名，顺序 = 显示顺序，最多 kFavMax 个）以及它们的反查结果。
+    // favPtrs_ 和 favs_ 等长、逐项对应；nullptr = 这个图标当前不在了（文件被删 /
+    // 换了盘），那一格就不画。
+    std::vector<std::wstring> favs_;
+    std::vector<DesktopIconView*> favPtrs_;
+    bool favLoaded_ = false;
 
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;

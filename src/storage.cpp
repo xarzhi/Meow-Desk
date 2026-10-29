@@ -28,7 +28,9 @@ std::wstring g_logfile;
 //   v5 — fence 表加 expandMode（展开 / 伸缩模式；-1 = 老数据，启动时按全局默认补）
 //   v6 — 把全局开关 defaultTelescope 落成 0：新建的盒子默认始终展开，不自己收起
 //   v7 — fence 表加 kind（0 = 收纳盒 / 1 = 待办盒）；新增 todo 表（待办条目）
-const int kSchemaVersion = 8;
+//   v8 — fence 表加 collapseDir（收起方向）
+//   v9 — 新增 search_fav 表（搜索窗口右上角的「常用」快捷项，最多 5 条）
+const int kSchemaVersion = 9;
 
 void SetError(const char* what) {
     g_lastError = what ? what : "";
@@ -106,6 +108,13 @@ bool Upgrade(int from) {
         "  ord   INTEGER NOT NULL,"     // 盒内顺序（order 是 SQL 关键字，改名 ord）
         "  x INTEGER NOT NULL, y INTEGER NOT NULL,"
         "  grp INTEGER NOT NULL DEFAULT 0"   // 盒内分组（标签下标）
+        ");"
+        // 搜索窗口右上角的「常用」快捷项。
+        // 同样用解析名当主键：显示名会重名，path 唯一且稳定；ord 是显示顺序
+        // （满 5 个就不再收，UI 上也只画 5 格）。
+        "CREATE TABLE IF NOT EXISTS search_fav ("
+        "  path TEXT PRIMARY KEY,"
+        "  ord  INTEGER NOT NULL"
         ");";
     if (sqlite3_exec(g_db, kSchema, nullptr, nullptr, nullptr) != SQLITE_OK) {
         SetError("create tables");

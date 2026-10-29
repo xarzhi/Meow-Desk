@@ -16,6 +16,7 @@
 #include "app_icon.h"
 #include "icon_render.h"
 #include "pinyin.h"
+#include "storage.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "dwmapi.lib")
@@ -49,6 +50,17 @@ const int kEditId = 1001;
 
 // 每行右侧「定位」按钮的边长（正方形）
 const int kLocateSize = 28;
+
+// ---- 右上角「常用」区 ----
+//
+// 5 个 26px 的方格，间距 6，右端贴着 kWidth - kPad。
+// 起点算成常数（kFavLeft）而不是「按当前个数右对齐」：个数变化时已有项不会
+// 左右跳动，新加的永远在最右端追加。
+const int kFavMax = 5;
+const int kFavSize = 26;
+const int kFavGap = 6;
+const int kFavSpan = kFavMax * (kFavSize + kFavGap);          // 5*32 = 160
+const int kFavLeft = kWidth - kPad - kFavSpan + kFavGap;      // = 510
 
 // 「点到面板外面就关掉」的巡检定时器
 const UINT_PTR kWatchTimer = 31;
@@ -109,6 +121,24 @@ void AddRound(GraphicsPath& p, const RectF& r, float rad) {
 std::wstring Lower(std::wstring s) {
     for (auto& c : s) c = (wchar_t)towlower(c);
     return s;
+}
+
+// 五角星：外顶点 5 个、内顶点 5 个，从正上方（-90°）起顺时针。
+// 「加入常用」按钮和右上角常用项都用它 —— 同一套形状，用户一眼能对上。
+//
+// 垂直方向补一点点偏移：五角星的外接盒并不是以上下顶点对称的
+// （上尖角伸出去 r，下边只有 r*sin54° = 0.809r），几何中心摆放会看起来偏高。
+// 偏移量 = (r - 0.809r) / 2 = 0.0955r。
+void StarPath(GraphicsPath& p, float cx, float cy, float rOut) {
+    const float rIn = rOut * 0.42f;
+    const float dy = rOut * 0.0955f;
+    PointF pts[10];
+    for (int k = 0; k < 10; ++k) {
+        const float ang = -1.57079632679f + (float)k * 0.62831853071f;   // -90° + k*36°
+        const float r = (k & 1) ? rIn : rOut;
+        pts[k] = PointF(cx + r * cosf(ang), cy + dy + r * sinf(ang));
+    }
+    p.AddPolygon(pts, 10);
 }
 
 // 去掉分隔符再比。搜狗/微软拼音在组合串里会插音节分隔符，比如输入 wyy 时
@@ -268,6 +298,110 @@ RECT SearchWindow::LocateRect(int i) const {
     return o;
 }
 
+// 「加入常用」按钮：贴在「定位」左边。两个都是 28px 的方形，中间留 6px。
+RECT SearchWindow::AddFavRect(int i) const {
+    const RECT lr = LocateRect(i);
+    RECT o{};
+    o.right = lr.left - 6;
+    o.left = o.right - kLocateSize;
+    o.top = lr.top;
+    o.bottom = lr.bottom;
+    return o;
+}
+
+// 右上角第 i 个常用项。位置只看下标，和「有几个」无关 —— 这样加/减一个
+// 不会让其余几个左右乱跳。
+RECT SearchWindow::FavBarRect(int i) const {
+    RECT o{};
+    o.left = kFavLeft + i * (kFavSize + kFavGap);
+    o.top = kPadTop + (kHeaderH - kFavSize) / 2;
+    o.right = o.left + kFavSize;
+    o.bottom = o.top + kFavSize;
+    return o;
+}
+
+bool SearchWindow::IsFav(const DesktopIconView* e) const {
+    if (!e || e->path.empty()) return false;
+    for (const auto& p : favs_)
+        if (p == e->path) return true;
+    return false;
+}
+
+void SearchWindow::ToggleFav(DesktopIconView* e) {
+    if (!e || e->path.empty()) return;
+    auto it = std::find(favs_.begin(), favs_.end(), e->path);
+    if (it != favs_.end()) {
+        favs_.erase(it);
+    } else {
+        // 满了就不收（这时候界面上那颗星已经画成灰的，点了本来也不该有反应）
+        if ((int)favs_.size() >= kFavMax) return;
+        favs_.push_back(e->path);
+    }
+    SaveFavs();
+    ResolveFavPtrs();
+    Repaint();
+}
+
+void SearchWindow::OpenFav(int i) {
+    if (i < 0 || i >= (int)favPtrs_.size()) return;
+    DesktopIconView* e = favPtrs_[i];
+    if (!e) return;   // 这一格的图标已经不在了（文件被删 / 换了盘）
+    Hide();
+    hotFavBar_ = -1;
+    if (onOpen) onOpen(e);
+}
+
+void SearchWindow::ResolveFavPtrs() {
+    favPtrs_.assign(favs_.size(), nullptr);
+    if (!all_) return;
+    for (size_t k = 0; k < favs_.size(); ++k) {
+        for (auto* e : *all_) {
+            if (e && e->path == favs_[k]) {
+                favPtrs_[k] = e;
+                break;
+            }
+        }
+    }
+}
+
+void SearchWindow::LoadFavs() {
+    if (favLoaded_) return;
+    favLoaded_ = true;
+    favs_.clear();
+    if (!storage::Open()) return;
+    storage::Stmt st("SELECT path FROM search_fav ORDER BY ord");
+    if (!st.ok()) return;
+    while (st.step() && (int)favs_.size() < kFavMax) {
+        const std::wstring p = st.colText(0);
+        if (!p.empty()) favs_.push_back(p);
+    }
+}
+
+void SearchWindow::SaveFavs() {
+    if (!storage::Open()) return;
+    if (!storage::Begin()) return;
+
+    bool ok = storage::Exec("DELETE FROM search_fav;");
+    if (ok) {
+        storage::Stmt st("INSERT OR REPLACE INTO search_fav(path,ord) VALUES(?1,?2)");
+        for (size_t i = 0; i < favs_.size(); ++i) {
+            if (!st.ok()) {
+                ok = false;
+                break;
+            }
+            st.bindText(1, favs_[i]);
+            st.bindInt(2, (int)i);
+            ok = st.done() && ok;
+            st.reset();
+        }
+    }
+    if (ok) {
+        storage::Commit();
+        return;
+    }
+    storage::Rollback();
+}
+
 void SearchWindow::Layout() {
     if (!hwnd_) return;
     RECT cr{};
@@ -383,8 +517,14 @@ void SearchWindow::ShowPalette() {
     sel_ = 0;
     hot_ = -1;
     hotLoc_ = -1;
+    hotFav_ = -1;
+    hotFavBar_ = -1;
     if (edit_) SetWindowTextW(edit_, L"");
     Filter();
+    // 常用项：配置只读一次（favLoaded_），但反查每次弹出都要重做 ——
+    // 图标列表在面板关着的这段时间里可能已经变了（新下载、删掉、拖进盒子）。
+    LoadFavs();
+    ResolveFavPtrs();
 
     // 居中到光标所在显示器
     POINT cur{};
@@ -504,10 +644,50 @@ void SearchWindow::Repaint() {
         tf.SetFormatFlags(StringFormatFlagsNoWrap);
         tf.SetTrimming(StringTrimmingEllipsisCharacter);
         const int tx = logoX + kLogoPx + kLogoGap;
+        // 标题右边不能压到右上角的常用区 —— 常用区从 kFavLeft 起，
+        // 这里按它裁一下（现在 "Meow Desk" 远短于这个宽度，纯属防御）。
+        const int tw = (kFavLeft - 8) - tx;
         g.DrawString(L"Meow Desk", -1, &fTitle,
-                     RectF((float)tx, (float)logoY, (float)(w - tx - kPad),
+                     RectF((float)tx, (float)logoY, (float)(tw > 40 ? tw : 40),
                            (float)kLogoPx),
                      &tf, &brSub);
+    }
+
+    // ---- 右上角：常用区 ----
+    //
+    // 最多 5 格，位置只由下标决定（见 FavBarRect）。存的是解析名，
+    // 每次弹出面板都重新反查一次图标；反查不到的（文件删了 / 换了盘）
+    // 那一格画个很淡的空心小方块占位 —— 位置留着，用户才能看出是「这一格废了」
+    // 而不是「怎么少了一个」。
+    {
+        const int n = (std::min)((int)favs_.size(), kFavMax);
+        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        for (int i = 0; i < n; ++i) {
+            const RECT fr = FavBarRect(i);
+            DesktopIconView* fe = (i < (int)favPtrs_.size()) ? favPtrs_[i] : nullptr;
+
+            if (i == hotFavBar_ && fe) {
+                GraphicsPath hp;
+                AddRound(hp,
+                         RectF((float)fr.left, (float)fr.top, (float)kFavSize,
+                               (float)kFavSize),
+                         6.0f);
+                SolidBrush hb(CA(t.accent, dark_ ? 70 : 36));
+                g.FillPath(&hb, &hp);
+            }
+            if (fe && fe->bmp.valid()) {
+                Bitmap icon(fe->bmp.width, fe->bmp.height, fe->bmp.width * 4,
+                            PixelFormat32bppPARGB,
+                            const_cast<BYTE*>(
+                                reinterpret_cast<const BYTE*>(fe->bmp.pixels.data())));
+                g.DrawImage(&icon,
+                            Rect(fr.left + 3, fr.top + 3, kFavSize - 6, kFavSize - 6));
+            } else if (!fe) {
+                Pen dp(CA(t.sub, 70), 1.0f);
+                g.DrawRectangle(&dp, Rect(fr.left + 9, fr.top + 9, 8, 8));
+            }
+        }
+        g.SetInterpolationMode(InterpolationModeDefault);
     }
 
     // ---- 结果列表 ----
@@ -539,11 +719,48 @@ void SearchWindow::Repaint() {
                         const_cast<BYTE*>(reinterpret_cast<const BYTE*>(e->bmp.pixels.data())));
             g.DrawImage(&icon, Rect(r.left + 14, iy, 32, 32));
         }
+        // 行内右端现在是「★ 收藏 + 准星 定位」两颗按钮，文字要再让出一颗的宽度。
+        // 宽度按实际按钮矩形算（见 AddFavRect），别在这里另写一套字面量。
+        const RECT favr = AddFavRect(i);
+        const float textL = (float)r.left + 58.0f;
+        const float textR = (float)favr.left - 6.0f;
         g.DrawString(e->name.c_str(), -1, &fItem,
-                     RectF((float)r.left + 58.0f, (float)r.top,
-                           (float)(r.right - r.left) - 70.0f - (float)(kLocateSize + 6),
+                     RectF(textL, (float)r.top,
+                           (std::max)(8.0f, textR - textL),
                            (float)(r.bottom - r.top)),
                      &sf, &brText);
+
+        // ---- 行尾「加入常用」按钮：五角星。再点一次 = 从常用里移除 ----
+        {
+            const bool faved = IsFav(e);
+            const bool fhot = (i == hotFav_);
+            // 已经有 5 个了 → 没收藏的这些画成灰的，点了不响应。
+            // 不做「自动替换最旧的那个」：用户点了个星，结果另一项莫名消失，
+            // 比「点了没反应」更难理解。
+            const bool off = !faved && ((int)favs_.size() >= kFavMax);
+            if (fhot && !off) {
+                GraphicsPath fp;
+                AddRound(fp,
+                         RectF((float)favr.left, (float)favr.top,
+                               (float)(favr.right - favr.left),
+                               (float)(favr.bottom - favr.top)),
+                         6.0f);
+                SolidBrush fb(CA(t.accent, dark_ ? 70 : 36));
+                g.FillPath(&fb, &fp);
+            }
+            const float sx = ((float)favr.left + (float)favr.right) * 0.5f;
+            const float sy = ((float)favr.top + (float)favr.bottom) * 0.5f;
+            GraphicsPath sp;
+            StarPath(sp, sx, sy, 7.0f);
+            if (faved) {
+                // 已收藏 = 实心星，一眼能看出「这项已经在上面那条里了」
+                SolidBrush sb(fhot ? C(t.accent) : CA(t.accent, dark_ ? 230 : 215));
+                g.FillPath(&sb, &sp);
+            } else {
+                Pen sPen(off ? CA(t.sub, 80) : (fhot ? C(t.accent) : C(t.sub)), 1.4f);
+                g.DrawPath(&sPen, &sp);
+            }
+        }
 
         // ---- 行尾「定位」按钮：十字准星。点一下关面板并高亮图标真实位置 ----
         {
@@ -586,8 +803,8 @@ void SearchWindow::Repaint() {
         StringFormat lf;
         lf.SetLineAlignment(StringAlignmentCenter);
         SolidBrush hint(C(t.sub));
-        g.DrawString(L"\u2191\u2193 \u9009\u62e9   Enter \u6253\u5f00   \u51c6\u661f "
-                     L"\u5b9a\u4f4d   Esc \u5173\u95ed", -1,
+        g.DrawString(L"\u2191\u2193 \u9009\u62e9   Enter \u6253\u5f00   \u2605 "
+                     L"\u6536\u85cf   \u51c6\u661f \u5b9a\u4f4d   Esc \u5173\u95ed", -1,
                      &fSub, RectF((float)kPad + 4.0f, (float)h - (float)kFooterH,
                                   (float)w - kPad * 2, (float)kFooterH),
                      &lf, &hint);
@@ -635,19 +852,40 @@ LRESULT SearchWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         int hot = -1;
         int hotLoc = -1;
-        for (int i = 0; i < RowsVisible(); ++i) {
-            RECT r = RowRect(i);
-            if (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom) {
-                hot = i;
-                RECT lr = LocateRect(i);
-                if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom)
-                    hotLoc = i;
+        int hotFav = -1;
+        int hotBar = -1;
+        // 右上角常用区在头部，和结果行不重叠，先单独判
+        const int fn = (std::min)((int)favs_.size(), kFavMax);
+        for (int i = 0; i < fn; ++i) {
+            RECT fr = FavBarRect(i);
+            if (pt.x >= fr.left && pt.x < fr.right && pt.y >= fr.top && pt.y < fr.bottom) {
+                hotBar = i;
                 break;
             }
         }
-        if (hot != hot_ || hotLoc != hotLoc_) {
+        if (hotBar < 0) {
+            for (int i = 0; i < RowsVisible(); ++i) {
+                RECT r = RowRect(i);
+                if (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom) {
+                    hot = i;
+                    RECT lr = LocateRect(i);
+                    if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom)
+                        hotLoc = i;
+                    // 「加入常用」按钮整块都在行内，必须和「定位」一样单独判，
+                    // 否则悬停高亮（和点击）都会被当成这一行本身
+                    RECT fr2 = AddFavRect(i);
+                    if (pt.x >= fr2.left && pt.x < fr2.right && pt.y >= fr2.top &&
+                        pt.y < fr2.bottom)
+                        hotFav = i;
+                    break;
+                }
+            }
+        }
+        if (hot != hot_ || hotLoc != hotLoc_ || hotFav != hotFav_ || hotBar != hotFavBar_) {
             hot_ = hot;
             hotLoc_ = hotLoc;
+            hotFav_ = hotFav;
+            hotFavBar_ = hotBar;
             // 悬停即选中。以前这里只改 hot_，sel_ 还停在键盘上次拨到的那一项 ——
             // 鼠标指着第 5 项按回车/空格，打开的却是第 1 项，
             // 用户看到的现象就是「快捷键打开的项不是我高亮的那项」。
@@ -660,13 +898,30 @@ LRESULT SearchWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONDOWN: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        // 1) 右上角常用项：点一下就打开（常用区就是「一键入口」）
+        const int fn = (std::min)((int)favs_.size(), kFavMax);
+        for (int i = 0; i < fn; ++i) {
+            RECT fr = FavBarRect(i);
+            if (pt.x >= fr.left && pt.x < fr.right && pt.y >= fr.top && pt.y < fr.bottom) {
+                OpenFav(i);
+                return 0;
+            }
+        }
         for (int i = 0; i < RowsVisible(); ++i) {
-            // 先判「定位」按钮：它在行内，不先拦下来就会直接被当成「打开」
+            // 2) 行内「加入常用」按钮。它和「定位」都在行内，必须排在整行判断之前，
+            //    否则点按钮会被当成「打开这一项」。
+            RECT fr = AddFavRect(i);
+            if (pt.x >= fr.left && pt.x < fr.right && pt.y >= fr.top && pt.y < fr.bottom) {
+                ToggleFav(hits_[i]);
+                return 0;
+            }
+            // 3) 先判「定位」按钮：它在行内，不先拦下来就会直接被当成「打开」
             RECT lr = LocateRect(i);
             if (pt.x >= lr.left && pt.x < lr.right && pt.y >= lr.top && pt.y < lr.bottom) {
                 Locate(i);
                 return 0;
             }
+            // 4) 整行 → 打开
             RECT r = RowRect(i);
             if (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom) {
                 sel_ = i;
@@ -675,6 +930,28 @@ LRESULT SearchWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         // 点卡片外（这里没有外部，卡片就是窗口）→ 关闭
+        return 0;
+    }
+
+    // 右键常用项 = 从常用里移除。
+    //
+    // 为什么需要这个入口：列表里那颗星也能取消收藏，但得先把它搜出来 ——
+    // 常用项图标太小（26px）画不了名字，用户可能只认得位置记不住是啥，
+    // 想清掉某个加错的项时「先搜出来再点星」很难受。
+    case WM_RBUTTONDOWN: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const int fn = (std::min)((int)favs_.size(), kFavMax);
+        for (int i = 0; i < fn; ++i) {
+            RECT fr = FavBarRect(i);
+            if (pt.x >= fr.left && pt.x < fr.right && pt.y >= fr.top && pt.y < fr.bottom) {
+                favs_.erase(favs_.begin() + i);
+                SaveFavs();
+                ResolveFavPtrs();
+                hotFavBar_ = -1;
+                Repaint();
+                return 0;
+            }
+        }
         return 0;
     }
 
