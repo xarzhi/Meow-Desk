@@ -88,6 +88,13 @@ private:
 
     int HitTest(POINT pt) const;   // 返回控件 id，-1 无
 
+    // ---- 三个滑块（圆角 / 透明度 / 头部高度）----
+    // 行矩形、取值区间、x→值 三方共用同一份实现：以前绘制一套、拖动又一套，
+    // 圆点永远跑在鼠标前面。新增滑块也走这三个入口，别再手写一遍。
+    const RECT& SliderRow(int id) const;
+    int SliderValueNow(int id) const;       // 滑块当前的生效值（和绘制那份一致）
+    void ApplySliderValue(int id, int x);   // x → 值 → 写配置 → 立刻重绘
+
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;
     bool dark_ = false;
@@ -147,6 +154,9 @@ private:
 
     int hot_ = -1;
     int sliderDrag_ = -1;
+    // 按下那一刻「鼠标 x - 圆点 x」。拖动时按 `pt.x - sliderGrabDx_` 反算值，
+    // 圆点就不会在按下的一瞬间跳到鼠标底下（点右侧数值区时尤其明显）。
+    int sliderGrabDx_ = 0;
 
     // 正在等用户按组合键。为 true 时 WndProc 把键盘消息全部吃掉，
     // 由它来组 (mods,vk) —— 不能让 Alt+F 之类的组合漏给系统菜单。

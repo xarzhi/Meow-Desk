@@ -185,6 +185,16 @@ int SliderValueFromX(const RECT& row, int x, int lo, int hi) {
     return lo + (int)std::lround(t01 * (hi - lo));
 }
 
+// 值 → 鼠标 x（上面那个的逆）。只用来算「按下那一刻，圆点和鼠标差多远」——
+// 差值记住之后拖动就是相对位移，点右边的数值文本区也不会把值一下拉满。
+int SliderXFromValue(const RECT& row, int v, int lo, int hi) {
+    const RECT tr = TrackRect(row);
+    if (hi <= lo) return tr.left;
+    const double t01 =
+        (double)std::clamp(v - lo, 0, hi - lo) / (double)(hi - lo);
+    return tr.left + (int)std::lround(t01 * (double)(tr.right - tr.left));
+}
+
 }  // namespace
 
 struct SettingsTheme {
@@ -377,6 +387,50 @@ int SettingsWindow::HitTest(POINT pt) const {
     return ID_NONE;
 }
 
+// 三个滑块各自的行矩形。命中、起拖、拖动、绘制全部从这里取，
+// 不要再写 `(id == ID_RADIUS) ? rcRadius_ : ...` 这种三元表达式。
+const RECT& SettingsWindow::SliderRow(int id) const {
+    if (id == ID_RADIUS) return rcRadius_;
+    if (id == ID_ALPHA) return rcAlpha_;
+    return rcHeaderH_;
+}
+
+// 滑块此刻「画在哪儿」对应的值。必须和 PaintPage 里的取值一模一样，
+// 否则算出来的圆点位置和看到的圆点差一截，相对拖动就会飘。
+int SettingsWindow::SliderValueNow(int id) const {
+    const bool empty = g_config.fences.empty();
+    if (id == ID_RADIUS) {
+        const int r = empty ? 12 : g_config.fences[0].radius;
+        return std::clamp(r, 0, kRadiusMax);
+    }
+    if (id == ID_ALPHA) {
+        const int acrylic = empty ? 0 : g_config.fences[0].acrylic;
+        const int a = empty ? 236 : g_config.fences[0].alpha;
+        // 「纯色」档下滑块是按满格画的（见 PaintPage），相对位移要按那个位置算
+        if (acrylic == 0 && a >= 255) return kAlphaMax;
+        return std::clamp(a, kAlphaMin, kAlphaMax);
+    }
+    return std::clamp(g_config.headerHeight, kHeaderHMin, kHeaderHMax);
+}
+
+// 鼠标 x → 滑块值 → 写进配置 → 让盒子和面板立刻跟上。
+// 「按下就跳值」和「拖动中」都只走这一个入口，两处各写一遍必然又跑偏。
+void SettingsWindow::ApplySliderValue(int id, int x) {
+    int lo = 0, hi = 100;
+    SliderRange(id, lo, hi);
+    const int v = SliderValueFromX(SliderRow(id), x, lo, hi);
+
+    if (id == ID_RADIUS) {
+        for (auto& f : g_config.fences) f.radius = v;
+    } else if (id == ID_ALPHA) {
+        for (auto& f : g_config.fences) f.alpha = v;
+    } else {
+        g_config.headerHeight = v;
+    }
+    if (onChanged) onChanged();
+    Paint();
+}
+
 void SettingsWindow::NotifyChanged() {
     if (onChanged) onChanged();
 }
@@ -554,7 +608,11 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         g.FillEllipse(&knob, cx - d * 0.5f, cy - d * 0.5f, d, d);
     };
 
-    auto drawSlider = [&](const RECT& row, int lo, int hi, int val, const std::wstring& text) {
+    // id 用来判「鼠标正压在这一行上」——悬停/拖动时圆点放大一圈，
+    // 让人一眼看出这行是能拖的（以前滑块对没对准、能不能点全靠猜）。
+    auto drawSlider = [&](int id, const RECT& row, int lo, int hi, int val,
+                          const std::wstring& text) {
+        const bool hot = (hot_ == id || sliderDrag_ == id);
         RECT tr = TrackRect(row);
         GraphicsPath bgp;
         AddRound(bgp, RectF((float)tr.left, (float)tr.top, (float)(tr.right - tr.left), 4.0f),
@@ -573,10 +631,16 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         }
         const float cx = (float)tr.left + fw;
         const float cy = (float)(row.top + row.bottom) * 0.5f;
+        const float kr = hot ? 10.0f : 9.0f;
+        if (hot) {
+            Pen halo(CA(t.accent, 110), 2.0f);
+            g.DrawEllipse(&halo, cx - kr - 2.0f, cy - kr - 2.0f, (kr + 2.0f) * 2.0f,
+                          (kr + 2.0f) * 2.0f);
+        }
         SolidBrush knob(C(RGB(255, 255, 255)));
-        g.FillEllipse(&knob, cx - 9.0f, cy - 9.0f, 18.0f, 18.0f);
+        g.FillEllipse(&knob, cx - kr, cy - kr, kr * 2.0f, kr * 2.0f);
         Pen kp(C(dark_ ? RGB(70, 70, 70) : RGB(180, 180, 180)), 1.0f);
-        g.DrawEllipse(&kp, cx - 9.0f, cy - 9.0f, 18.0f, 18.0f);
+        g.DrawEllipse(&kp, cx - kr, cy - kr, kr * 2.0f, kr * 2.0f);
         SolidBrush dot(C(t.accent));
         g.FillEllipse(&dot, cx - 4.0f, cy - 4.0f, 8.0f, 8.0f);
 
@@ -737,7 +801,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
         g.DrawString(L"\u5706\u89d2", -1, &fBody,
                      RectF((float)kRowLeft, (float)rcRadius_.top, 90.0f, 30.0f), &sf,
                      &brText);
-        drawSlider(rcRadius_, 0, kRadiusMax, std::min(radius, kRadiusMax),
+        drawSlider(ID_RADIUS, rcRadius_, 0, kRadiusMax, std::min(radius, kRadiusMax),
                    std::to_wstring(std::min(radius, kRadiusMax)));
 
         // ---- 盒子背景三档：纯色 / 透明 / 亚克力 ----
@@ -782,10 +846,10 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
             wchar_t buf[16];
             if (bgMode == 1) {
                 swprintf_s(buf, L"%d%%", (int)std::lround(alpha * 100.0 / 255.0));
-                drawSlider(rcAlpha_, kAlphaMin, kAlphaMax, alpha, buf);
+                drawSlider(ID_ALPHA, rcAlpha_, kAlphaMin, kAlphaMax, alpha, buf);
             } else {
                 // 纯色 / 亚克力档：透明度滑块置灰，不响应（画在满格）
-                drawSlider(rcAlpha_, kAlphaMin, kAlphaMax, kAlphaMax, L"100%");
+                drawSlider(ID_ALPHA, rcAlpha_, kAlphaMin, kAlphaMax, kAlphaMax, L"100%");
             }
         }
 
@@ -794,7 +858,7 @@ void SettingsWindow::PaintPage(Graphics& g, const SettingsTheme& t) {
                      &brText);
         // 上限 50：再高头部就把内容区挤没了（用户定的上限）。
         // 区间必须和拖动共用 kHeaderHMin/kHeaderHMax，别在这里另写。
-        drawSlider(rcHeaderH_, kHeaderHMin, kHeaderHMax,
+        drawSlider(ID_HEADER_H, rcHeaderH_, kHeaderHMin, kHeaderHMax,
                    std::clamp(g_config.headerHeight, kHeaderHMin, kHeaderHMax),
                    std::to_wstring(std::clamp(g_config.headerHeight, kHeaderHMin,
                                               kHeaderHMax)) + L" px");
@@ -1672,27 +1736,37 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == ID_RADIUS || id == ID_ALPHA || id == ID_HEADER_H) {
-            // 透明度滑块只在「透明」档生效；纯色/亚克力档置灰，点它不响应
-            if (id == ID_ALPHA) {
-                const int acrylic =
-                    g_config.fences.empty() ? 0 : g_config.fences[0].acrylic;
-                const int alpha =
-                    g_config.fences.empty() ? 236 : g_config.fences[0].alpha;
-                const int bgMode = acrylic ? 2 : (alpha >= 255 ? 0 : 1);
-                if (bgMode != 1) return 0;
-            }
-            // 只在轨道附近起拖（左右各放宽一个圆点半径，方便抓住贴边的圆点）。
-            // 点右侧的数值文本也当「拖到最大」是很反直觉的 —— 那也是用户说的
-            // 「圆点跟点击位置不一样」的一种。
-            const RECT& row = (id == ID_RADIUS) ? rcRadius_
-                              : (id == ID_ALPHA) ? rcAlpha_
-                                                 : rcHeaderH_;
+            // 「纯色」档下 alpha 恒为 255（= 完全不透明），透明度滑块本身没有意义。
+            // 以前这里直接 return 0 —— 点上去毫无反应、拖也不动，用户看到的
+            // 就是「点都点不了」。现在动它等于顺带切回「透明」档（这才是这个
+            // 滑块的语义）；想要完全不透明请点「纯色」那个分段按钮。
+            const int acrylic = g_config.fences.empty() ? 0 : g_config.fences[0].acrylic;
+            const int curAlpha = g_config.fences.empty() ? 236 : g_config.fences[0].alpha;
+            const bool alphaLocked = (acrylic == 0 && curAlpha >= 255);
+            if (id == ID_ALPHA && alphaLocked) Toggle(ID_BG_TRANS);
+
+            const RECT& row = SliderRow(id);
             const RECT tr = TrackRect(row);
-            if (pt.x < tr.left - 9 || pt.x > tr.right + 9) return 0;
+            // 整行都是热区。以前只认轨道左右各 9px，右侧那 92px 的数值文本区
+            // 点下去完全没反应 —— 而圆点常停在最右边、数字紧挨着它，看着就是
+            // 「滑块坏了」。
+            if (pt.x < row.left - 8 || pt.x > row.right + 8) return 0;
 
             sliderDrag_ = id;
+            SetFocus(h);
             SetCapture(h);
-            SendMessageW(h, WM_MOUSEMOVE, 0, lp);   // 立刻按点击位置设值
+            if (pt.x >= tr.left - 9 && pt.x <= tr.right + 9) {
+                sliderGrabDx_ = 0;
+                ApplySliderValue(id, pt.x);   // 点在轨道上：立刻跳到点击位置
+            } else {
+                // 点在数值/空白：记住「鼠标和圆点的距离」，之后按相对位移拖，
+                // 值不会在按下的那一瞬间被拉满。
+                int lo = 0, hi = 100;
+                SliderRange(id, lo, hi);
+                sliderGrabDx_ =
+                    pt.x - SliderXFromValue(row, SliderValueNow(id), lo, hi);
+                Paint();
+            }
             return 0;
         }
         return 0;
@@ -1701,24 +1775,9 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         if (sliderDrag_ >= 0) {
-            const RECT& row = (sliderDrag_ == ID_RADIUS) ? rcRadius_
-                              : (sliderDrag_ == ID_ALPHA) ? rcAlpha_
-                                                          : rcHeaderH_;
-            // 区间和绘制共用 SliderRange —— 之前这里对头部高度用的是 28..72，
-            // 而绘制用 26..50，两套比例尺直接导致圆点跑偏 + 显示满值卡死。
-            int lo = 0, hi = 100;
-            SliderRange(sliderDrag_, lo, hi);
-            const int v = SliderValueFromX(row, pt.x, lo, hi);
-
-            if (sliderDrag_ == ID_RADIUS) {
-                for (auto& f : g_config.fences) f.radius = v;
-            } else if (sliderDrag_ == ID_ALPHA) {
-                for (auto& f : g_config.fences) f.alpha = v;
-            } else {
-                g_config.headerHeight = v;
-            }
-            if (onChanged) onChanged();
-            Paint();
+            // 区间、行矩形、x→值 全在 ApplySliderValue 里，和按下那一下共用；
+            // 减掉按下时的抓取偏移，圆点才会「跟手」而不是瞬移。
+            ApplySliderValue(sliderDrag_, pt.x - sliderGrabDx_);
             return 0;
         }
         const int hot = HitTest(pt);
@@ -1732,8 +1791,10 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONUP:
         if (sliderDrag_ >= 0) {
             sliderDrag_ = -1;
+            sliderGrabDx_ = 0;
             if (GetCapture() == h) ReleaseCapture();
             g_config.Save();
+            Paint();
             return 0;
         }
         return 0;
@@ -1744,7 +1805,9 @@ LRESULT SettingsWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CAPTURECHANGED:
         if (sliderDrag_ >= 0) {
             sliderDrag_ = -1;
+            sliderGrabDx_ = 0;
             g_config.Save();
+            Paint();
         }
         return 0;
 
