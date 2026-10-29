@@ -17,6 +17,7 @@ bool g_tried = false;
 std::string g_lastError;
 std::wstring g_dir;
 std::wstring g_file;
+std::wstring g_logfile;
 
 // schema 版本：以后加字段就 +1，并在 Upgrade() 里补一段迁移
 //   v1 — 初版：app / fence / icon_layout
@@ -212,6 +213,11 @@ const std::wstring& Dir() {
 const std::wstring& File() {
     if (g_file.empty()) g_file = Dir() + L"\\meow-desk.db";
     return g_file;
+}
+
+const std::wstring& LogFile() {
+    if (g_logfile.empty()) g_logfile = Dir() + L"\\meow-desk.log";
+    return g_logfile;
 }
 
 bool Open() {

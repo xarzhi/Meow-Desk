@@ -34,6 +34,15 @@ namespace storage {
 const std::wstring& Dir();
 const std::wstring& File();
 
+// 日志文件（Dir() 下的 meow-desk.log）。
+//
+// 必须是**绝对路径**：以前是 fopen("meow-desk.log")，跟着「当前目录」走。
+// 手动双击时当前目录是 exe 所在目录，看着没问题；**开机自启那一次**当前目录是
+// C:\Windows\System32（Explorer 处理 Run 键时 lpCurrentDirectory 给的是 NULL），
+// 普通用户又没有写权限 → fopen 直接失败（我们吞掉了错误）→「开机启动要等半分钟」
+// 这种问题永远查不到现场。改成绝对路径之后，开机那一次也会老老实实落在数据目录里。
+const std::wstring& LogFile();
+
 // 打开（首次会建表 + 从旧的 *.ini 导入）。多次调用只打开一次。
 // 返回 false 表示数据库不可用，调用方应回退到默认值。
 bool Open();

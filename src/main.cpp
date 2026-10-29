@@ -147,7 +147,8 @@ static ULONGLONG g_logBaseFt = 0;
 
 static void LogStep(const char* step) {
     FILE* f = nullptr;
-    fopen_s(&f, "meow-desk.log", "a");
+    // 绝对路径（数据目录），开机自启那次的当前目录是 System32，相对路径写不进去
+    _wfopen_s(&f, storage::LogFile().c_str(), L"a");
     if (f) {
         ULONGLONG ms = 0;
         if (g_logBaseFt) {
@@ -1558,47 +1559,101 @@ static std::wstring DomUser() {
     return dom[0] ? (std::wstring(dom) + L"\\" + user) : std::wstring(user);
 }
 
-static bool TaskConnect(ComPtr<ITaskService>& svc) {
-    if (FAILED(CoCreateInstance(__uuidof(TaskScheduler), nullptr, CLSCTX_INPROC_SERVER,
-                                __uuidof(ITaskService), reinterpret_cast<void**>(&svc.p))))
-        return false;
+// 注册任务失败的「哪一步 + 错误码」。
+//
+// 以前注册失败只有一个 bool，日志里就一行 "task register failed"，分不清是
+// 没权限、被组策略禁了、还是参数写错了 —— 而「自启慢了半分钟」这种问题的
+// 第一现场就在这一行里（注册失败就悄悄退回 Run 键，而 Run 键由 Explorer 排队处理）。
+static const wchar_t* g_taskFailStep = nullptr;
+static HRESULT g_taskFailHr = S_OK;
+
+static bool TaskOk(HRESULT hr, const wchar_t* step) {
+    if (SUCCEEDED(hr)) return true;
+    if (!g_taskFailStep) {
+        g_taskFailStep = step;
+        g_taskFailHr = hr;
+    }
+    return false;
+}
+
+static void TaskFailReset() {
+    g_taskFailStep = nullptr;
+    g_taskFailHr = S_OK;
+}
+
+static void TaskFailLog(const char* what) {
+    char buf[320];
+    sprintf_s(buf, "%s failed at %ls hr=0x%08X (0x%08X)", what,
+              g_taskFailStep ? g_taskFailStep : L"?", (unsigned)g_taskFailHr,
+              (unsigned)g_taskFailHr);
+    LogStep(buf);
+}
+
+static bool TaskConnect(ComPtr<ITaskService>& svc) {    const HRESULT hr = CoCreateInstance(__uuidof(TaskScheduler), nullptr, CLSCTX_INPROC_SERVER,
+                                        __uuidof(ITaskService), reinterpret_cast<void**>(&svc.p));
+    if (!TaskOk(hr, L"CoCreateInstance")) return false;
     VARIANT e{};
     VariantInit(&e);
-    return SUCCEEDED(svc->Connect(e, e, e, e));
+    return TaskOk(svc->Connect(e, e, e, e), L"Connect");
 }
 
 // 任务存在吗？存在就把「是否启用」带出来。返回 false = 这个任务不存在（或问不到）。
-static bool TaskQuery(bool& enabled) {
+static bool TaskQuery(bool& enabled, const wchar_t* name = kTaskName) {
     enabled = false;
     ComPtr<ITaskService> svc;
     if (!TaskConnect(svc)) return false;
     ComPtr<ITaskFolder> root;
     if (FAILED(svc->GetFolder(Bstr(L"\\"), &root)) || !root) return false;
     ComPtr<IRegisteredTask> task;
-    if (FAILED(root->GetTask(Bstr(kTaskName), &task)) || !task) return false;
+    if (FAILED(root->GetTask(Bstr(name), &task)) || !task) return false;
     VARIANT_BOOL en = VARIANT_FALSE;
     if (SUCCEEDED(task->get_Enabled(&en))) enabled = (en != VARIANT_FALSE);
     return true;
+}
+
+// 任务里记的可执行文件路径 / 工作目录。
+// 平时就是当前进程的 exe；自检的 fix 模式允许指定「真正的安装位置」，
+// 免得把任务指到一个临时的调试副本上。
+static std::wstring g_taskExeOverride;
+
+static std::wstring TaskExePath() {
+    std::wstring p = g_taskExeOverride.empty() ? ExeFullPath() : g_taskExeOverride;
+    // 任务计划里存的必须是规范的 Win32 路径：正斜杠、`.`、`..` 一律抹平。
+    // （命令行里传进来的路径可能是 `D:/xxx` 这种，任务照样能建，但启动时会找不到文件。）
+    if (p.empty()) return p;
+    for (auto& c : p)
+        if (c == L'/') c = L'\\';
+    wchar_t full[MAX_PATH * 4]{};
+    const DWORD n = GetFullPathNameW(p.c_str(), MAX_PATH * 4, full, nullptr);
+    return n > 0 && n < MAX_PATH * 4 ? std::wstring(full, n) : p;
+}
+
+static std::wstring TaskExeDir() {
+    const std::wstring p = TaskExePath();
+    const size_t s = p.find_last_of(L'\\');
+    return (s == std::wstring::npos) ? std::wstring() : p.substr(0, s);
 }
 
 // 注册（或更新）登录任务。highPriority 只影响「任务被拉起那一刻的线程优先级」：
 // 任务计划默认给 BELOW_NORMAL(7)，开机那会儿根本抢不过别的启动项。
 //   1 = HIGH，4 = NORMAL。程序自己起来之后还会按配置 SetPriorityClass。
 // user 是 Principal / Trigger 的标识（SID 或 DOMAIN\User）。
-static bool TaskRegisterAs(const std::wstring& user, bool highPriority) {
+static bool TaskRegisterAs(const std::wstring& user, bool highPriority,
+                           const wchar_t* name = kTaskName) {
     if (user.empty()) return false;
+    TaskFailReset();
 
     ComPtr<ITaskService> svc;
     if (!TaskConnect(svc)) return false;
 
     ComPtr<ITaskDefinition> def;
-    if (FAILED(svc->NewTask(0, &def)) || !def) return false;
+    if (!TaskOk(svc->NewTask(0, &def), L"NewTask") || !def) return false;
 
     ComPtr<IRegistrationInfo> ri;
     if (SUCCEEDED(def->get_RegistrationInfo(&ri)) && ri) ri->put_Author(Bstr(L"MeowDesk"));
 
     ComPtr<IPrincipal> pr;
-    if (FAILED(def->get_Principal(&pr)) || !pr) return false;
+    if (!TaskOk(def->get_Principal(&pr), L"get_Principal") || !pr) return false;
     pr->put_LogonType(TASK_LOGON_INTERACTIVE_TOKEN);
     pr->put_RunLevel(TASK_RUNLEVEL_LUA);   // 普通权限：绝不为了自启去要 UAC
     pr->put_UserId(Bstr(user));
@@ -1608,7 +1663,7 @@ static bool TaskRegisterAs(const std::wstring& user, bool highPriority) {
     //  · ExecutionTimeLimit = PT0S —— 常驻程序，默认 3 天后会被强杀
     //  · Priority —— 见函数注释
     ComPtr<ITaskSettings> st;
-    if (FAILED(def->get_Settings(&st)) || !st) return false;
+    if (!TaskOk(def->get_Settings(&st), L"get_Settings") || !st) return false;
     st->put_StartWhenAvailable(VARIANT_TRUE);
     st->put_DisallowStartIfOnBatteries(VARIANT_FALSE);
     st->put_StopIfGoingOnBatteries(VARIANT_FALSE);
@@ -1618,49 +1673,70 @@ static bool TaskRegisterAs(const std::wstring& user, bool highPriority) {
     st->put_ExecutionTimeLimit(Bstr(L"PT0S"));
 
     ComPtr<ITriggerCollection> trs;
-    if (FAILED(def->get_Triggers(&trs)) || !trs) return false;
+    if (!TaskOk(def->get_Triggers(&trs), L"get_Triggers") || !trs) return false;
     ComPtr<ITrigger> tr;
-    if (FAILED(trs->Create(TASK_TRIGGER_LOGON, &tr)) || !tr) return false;
+    if (!TaskOk(trs->Create(TASK_TRIGGER_LOGON, &tr), L"Create(LOGON)") || !tr) return false;
     ComPtr<ILogonTrigger> lg;
-    if (FAILED(tr->QueryInterface(__uuidof(ILogonTrigger),
-                                  reinterpret_cast<void**>(&lg.p))) ||
+    if (!TaskOk(tr->QueryInterface(__uuidof(ILogonTrigger),
+                                   reinterpret_cast<void**>(&lg.p)),
+                L"QI(ILogonTrigger)") ||
         !lg)
         return false;
     lg->put_UserId(Bstr(user));
     lg->put_Id(Bstr(L"MeowDeskLogon"));
 
     ComPtr<IActionCollection> acts;
-    if (FAILED(def->get_Actions(&acts)) || !acts) return false;
+    if (!TaskOk(def->get_Actions(&acts), L"get_Actions") || !acts) return false;
     ComPtr<IAction> act;
-    if (FAILED(acts->Create(TASK_ACTION_EXEC, &act)) || !act) return false;
+    if (!TaskOk(acts->Create(TASK_ACTION_EXEC, &act), L"Create(EXEC)") || !act) return false;
     ComPtr<IExecAction> ex;
-    if (FAILED(act->QueryInterface(__uuidof(IExecAction),
-                                   reinterpret_cast<void**>(&ex.p))) ||
+    if (!TaskOk(act->QueryInterface(__uuidof(IExecAction),
+                                    reinterpret_cast<void**>(&ex.p)),
+                L"QI(IExecAction)") ||
         !ex)
         return false;
-    ex->put_Path(Bstr(ExeFullPath()));
-    ex->put_WorkingDirectory(Bstr(ExeDir()));
+    ex->put_Path(Bstr(TaskExePath()));
+    ex->put_WorkingDirectory(Bstr(TaskExeDir()));
 
     ComPtr<ITaskFolder> root;
-    if (FAILED(svc->GetFolder(Bstr(L"\\"), &root)) || !root) return false;
+    if (!TaskOk(svc->GetFolder(Bstr(L"\\"), &root), L"GetFolder") || !root) return false;
 
-    ComPtr<IRegisteredTask> out;
     VARIANT empty{};
     VariantInit(&empty);
     // userId 是 VARIANT（VT_BSTR），不是 BSTR —— 直接塞 BSTR 编不过
-    VARIANT vUser{};
-    VariantInit(&vUser);
-    vUser.vt = VT_BSTR;
-    vUser.bstrVal = SysAllocString(user.c_str());
-    const HRESULT hr = root->RegisterTaskDefinition(
-        Bstr(kTaskName), def, TASK_CREATE_OR_UPDATE, vUser, empty,
-        TASK_LOGON_INTERACTIVE_TOKEN, empty, &out);
-    VariantClear(&vUser);
-    if (FAILED(hr)) {
-        LogStep("task register failed hr=" + std::to_string((long)hr));
-        return false;
+    auto registerOnce = [&]() -> HRESULT {
+        VARIANT vUser{};
+        VariantInit(&vUser);
+        vUser.vt = VT_BSTR;
+        vUser.bstrVal = SysAllocString(user.c_str());
+        ComPtr<IRegisteredTask> out2;
+        const HRESULT h = root->RegisterTaskDefinition(
+            Bstr(name), def, TASK_CREATE_OR_UPDATE, vUser, empty, TASK_LOGON_INTERACTIVE_TOKEN,
+            empty, &out2);
+        VariantClear(&vUser);
+        return h;
+    };
+
+    HRESULT hr = registerOnce();
+    if (SUCCEEDED(hr)) return true;
+
+    // 【踩过的坑】任务里的「优先级高于 NORMAL」是**管理员专属**的。
+    // 普通用户注册 priority=1 会直接拿到 E_ACCESSDENIED(0x80070005)，
+    // 而且失败的是**整条注册**，不是只把优先级忽略掉 —— 于是任务根本建不出来，
+    // 只能退回 Run 键，而 Run 键由 Explorer 串行排队处理，
+    // 表现就是「输完密码进桌面，半分钟后程序才自己冒出来」。
+    // 所以：高优先级没权限就退 NORMAL 重试，任务先建出来。
+    // （程序自己起来之后照样会 SetPriorityClass，运行期的「高优先级」不受影响。）
+    if (highPriority && hr == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED)) {
+        st->put_Priority(4);
+        hr = registerOnce();
+        if (SUCCEEDED(hr)) {
+            LogStep("task registered with NORMAL priority (task HIGH needs admin)");
+            return true;
+        }
     }
-    return true;
+    TaskOk(hr, L"RegisterTaskDefinition");
+    return false;
 }
 
 static bool TaskRegister(bool highPriority) {
@@ -1671,15 +1747,16 @@ static bool TaskRegister(bool highPriority) {
         LogStep("task register used account name fallback");
         return true;
     }
+    TaskFailLog("task register");
     return false;
 }
 
-static void TaskDelete() {
+static void TaskDelete(const wchar_t* name = kTaskName) {
     ComPtr<ITaskService> svc;
     if (!TaskConnect(svc)) return;
     ComPtr<ITaskFolder> root;
     if (FAILED(svc->GetFolder(Bstr(L"\\"), &root)) || !root) return;
-    root->DeleteTask(Bstr(kTaskName), 0);
+    root->DeleteTask(Bstr(name), 0);
 }
 
 // 任务里记的可执行文件路径。用来判断「自启项指的还是不是当前这个 exe」——
@@ -1780,22 +1857,52 @@ static void SetAutoStart(bool on) {
 // 顺便干两件事（每次启动都跑，绝大多数情况只是一次 GetTask 查询）：
 //   1. 任务指向的 exe 路径变了（换目录 / 改名）→ 重新注册
 //   2. 任务和 Run 键同时存在 → 清掉 Run 键，别让开机启动两个进程
+// 注册完必须回头确认一遍：任务真的在了、是启用状态、指向的还是这个 exe。
+// 确认不过就**不要**删 Run 键 —— 宁可留一条慢一点的退路，也不能让用户开机
+// 什么都不启动（那比慢半分钟严重得多）。
+static bool TaskVerifyRegistered(const std::wstring& wantExe) {
+    bool en = false;
+    if (!TaskQuery(en) || !en) return false;
+    return _wcsicmp(TaskExecPath().c_str(), wantExe.c_str()) == 0;
+}
+
+// 定义在下面（自启注册重试那一节），SyncAutoStart 失败时要用
+static void ScheduleAutoStartRetry();
+
 static void SyncAutoStart() {
     bool enabled = false;
-    if (TaskQuery(enabled)) {
-        if (!enabled) return;   // 用户在任务计划程序里禁用了，尊重它
-        if (_wcsicmp(TaskExecPath().c_str(), ExeFullPath().c_str()) != 0) {
+    const bool hasTask = TaskQuery(enabled);
+    if (hasTask && enabled) {
+        if (_wcsicmp(TaskExecPath().c_str(), TaskExePath().c_str()) != 0) {
             if (TaskRegister(g_config.highPriority != 0)) {
                 LogStep("autostart task retargeted -> " + Narrow(ExeFullPath()));
             }
         }
         if (RunValueExists()) RunValueWrite(false);
+        LogStep("autostart: logon task present");
         return;
     }
-    if (!RunValueExists()) return;
+    if (hasTask && !enabled) {
+        // 用户在任务计划程序里禁用了：尊重它，但也别再往 Run 键上加
+        LogStep("autostart: logon task DISABLED by user");
+        return;
+    }
+    if (!RunValueExists()) {
+        LogStep("autostart: off");
+        return;
+    }
+    // Run 键在、任务不在：老版本留下的，或者上次注册失败了。
+    // 每次开机都会走到这里 —— 注册失败就会一直卡在「Explorer 排队跑 Run 键」这条慢路上。
     if (TaskRegister(g_config.highPriority != 0)) {
-        RunValueWrite(false);
-        LogStep("autostart migrated: Run key -> logon task");
+        if (TaskVerifyRegistered(TaskExePath())) {
+            RunValueWrite(false);
+            LogStep("autostart migrated: Run key -> logon task (verified)");
+        } else {
+            LogStep("autostart: task registered but verify FAILED, Run key kept");
+        }
+    } else {
+        LogStep("autostart: STILL on Run key (slow path) - task registration failed");
+        ScheduleAutoStartRetry();
     }
 }
 
@@ -1804,6 +1911,44 @@ static void SyncAutoStart() {
 static void ApplyHighPriority(bool on) {
     SetPriorityClass(GetCurrentProcess(), on ? HIGH_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
     LogStep(std::string("priority ") + (on ? "high" : "normal"));
+}
+
+// ---------------------------------------------------------------------------
+// 自启注册重试
+// ---------------------------------------------------------------------------
+// 登录那一刻系统正忙：任务计划服务的 COM 接口、任务文件所在的那把锁，都可能
+// 还没准备好，RegisterTaskDefinition 这时会失败。一失败就只能退回 Run 键 ——
+// 而 Run 键由 Explorer 串行处理（这台机器上排第七个），于是「进桌面半分钟后才冒出来」。
+//
+// 关键是**不能等到下次开机再补**：下次开机还是同一条慢路，永远补不上。
+// 所以这一次会话里就要重试，成功后立刻把 Run 键删掉，下次开机就走登录任务。
+static DWORD g_autoStartRetryAt = 0;   // 0 = 没有待重试
+static int g_autoStartRetries = 0;
+
+static void ScheduleAutoStartRetry() {
+    // 5s / 20s / 60s / 180s：登录后的头一分钟最可能失败，再往后基本是别的原因，
+    // 别一直重试下去骚扰系统
+    static const DWORD kDelay[] = {5000, 20000, 60000, 180000};
+    if (g_autoStartRetries >= (int)(sizeof(kDelay) / sizeof(kDelay[0]))) return;
+    g_autoStartRetryAt = GetTickCount() + kDelay[g_autoStartRetries];
+    ++g_autoStartRetries;
+    LogStep("autostart: retry scheduled in " + std::to_string(kDelay[g_autoStartRetries - 1] / 1000) +
+            "s");
+}
+
+// 由 500ms 心跳调用（g_surface.onTick）
+static void AutoStartRetryTick() {
+    if (!g_autoStartRetryAt) return;
+    if ((int)(GetTickCount() - g_autoStartRetryAt) < 0) return;   // 还没到点
+    g_autoStartRetryAt = 0;
+    if (!RunValueExists()) return;   // 已经搬过去了，或者用户把自启关了
+    if (TaskRegister(g_config.highPriority != 0) && TaskVerifyRegistered(TaskExePath())) {
+        RunValueWrite(false);
+        LogStep("autostart migrated on retry #" + std::to_string(g_autoStartRetries) +
+                " (Run key removed)");
+        return;
+    }
+    ScheduleAutoStartRetry();
 }
 
 // ---------------------------------------------------------------------------
@@ -3124,11 +3269,91 @@ static void CheckAutoOrganize() {
 }
 
 // ---------------------------------------------------------------------------
+// 自启自检
+// ---------------------------------------------------------------------------
+// `set MEOW_AUTOSTART_TEST=1` 后启动：只把「自启现在是什么状态、本机到底能不能
+// 注册登录任务」原样打一遍日志就退出 —— 不建窗口、不动桌面图标、不碰单例互斥体。
+//
+// 为什么要这么个东西：这台机器上「开机要等半分钟」的真正原因藏在 TaskQuery /
+// RegisterTaskDefinition 的返回值里，界面上完全看不见。注册失败会静默退回 Run 键，
+// 而 Run 键是 Explorer 串行处理的（用户机器上排第七个），半分钟就对上了。
+//
+// 探测用临时任务名，试完立刻删掉 —— 绝不动真正的 MeowDesk 任务，
+// 免得「诊断」本身把用户的自启设置改坏。
+static int AutoStartSelfTest() {
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    g_procStartFt = FileTimeToU64(ft);
+    g_logBaseFt = g_procStartFt;
+    OleInitialize(nullptr);
+
+    LogStep("=== autostart self-test ===");
+    LogStep("exe: " + Narrow(ExeFullPath()));
+    LogStep("data: " + Narrow(storage::Dir()));
+    LogStep("sid: " + Narrow(CurrentUserSid()) + "  acct: " + Narrow(DomUser()));
+
+    bool en = false;
+    const bool has = TaskQuery(en);
+    LogStep("task exists=" + std::to_string(has ? 1 : 0) + " enabled=" +
+            std::to_string(en ? 1 : 0) + " path=" + Narrow(TaskExecPath()));
+    LogStep(std::string("run key: ") + (RunValueExists() ? "present" : "absent"));
+
+    // ---- fix 模式：真的迁移一次 ----
+    // `MEOW_AUTOSTART_TEST=fix`（+ 可选 `MEOW_AUTOSTART_EXE=<安装位置>`）：
+    // 注册真正的 MeowDesk 登录任务、成功后删掉 Run 键。
+    // 用在「程序正开着、单例互斥体挡住第二个实例」的场合 —— 这是唯一能在
+    // 不关程序的前提下把自启从 Run 键搬到登录任务的入口。
+    wchar_t mode[16]{};
+    GetEnvironmentVariableW(L"MEOW_AUTOSTART_TEST", mode, 16);
+    if (_wcsicmp(mode, L"fix") == 0) {
+        wchar_t alt[MAX_PATH * 4]{};
+        if (GetEnvironmentVariableW(L"MEOW_AUTOSTART_EXE", alt, MAX_PATH * 4) > 0)
+            g_taskExeOverride = alt;
+        LogStep("fix: target exe = " + Narrow(TaskExePath()));
+        if (TaskRegister(true) && TaskVerifyRegistered(TaskExePath())) {
+            RunValueWrite(false);
+            LogStep("fix: task registered & verified, Run key removed");
+        } else {
+            LogStep("fix: FAILED (Run key kept)");
+        }
+        LogStep("=== self-test done ===");
+        return 0;
+    }
+
+    const wchar_t* probe = L"MeowDeskProbe";
+    const std::wstring sid = CurrentUserSid();
+    const std::wstring acct = DomUser();
+    auto probeOnce = [&](const std::wstring& who, bool high, const char* tag) {
+        if (who.empty()) return false;
+        const bool ok = TaskRegisterAs(who, high, probe);
+        LogStep(std::string(tag) + (ok ? " OK" : " FAILED"));
+        if (!ok) TaskFailLog(tag);
+        TaskDelete(probe);
+        bool dummy = false;
+        LogStep(std::string(tag) + " cleanup removed=" +
+                (TaskQuery(dummy, probe) ? "NO(still there)" : "yes"));
+        return ok;
+    };
+    // 和程序里真正用的参数一致（配置里 highPriority=1 → 任务优先级 1），
+    // 再补一次普通优先级做对照：两次结果的差异本身就是线索。
+    const bool okSidHigh = probeOnce(sid, true, "probe(sid,high)");
+    const bool okSidNorm = probeOnce(sid, false, "probe(sid,normal)");
+    const bool okAcct = (okSidHigh || okSidNorm) ? true : probeOnce(acct, true, "probe(acct,high)");
+    LogStep("=== self-test done ===");
+    return (okSidHigh || okSidNorm || okAcct) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 物理像素坐标系：不清这个，DWM 会把分层窗口整体拉伸，图标必然发虚
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // 自检模式：必须在单例互斥体之前 —— 用户那边程序通常正开着，
+    // 走互斥体的话这个进程会直接退掉，什么都测不到。
+    if (GetEnvironmentVariableW(L"MEOW_AUTOSTART_TEST", nullptr, 0) > 0)
+        return AutoStartSelfTest();
 
     // ---- 单例 ----
     // 两个实例会各自建一层桌面、各自把系统桌面图标藏一遍，还会互相覆盖
@@ -3187,8 +3412,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // 上次开了「高优先级运行」就照办 —— 进程优先级不落盘在系统里，
     // 每次启动都得自己按配置重新设一遍。
     ApplyHighPriority(g_config.highPriority != 0);
-    // 老版本的 Run 键自启自动搬到「登录计划任务」；换了路径/名字也会自动纠正
-    SyncAutoStart();
+    // 自启同步（查询/注册登录计划任务）**不能**挡在「出画面」前面：
+    // 它要 CoCreateInstance + Connect + GetTask 好几趟 COM，开机那会儿系统正忙，
+    // 几十毫秒很常见。挪到窗口都建好之后再做（见 fences created 之后）。
     g_lastArrow = g_config.shortcutArrow;
     g_lastAcrylic = g_config.fences.empty() ? 0 : g_config.fences[0].acrylic;
 
@@ -3465,6 +3691,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     for (int i = 0; i < (int)g_config.fences.size(); ++i) AddFenceWindow(i);
     LogStep("fences created: " + std::to_string(g_fences.size()));
 
+    // 窗口都摆好了，再来收拾自启：老版本留下的 Run 键自动搬到「登录计划任务」，
+    // 任务里记的 exe 路径换了目录/改名也会自动纠正。
+    // 放在这里是因为它要跑好几趟 COM，压在启动最前面会让「出画面」慢一拍。
+    SyncAutoStart();
+    LogStep("autostart checked");
+
     // 换壁纸 / 改分辨率 → 盒子重抓磨砂底图。
     // 底图只在盒子创建时抓过一次，壁纸一换，磨砂里还是旧壁纸，看起来就像
     // 「桌面变了、盒子没变」；以前得拖一下盒子（触发补抓）才会更新。
@@ -3584,6 +3816,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         for (auto& f : g_fences)
             if (f && f->IsGeometryBusy()) busy = true;
         if (!busy) TrimWorkingSetIfIdle();
+        // 登录那会儿没注册上的自启任务，趁这次会话补齐（见 ScheduleAutoStartRetry）
+        AutoStartRetryTick();
     };
 
     RestoreZOrder();

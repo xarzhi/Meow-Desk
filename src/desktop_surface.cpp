@@ -3,6 +3,7 @@
 #include "icon_render.h"
 #include "file_drop.h"
 #include "shell_icons.h"
+#include "storage.h"
 
 #include <objidl.h>
 #include <ole2.h>
@@ -114,7 +115,7 @@ bool Intersects(const RECT& a, const RECT& b) {
 
 void LogSurface(const char* fmt, ...) {
     FILE* f = nullptr;
-    fopen_s(&f, "meow-desk.log", "a");
+    _wfopen_s(&f, storage::LogFile().c_str(), L"a");
     if (!f) return;
     va_list ap;
     va_start(ap, fmt);

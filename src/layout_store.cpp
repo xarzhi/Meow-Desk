@@ -52,7 +52,8 @@ void BackupLegacy(const std::wstring& p) {
 
 void LogLine(const char* s) {
     FILE* f = nullptr;
-    fopen_s(&f, "meow-desk.log", "a");
+    // 和 main.cpp 一样走绝对路径（数据目录），别跟着当前目录跑
+    _wfopen_s(&f, storage::LogFile().c_str(), L"a");
     if (f) {
         fprintf(f, "%s\n", s);
         fclose(f);
