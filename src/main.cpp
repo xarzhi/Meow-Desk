@@ -873,6 +873,7 @@ static void RequestIconReload();
 static DesktopIconView* IconAtScreen(POINT pt);
 static DWORD DropFilesOntoIcon(const std::vector<std::wstring>& paths, DesktopIconView* tgt);
 static bool IsContainerTarget(const DesktopIconView* e);
+static bool IsRecycleBinTarget(const DesktopIconView* e);
 
 // 一批文件落进我们的桌面（fenceIndex < 0）或者某个盒子
 static DWORD AcceptDroppedFiles(const std::vector<std::wstring>& paths, POINT screenPt,
@@ -892,6 +893,13 @@ static DWORD AcceptDroppedFiles(const std::vector<std::wstring>& paths, POINT sc
         if (eff != DROPEFFECT_NONE) {
             RequestIconReload();
             return eff;
+        }
+        // 落在回收站上但没删掉（文件被占用 / 弹窗里点了取消）：
+        // 这单算处理完了，**别**再往下当普通文件搬进桌面 —— 那等于把用户取消的
+        // 删除又变成一次移动。外部拖进来的返回 NONE，让拖放源自己留着原件。
+        if (IsRecycleBinTarget(tgt)) {
+            LogStep("file drop: recycle bin refused, files left alone");
+            return DROPEFFECT_NONE;
         }
     }
 
@@ -1016,7 +1024,14 @@ static DWORD DeleteFilesToRecycleBin(const std::vector<std::wstring>& paths) {
     op.wFunc = FO_DELETE;
     op.pFrom = from.c_str();
     // FOF_ALLOWUNDO = 进回收站（和桌面拖到回收站一样，还能还原）
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    // FOF_NOCONFIRMATION = 不再问「确实要把这些项目放入回收站吗」——资源管理器拖进
+    //   回收站也不问，问一次反而像出了错。
+    //
+    // **绝对不能加 FOF_NOERRORUI / FOF_SILENT**：那两个会把 shell 的错误对话框
+    // 一并吞掉。文件夹里的程序正在运行（文件被占用）时，系统本该弹「操作无法完成，
+    // 因为文件夹或文件在另一个程序中打开」并给「重试 / 取消」—— 加了就什么都不弹，
+    // 只剩下一次静默失败，用户看到的就是「拖到回收站没反应、图标还被挪到了旁边」。
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
     const int rc = SHFileOperationW(&op);
     const bool ok = rc == 0 && !op.fAnyOperationsAborted;
     LogStep("drop -> recycle bin: rc=" + std::to_string(rc) + " aborted=" +
@@ -1095,6 +1110,17 @@ static bool IsContainerTarget(const DesktopIconView* e) {
     if (IsRecycleBinPath(e->path)) return true;
     const DWORD a = GetFileAttributesW(e->path.c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// 目标是回收站吗？
+//
+// 单独抽出来是因为**回收站永远算「接住了这次松手」**，哪怕删除失败：
+// 删除失败（文件正被占用 / 用户在系统弹窗里点了取消）时 `DeleteFilesToRecycleBin`
+// 返回 DROPEFFECT_NONE，而 DROPEFFECT_NONE 的语义在全程序里是「这个目标不认，
+// 调用方照普通落点摆放」—— 结果就是图标被摆到回收站旁边、文件还在原地，
+// 看着像「拖过去只挪了个位置」（2026-10-29 用户报的正是这个）。
+static bool IsRecycleBinTarget(const DesktopIconView* e) {
+    return e != nullptr && IsRecycleBinPath(e->path);
 }
 
 // 「用它的程序打开被我拖来的文件」——只认可执行 / 快捷方式。
@@ -3024,6 +3050,10 @@ static void AddFenceWindow(int i, bool startCollapsed) {
             if (eff != DROPEFFECT_NONE) {
                 // MOVE = 文件被搬走了（进文件夹 / 进回收站），图标要跟着消失
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
+            } else if (IsRecycleBinTarget(tgt)) {
+                // 回收站没删成（被占用 / 弹窗里点了取消）：图标留在原处。
+                // 走下面那个分支会把它插进这一格 —— 用户看到的就是
+                // 「没删掉，图标却挪到回收站旁边了」。
             } else {
                 // 插入之前先记槽位，插完再播位移动画（后面的图标让开一格）
                 CaptureDragFlips(batch);
@@ -3033,10 +3063,11 @@ static void AddFenceWindow(int i, bool startCollapsed) {
         } else {
             // 盒子 → 桌面：先看落点有没有压在桌面图标上（文件夹 / 回收站 / 程序），
             // 是的话交给它处理，而不是把图标摆到那个图标旁边。整批一起交。
-            const DWORD eff = DropIconsOntoIcon(batch, IconAtScreen(pt));
+            DesktopIconView* tgt = IconAtScreen(pt);
+            const DWORD eff = DropIconsOntoIcon(batch, tgt);
             if (eff != DROPEFFECT_NONE) {
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
-            } else {
+            } else if (!IsRecycleBinTarget(tgt)) {
                 // 第一张落到光标处，其余会顺着空位依次散开
                 CaptureDragFlips(batch);   // 盒子里的图标要往前补位，也给它动画
                 std::vector<DesktopIconView*> pending;
@@ -3653,13 +3684,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         // 会被当成普通落点，于是「拖 md 到 Typora 图标上」看起来毫无反应。
         // 多选拖动同样走这里 —— 整批交给目标（拖到回收站就整批删掉）。
         if (fi < 0) {
-            const DWORD eff = DropIconsOntoIcon(list, g_surface.ItemAtScreen(pt));
+            DesktopIconView* tgt = g_surface.ItemAtScreen(pt);
+            const DWORD eff = DropIconsOntoIcon(list, tgt);
             if (eff != DROPEFFECT_NONE) {
                 if (eff == DROPEFFECT_MOVE) RequestIconReload();
                 SaveIconLayout();
                 RedrawAll();
                 return true;
             }
+            // 落在回收站上没删成（被占用 / 用户取消）：算处理过了，图标留在原位。
+            // 返回 false 会让它「摆到光标底下那一格」，也就是用户看到的
+            // 「没删掉，图标却挪到回收站旁边去了」。
+            if (IsRecycleBinTarget(tgt)) return true;
             return false;
         }
 
@@ -3684,6 +3720,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 RedrawAll();
                 return true;
             }
+            // 同上：回收站没删成也要算处理过，别把图标摆到盒子外/旁边的格子
+            if (IsRecycleBinTarget(tgt)) return true;
         }
         int k = 0;
         for (auto* e : list) {
