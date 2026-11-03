@@ -2051,12 +2051,16 @@ static void TrimWorkingSetIfIdle() {
 }
 
 // ---------------------------------------------------------------------------
-// 盒子右键菜单（自绘）——「新建盒子 / 新建文件夹 / 排序方式 / 查看 /
+// 盒子右键菜单（自绘）——「新建盒子 / 新建文件夹 / 新建文本文档 / 排序方式 / 查看 /
 // 打开设置面板 / 重命名分区」。排序方式、查看带二级菜单，和资源管理器一致。
+//
+// 「新建」这一组只对收纳盒有意义：建出来的东西直接进那个盒子的当前分组，
+// 不再落到桌面上（以前落桌面，等于右键盒子的结果跑到盒子外面去）。
 // ---------------------------------------------------------------------------
 enum {
     kCmdNewFence = 4001,
-    kCmdNewFolder = 4002,
+    kCmdNewFolder = 4002,   // 在盒子里新建文件夹
+    kCmdNewFile = 4003,     // 在盒子里新建文本文档
     kCmdSortName = 4010,    // 4010..4014：名称 / 类型 / 大小 / 修改日期 / 自定义
     kCmdSortAsc = 4020,
     kCmdSortDesc = 4021,
@@ -2416,29 +2420,79 @@ static void OrganizeDesktopNow() {
     OrganizeIcons(cand, false);
 }
 
-// 在真实桌面上新建文件夹（和资源管理器一样挑一个不重名的名字）
-static void NewDesktopFolder() {
-    PWSTR p = nullptr;
-    std::wstring dir;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &p)) && p) {
-        dir = p;
-        CoTaskMemFree(p);
-    }
+// 在**盒子里**新建文件夹 / 文本文档。
+//
+// 以前这里叫 NewDesktopFolder：只往桌面文件夹里建一个目录，图标还留在桌面
+// （owner = -1）。可「新建文件夹」这一项本来就只出现在收纳盒的右键菜单里，
+// 用户右键的是盒子，建出来的东西却跑到桌面上去了。
+// 现在建完直接收进这个盒子的**当前分组**末尾，并滚到看得见的位置。
+//
+// 文件本身仍然建在真实的桌面文件夹里 —— 我们的桌面只是那个文件夹的视图，
+// 不存在「只存在于盒子里」的文件。盒子只管归属（owner），不管存放位置。
+//
+// folder = true 建目录，false 建一个空的文本文档。
+static void NewFenceItem(int fi, bool folder) {
+    if (fi < 0 || fi >= (int)g_fences.size() || !g_fences[fi]) return;
+    const std::wstring dir = DesktopFolderPath();
     if (dir.empty()) return;
+
+    // 名字规则和资源管理器一致：文件夹「新建文件夹 (n)」，文本文档「新建文本文档 (n).txt」
+    // 中文写成转义是为了不依赖源码编码，别改成字面量。
+    const std::wstring base =
+        folder ? L"\u65b0\u5efa\u6587\u4ef6\u5939" : L"\u65b0\u5efa\u6587\u672c\u6587\u6863";
+    const std::wstring ext = folder ? L"" : L".txt";
 
     std::wstring made;
     for (int i = 1; i <= 200 && made.empty(); ++i) {
-        std::wstring path = dir + L"\\\u65b0\u5efa\u6587\u4ef6\u5939";
-        if (i > 1) path += L" (" + std::to_wstring(i) + L")";
-        if (CreateDirectoryW(path.c_str(), nullptr))
-            made = path;
-        else if (GetLastError() != ERROR_ALREADY_EXISTS)
-            break;
+        std::wstring name = base;
+        if (i > 1) name += L" (" + std::to_wstring(i) + L")";
+        name += ext;
+        const std::wstring full = dir + L"\\" + name;
+        if (folder) {
+            if (CreateDirectoryW(full.c_str(), nullptr)) {
+                made = full;
+            } else if (GetLastError() != ERROR_ALREADY_EXISTS) {
+                break;
+            }
+        } else {
+            HANDLE h = CreateFileW(full.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                CloseHandle(h);
+                made = full;
+            } else {
+                const DWORD err = GetLastError();
+                if (err != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) break;
+            }
+        }
     }
     if (made.empty()) return;
-    LogStep("new folder " + Narrow(made));
-    // 不依赖 shell 通知，自己重新枚举一次，图标立刻出现
-    ReloadDesktopIcons();
+    LogStep(std::string(folder ? "new folder " : "new file ") + Narrow(made));
+
+    // 不依赖 shell 通知，自己重新枚举一次，图标立刻出现。
+    // keepPositions = true：这次变化是我们自己写盘造成的，别顺手把别的图标的
+    // shell 坐标拉进来重排一遍。
+    ReloadDesktopIcons(true);
+
+    DesktopIconView* e = nullptr;
+    for (auto* o : g_icons) {
+        if (o && _wcsicmp(o->path.c_str(), made.c_str()) == 0) {
+            e = o;
+            break;
+        }
+    }
+    if (!e) {
+        // 枚举还没跟上（很少见）：文件已经建好了，下一次重载它自己会出现
+        LogStep("new item: not enumerated yet");
+        RedrawAll();
+        return;
+    }
+
+    InsertIntoFence(e, fi, -1);   // -1 = 追加到当前分组末尾
+    SaveIconLayout();
+    RedrawAll();
+    // 分组里图标很多时它落在可视区外，不滚过去用户会以为没建出来。
+    g_fences[fi]->ScrollItemVisible(e);
 }
 
 // ---- 重命名分区 / 分组 ----
@@ -2594,7 +2648,10 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
 
     // 后面这几组只对收纳盒有意义：待办盒不装图标，没有文件夹、排序、查看档位
     if (!todo) {
-        items.push_back(PopupMenuItem(L"\u65b0\u5efa\u6587\u4ef6\u5939", kCmdNewFolder));  // 新建文件夹
+        // 建出来的图标进这个盒子的当前分组（见 NewFenceItem），不再落桌面。
+        items.push_back(PopupMenuItem(L"\u65b0\u5efa\u6587\u4ef6\u5939", kCmdNewFolder));
+        // 新建文本文档
+        items.push_back(PopupMenuItem(L"\u65b0\u5efa\u6587\u672c\u6587\u6863", kCmdNewFile));
         items.push_back(PopupMenuItem::Sep());
         {
             PopupMenuItem m(L"\u6392\u5e8f\u65b9\u5f0f", 0);   // 排序方式
@@ -2690,7 +2747,8 @@ static void ShowFenceMenu(int fi, POINT sp, int item) {
         if (id == kCmdTodoDetail) { w->ShowTodoDetail(item); return; }
         if (id == kCmdTodoEdit) { w->EditTodoAt(item); return; }
         if (id == kCmdTodoDelete) { w->DeleteTodoAt(item); return; }
-        if (id == kCmdNewFolder) { NewDesktopFolder(); return; }
+        if (id == kCmdNewFolder) { NewFenceItem(fi, true); return; }
+        if (id == kCmdNewFile) { NewFenceItem(fi, false); return; }
         if (id == kCmdSettings) { g_settings.Show(); return; }
         if (id == kCmdRename) { BeginRenameFence(fi); return; }
         if (id == kCmdNewGroup) {

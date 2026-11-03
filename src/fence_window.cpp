@@ -2398,6 +2398,21 @@ void FenceWindow::ScrollItemIntoView(int index) {
     if (scrollY_ != old) Redraw();
 }
 
+void FenceWindow::ScrollItemVisible(DesktopIconView* e) {
+    if (!e || !all_ || e->owner != index_ || isTodo()) return;
+    std::vector<DesktopIconView*> mine;
+    CollectVisible(mine);   // 当前分组的可见项
+    int idx = -1;
+    for (size_t i = 0; i < mine.size(); ++i) {
+        if (mine[i] == e) {
+            idx = (int)i;
+            break;
+        }
+    }
+    if (idx < 0) return;
+    ScrollItemIntoView(idx);
+}
+
 void FenceWindow::LocateItem(DesktopIconView* e) {
     if (!e) return;
     // 它在别的分组：先切过去，否则 CollectVisible 里根本找不到它
