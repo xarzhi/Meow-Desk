@@ -728,6 +728,9 @@ static void ReloadDesktopIcons(bool keepPositions = false) {
     }
 
     std::vector<DesktopIconView*> seen;
+    // 这次枚举里「我们替它找了位置」的图标（视图还没跟上，没有真实坐标的那些）。
+    // 循环结束后必须把位置写回资源管理器，见函数末尾那段注释。
+    std::vector<DesktopIconView*> invented;
     for (auto& it : items) {
         DesktopIconView* found = nullptr;
         for (auto* e : g_icons) {
@@ -751,8 +754,15 @@ static void ReloadDesktopIcons(bool keepPositions = false) {
         e->path = it.path;
         e->name = it.name;
         // 磁盘对账补进来的项没有 shell 坐标（哨兵 -1）：丢到桌面第一个空位，
-        // 不能都堆在左上角压着别的图标
-        e->pos = (it.pos.x >= 0 && it.pos.y >= 0) ? it.pos : g_surface.FirstFreeCell({});
+        // 不能都堆在左上角压着别的图标。
+        // 占位判定要算上盒子里的图标（includeFence）：它们在真实桌面上还压着
+        // 自己原来那一格，不算进去就会把新图标摞到人家头上。
+        if (it.pos.x >= 0 && it.pos.y >= 0) {
+            e->pos = it.pos;
+        } else {
+            e->pos = g_surface.FirstFreeCell({}, /*includeFence=*/true);
+            invented.push_back(e.get());
+        }
         e->dragPos = e->pos;
         LoadIconFor(e.get(), kIconPx);
         e->pidl = it.pidl;
@@ -777,6 +787,16 @@ static void ReloadDesktopIcons(bool keepPositions = false) {
         ++i;
     }
     DumpIconPositions();
+    // 替新图标找的空位必须**立刻写回真实桌面**。
+    //
+    // 这几种图标（刚下的文件、刚新建的文件夹、别人往桌面写的文件）出现时，
+    // 资源管理器的桌面视图往往还没跟上（枚举日志里的 `reconcile -0 +1`），
+    // 拿不到它的真实坐标，只能我们替它挑一格。以前只改内存不写回，于是
+    // 「内存里一个位置、真实桌面上另一个位置」，下一次 keepPositions=false 的
+    // 重载一把 shell 坐标拉进来，这些图标就当着用户的面跳走了 —— 用户看到的是
+    // 「新建一个文件夹，别的文件位置全变了」。
+    // 写回之后两边一致，重载多少次都不会动。
+    if (!invented.empty() && g_surface.hwnd()) CommitPositions(invented);
     if (g_surfaceVisible) g_surface.Redraw();
     for (auto& f : g_fences) if (f) f->Redraw();
 }

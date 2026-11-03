@@ -547,11 +547,17 @@ POINT DesktopSurface::AutoGridAnchor(POINT nearPt) const {
 }
 
 bool DesktopSurface::CellIsFree(int x, int y, int cw, int ch,
-                                const std::vector<DesktopIconView*>& exclude) const {
+                                const std::vector<DesktopIconView*>& exclude,
+                                bool includeFence) const {
     RECT a{x, y, x + cw, y + ch};
     if (!icons_) return true;
     for (auto* o : *icons_) {
-        if (!o || !o->OnDesktop()) continue;
+        if (!o) continue;
+        // 默认只算桌面上的图标。includeFence 时盒子里那些也算 —— 它们的真实桌面
+        // 坐标还在（进盒子只改了归属，没动过位置），资源管理器那边是实打实占着的。
+        if (!includeFence && !o->OnDesktop()) continue;
+        // 真实桌面上从来没落过位的（哨兵 -1）没有地皮可言，别拿它去挡别人。
+        if (o->pos.x < 0 || o->pos.y < 0) continue;
         if (std::find(exclude.begin(), exclude.end(), o) != exclude.end()) continue;
         RECT b{o->pos.x, o->pos.y, o->pos.x + cw, o->pos.y + ch};
         if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom)
@@ -566,7 +572,8 @@ bool DesktopSurface::CellIsFree(int x, int y, int cw, int ch,
 // 找出第一个空闲格子。删除盒子 / 删除分组时图标从这里开始一个挨一个往下排。
 // 注意别写成「先扫完一行再下移」—— 桌面图标的排列顺序本来就是一列列往下长，
 // 横着排会让删完后图标横躺在屏幕顶上，和用户预期相反。
-POINT DesktopSurface::FirstFreeCell(const std::vector<DesktopIconView*>& exclude) const {
+POINT DesktopSurface::FirstFreeCell(const std::vector<DesktopIconView*>& exclude,
+                                    bool includeFence) const {
     const int cw = cellW_ > 0 ? cellW_ : 75;
     const int ch = cellH_ > 0 ? cellH_ : 98;
     // 起点必须是**资源管理器网格的第一格**（带左上留白），不能是屏幕原点：
@@ -577,15 +584,16 @@ POINT DesktopSurface::FirstFreeCell(const std::vector<DesktopIconView*>& exclude
     const int maxY = origin_.y + height_ - ch;
     for (int x = org.x; x <= maxX; x += cw) {
         for (int y = org.y; y <= maxY; y += ch) {
-            if (CellIsFree(x, y, cw, ch, exclude)) return POINT{x, y};
+            if (CellIsFree(x, y, cw, ch, exclude, includeFence)) return POINT{x, y};
         }
     }
     // 整屏都排满了：退回网格第一格（宁可叠一点，也别把图标藏到屏幕外面去）
     return org;
 }
 
-POINT DesktopSurface::SnapToFreeCell(POINT want, const std::vector<DesktopIconView*>& exclude) const {
-    return SnapToFreeCellAt(want, AutoGridAnchor(want), exclude);
+POINT DesktopSurface::SnapToFreeCell(POINT want, const std::vector<DesktopIconView*>& exclude,
+                                     bool includeFence) const {
+    return SnapToFreeCellAt(want, AutoGridAnchor(want), exclude, includeFence);
 }
 
 void DesktopSurface::PlaceFreshItemsAt(POINT screenPt, const std::vector<std::wstring>& before) {
@@ -608,7 +616,10 @@ void DesktopSurface::PlaceFreshItemsAt(POINT screenPt, const std::vector<std::ws
         DesktopIconView* o = pending.front();
         // exclude 传还没摆的那几个（含它自己）：免得它自己的**旧**位置把目标格判成占用。
         // 已经摆好的不在 exclude 里，于是它们的新位置会正常挡住后面的。
-        const POINT cell = SnapToFreeCell(want, pending);
+        //
+        // includeFence = true 是这里的关键：盒子里的图标在真实桌面上还压着旧格子，
+        // 不算进来就会把新图标摞上去，Explorer 解冲突时把旁边那些图标挤走。
+        const POINT cell = SnapToFreeCell(want, pending, /*includeFence=*/true);
         void* pidl = o->pidl;
         const bool ok = SetDesktopIconPositions(1, &pidl, &cell);
         if (TraceOn())
@@ -625,7 +636,8 @@ void DesktopSurface::PlaceFreshItemsAt(POINT screenPt, const std::vector<std::ws
 }
 
 POINT DesktopSurface::SnapToFreeCellAt(POINT want, POINT anchor,
-                                       const std::vector<DesktopIconView*>& exclude) const {
+                                       const std::vector<DesktopIconView*>& exclude,
+                                       bool includeFence) const {
     const int cw = cellW_ > 0 ? cellW_ : 75;
     const int ch = cellH_ > 0 ? cellH_ : 98;
     const int maxX = origin_.x + width_ - cw;
@@ -646,7 +658,7 @@ POINT DesktopSurface::SnapToFreeCellAt(POINT want, POINT anchor,
     const int baseX = clampX(anchor.x + (int)std::lround((double)(want.x - anchor.x) / cw) * cw);
     const int baseY = clampY(anchor.y + (int)std::lround((double)(want.y - anchor.y) / ch) * ch);
 
-    auto freeAt = [&](int x, int y) { return CellIsFree(x, y, cw, ch, exclude); };
+    auto freeAt = [&](int x, int y) { return CellIsFree(x, y, cw, ch, exclude, includeFence); };
 
     if (freeAt(baseX, baseY)) return POINT{baseX, baseY};
 

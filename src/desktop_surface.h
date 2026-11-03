@@ -100,13 +100,16 @@ public:
 
     // 找一个离 wantCell 最近的空闲格子（屏幕坐标，格子左上角）。
     // exclude 里的图标不算占位。放不下即返回原值。
-    POINT SnapToFreeCell(POINT wantCell, const std::vector<DesktopIconView*>& exclude) const;
+    // includeFence 同 CellIsFree：给新出现的图标找落脚点时要传 true。
+    POINT SnapToFreeCell(POINT wantCell, const std::vector<DesktopIconView*>& exclude,
+                         bool includeFence = false) const;
 
     // 同上，但显式指定网格锚点（anchor 必须是某个已知落在网格上的格子左上角）。
     // 真实桌面的网格不从屏幕 (0,0) 起算，用绝对坐标取整会让图标落下时整体错位，
     // 所以吸附一律相对锚点取整。
     POINT SnapToFreeCellAt(POINT wantCell, POINT anchor,
-                           const std::vector<DesktopIconView*>& exclude) const;
+                           const std::vector<DesktopIconView*>& exclude,
+                           bool includeFence = false) const;
 
     // 离 nearPt 最近的桌面图标位置（没有桌面图标时退回 GridOrigin()）
     POINT AutoGridAnchor(POINT nearPt) const;
@@ -143,7 +146,11 @@ public:
     // 桌面左上角起、按列（先从上到下扫完一列，再往右）的第一个空闲格子。
     // 删除盒子 / 删除分组把图标倒回桌面时用：图标会从左上角开始一个挨一个往下排，
     // 一列排满再换右边一列，而不是各自「就近抢一个」格子撒得满屏都是。
-    POINT FirstFreeCell(const std::vector<DesktopIconView*>& exclude) const;
+    //
+    // includeFence：把**盒子里**的图标（owner >= 0）也算成占位。给「一个刚出现的新
+    // 图标找落脚点」时必须传 true —— 理由见 CellIsFree 上面那段。
+    POINT FirstFreeCell(const std::vector<DesktopIconView*>& exclude,
+                        bool includeFence = false) const;
 
     // 右键「新建 / 粘贴」之后，把这次**新出现**的图标摆到右键点的那个格子。
     //
@@ -217,10 +224,19 @@ public:
     std::function<void()> onActivateRequest;
 
 private:
-    // 这个格子（左上角 x,y）上有没有桌面图标挡着。exclude 里的不算。
+    // 这个格子（左上角 x,y）上有没有图标挡着。exclude 里的不算。
     // SnapToFreeCellAt 和 FirstFreeCell 共用同一套判定，免得两处口径走偏。
+    //
+    // includeFence = 把盒子里的图标也算成占位。**给新图标找落脚点时必须开**：
+    // 图标被拖进盒子时位置只是「归属」变了，它在真实桌面上的坐标我们从没挪过
+    // —— 资源管理器那边它仍然压着原来那一格。只看桌面图标就等于对那块地皮
+    // 视而不见，把新图标直接摞到它头上，Explorer 一解冲突就把旁边的图标挤走，
+    // 用户看到的就是「新建一个文件，别的文件位置全变了」。
+    // 拖拽 / 倒回桌面这些老路径一律用默认 false：盒子图标不算占位是它们原本的
+    // 手感（盒子占了桌面小半张，算进去后落点会到处乱跳），别去动。
     bool CellIsFree(int x, int y, int cw, int ch,
-                    const std::vector<DesktopIconView*>& exclude) const;
+                    const std::vector<DesktopIconView*>& exclude,
+                    bool includeFence = false) const;
     enum class Mode { None, Move, Marquee };
 
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
