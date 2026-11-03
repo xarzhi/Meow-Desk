@@ -32,6 +32,10 @@ const int kLabelInset = 10;    // 标签左右内缩（对齐资源管理器的�
 // 框选松手后弹「创建盒子」菜单的最小框尺寸：小于它就是「点了下空白处」，
 // 那种情况弹菜单会很烦（用户只是想取消选中）。
 const int kMarqueeMenuMin = 30;
+// 桌面上一个图标都没有时，用来当网格第一格的那个小留白。
+// 有图标时不用它 —— 那种情况能从真实图标反推出资源管理器的准确留白（见
+// DesktopSurface::GridOrigin）。这个值只影响「空桌面上第一次摆图标」。
+const int kEmptyGridPad = 8;
 
 inline int SnapTo(int v, int step) {
     if (step <= 0) return v;
@@ -305,19 +309,40 @@ void ShowBackgroundMenu(HWND hwnd, POINT pt) {
 }
 
 // 某个图标（文件/文件夹/快捷方式）
-void ShowItemMenu(HWND hwnd, const std::wstring& path, POINT pt) {
-    if (path.empty()) return;
-    // 走 IShellItem → BHID_SFUIObject：比 SHBindToParent + GetUIObjectOf 更稳，
-    // 拿到的菜单和资源管理器里右键一个文件完全一致（打开/打开方式/发送到/剪切/复制…）
-    if (TraceOn()) LogSurface("ctx item path=%ls", path.c_str());
-    IShellItem* item = nullptr;
-    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_IShellItem,
-                                          (void**)&item)) ||
-        !item)
-        return;
+// 右键菜单：paths 是**当前选中的那一批**，不是鼠标底下那一个。
+//
+// 【为什么必须整批交出去】shell 的「删除 / 剪切 / 复制」作用的范围 = 创建这个
+// IContextMenu 时传进去的对象个数。以前这里只 SHCreateItemFromParsingName 了
+// 鼠标底下那一个，于是框选 10 个图标再点删除，只删掉 1 个（用户报的 bug）。
+// 现在统一走 IShellItemArray，单选就是长度 1 的数组，只有一套代码。
+void ShowItemMenu(HWND hwnd, const std::vector<std::wstring>& paths, POINT pt) {
+    if (paths.empty()) return;
+    if (TraceOn())
+        LogSurface("ctx item count=%d first=%ls", (int)paths.size(), paths[0].c_str());
+
+    std::vector<PIDLIST_ABSOLUTE> pidls;
+    pidls.reserve(paths.size());
+    for (const auto& p : paths) {
+        if (p.empty()) continue;
+        PIDLIST_ABSOLUTE full = nullptr;
+        if (SUCCEEDED(SHParseDisplayName(p.c_str(), nullptr, &full, 0, nullptr)) && full)
+            pidls.push_back(full);
+    }
+
     IContextMenu* cm = nullptr;
-    item->BindToHandler(nullptr, BHID_SFUIObject, IID_IContextMenu, (void**)&cm);
-    item->Release();
+    IShellItemArray* arr = nullptr;
+    if (!pidls.empty() &&
+        SUCCEEDED(SHCreateShellItemArrayFromIDLists((UINT)pidls.size(),
+                                                    (PCIDLIST_ABSOLUTE_ARRAY)pidls.data(),
+                                                    &arr)) &&
+        arr) {
+        // 走 IShellItemArray → BHID_SFUIObject：和资源管理器里右键「一批文件」
+        // 拿到的菜单完全一致（多选时 fixture 会自动把「重命名」那类只对单个
+        // 对象有意义的项去掉）。
+        arr->BindToHandler(nullptr, BHID_SFUIObject, IID_IContextMenu, (void**)&cm);
+        arr->Release();
+    }
+    for (auto* p : pidls) ILFree(p);
     if (!cm) return;
 
     HMENU menu = CreatePopupMenu();
@@ -330,7 +355,9 @@ void ShowItemMenu(HWND hwnd, const std::wstring& path, POINT pt) {
                                    CMF_NORMAL | CMF_EXPLORE | CMF_CANRENAME);
     if (TraceOn()) LogSurface("item menu hr=0x%08lX count=%d", (unsigned long)hrq,
                               menu ? GetMenuItemCount(menu) : -1);
-    if (menu && SUCCEEDED(hrq)) InvokeShellMenu(hwnd, cm, menu, pt, path);
+    // path 只用来拦「重命名」（那是单选才有意义的操作），多选时传空 = 不拦。
+    if (menu && SUCCEEDED(hrq))
+        InvokeShellMenu(hwnd, cm, menu, pt, paths.size() == 1 ? paths[0] : std::wstring());
     if (menu) DestroyMenu(menu);
     cm->Release();
 }
@@ -341,7 +368,7 @@ void ShowItemMenu(HWND hwnd, const std::wstring& path, POINT pt) {
 // 对外暴露的系统原生菜单（盒子里右键图标也走这里，见 desktop_surface.h）
 // ---------------------------------------------------------------------------
 void ShowShellItemMenu(HWND owner, const std::wstring& path, POINT screenPt) {
-    ShowItemMenu(owner, path, screenPt);
+    ShowItemMenu(owner, std::vector<std::wstring>{path}, screenPt);
 }
 
 void SetShellMenuRenameHandler(std::function<bool(HWND owner, const std::wstring& path)> fn) {
@@ -464,12 +491,42 @@ void DesktopSurface::RefreshIconBitmaps(const std::vector<DesktopIconView*>& lis
     if (any) RepaintCells(dirty);
 }
 
+POINT DesktopSurface::GridOrigin() const {
+    const int cw = cellW_ > 0 ? cellW_ : 75;
+    const int ch = cellH_ > 0 ? cellH_ : 98;
+
+    // 找「左上角最靠前」的桌面图标：先比 y 再比 x。
+    // 它一定落在资源管理器的网格上，所以可以当作锚点往回倒推。
+    const DesktopIconView* first = nullptr;
+    if (icons_) {
+        for (auto* o : *icons_) {
+            if (!o || !o->OnDesktop()) continue;
+            if (!first || o->pos.y < first->pos.y ||
+                (o->pos.y == first->pos.y && o->pos.x < first->pos.x))
+                first = o;
+        }
+    }
+    if (!first) {
+        // 桌面上一个图标都没有：没有东西可以反推。给一个保守的小留白 ——
+        // 宁可差几个像素，也不要让第一列图标紧贴屏幕边缘（用户报的就是这个）。
+        return POINT{origin_.x + kEmptyGridPad, origin_.y + kEmptyGridPad};
+    }
+
+    // 沿网格往左上倒退到出界为止，落点就是第一格
+    int x = first->pos.x;
+    int y = first->pos.y;
+    while (x - cw >= origin_.x) x -= cw;
+    while (y - ch >= origin_.y) y -= ch;
+    return POINT{x, y};
+}
+
 POINT DesktopSurface::AutoGridAnchor(POINT nearPt) const {
     // 资源管理器的桌面图标网格有自己的左上留白，格子不是从屏幕 (0,0) 起算的，
     // 直接对绝对坐标 round(x/cw)*cw 会让图标落下时整体偏掉半格甚至更多。
     // 所以拿「离得最近的桌面图标当前位置」当锚点 —— 它一定在网格上。
+    // 桌面上没有图标时退回 GridOrigin()（那里面已经处理了留白）。
     // 注意参数不能叫 near / far：windef.h 里那两个是空宏，会把这行拆成 ".x"。
-    POINT best = origin_;
+    POINT best = GridOrigin();
     long long bestD = -1;
     if (icons_) {
         for (auto* o : *icons_) {
@@ -509,15 +566,19 @@ bool DesktopSurface::CellIsFree(int x, int y, int cw, int ch,
 POINT DesktopSurface::FirstFreeCell(const std::vector<DesktopIconView*>& exclude) const {
     const int cw = cellW_ > 0 ? cellW_ : 75;
     const int ch = cellH_ > 0 ? cellH_ : 98;
+    // 起点必须是**资源管理器网格的第一格**（带左上留白），不能是屏幕原点：
+    // 「保存文件到桌面」时新文件没有视图位置，就是从这里开始找空位的，
+    // 从 origin_ 起算会让它贴死在屏幕左上角。
+    const POINT org = GridOrigin();
     const int maxX = origin_.x + width_ - cw;
     const int maxY = origin_.y + height_ - ch;
-    for (int x = origin_.x; x <= maxX; x += cw) {
-        for (int y = origin_.y; y <= maxY; y += ch) {
+    for (int x = org.x; x <= maxX; x += cw) {
+        for (int y = org.y; y <= maxY; y += ch) {
             if (CellIsFree(x, y, cw, ch, exclude)) return POINT{x, y};
         }
     }
-    // 整屏都排满了：退回左上角（宁可叠一点，也别把图标藏到屏幕外面去）
-    return POINT{origin_.x, origin_.y};
+    // 整屏都排满了：退回网格第一格（宁可叠一点，也别把图标藏到屏幕外面去）
+    return org;
 }
 
 POINT DesktopSurface::SnapToFreeCell(POINT want, const std::vector<DesktopIconView*>& exclude) const {
@@ -1120,7 +1181,17 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             // 图标上：打开文件的右键菜单（打开方式 / 属性 / 删除 …）
             if (!hit->selected) SelectOnly(hit);
             Redraw();
-            ShowItemMenu(h, hit->path, sp);
+            // 点的是**已选中**的一员就保留整批选择，把这一批全交给 shell ——
+            // 只传 hit 一个的话，框选 10 个再点删除只会删掉它自己。
+            std::vector<std::wstring> sel;
+            if (icons_) {
+                for (auto* o : *icons_) {
+                    if (o && o->OnDesktop() && o->selected && !o->path.empty())
+                        sel.push_back(o->path);
+                }
+            }
+            if (sel.empty()) sel.push_back(hit->path);
+            ShowItemMenu(h, sel, sp);
         } else {
             ClearSelection();
             Redraw();

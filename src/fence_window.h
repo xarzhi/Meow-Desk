@@ -329,6 +329,10 @@ public:
     void ToggleTodoAt(int row);    // 勾上 / 取消勾
     void EditTodoAt(int row);      // 就地改文字（新建走 AddTodo 的弹窗）
     void DeleteTodoAt(int row);
+    // 第 row 行左侧那个勾选框的点击区 / 命中。
+    // **只有**点在这里面才切换完成状态；点文字不勾（双击才是改名）。
+    RECT TodoCheckRect(int row) const;
+    bool TodoCheckHit(int row, POINT clientPt) const;
     // 第 row 行右侧那个「×」删除按钮的客户区矩形（行不存在 → 空矩形）。
     RECT TodoDeleteRect(int row) const;
     // 这一点是不是点在那颗「×」上（删除按钮，命中范围比图形本身宽一点，好点）

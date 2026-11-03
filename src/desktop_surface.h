@@ -108,8 +108,17 @@ public:
     POINT SnapToFreeCellAt(POINT wantCell, POINT anchor,
                            const std::vector<DesktopIconView*>& exclude) const;
 
-    // 离 nearPt 最近的桌面图标位置（没有桌面图标时退回 origin_）
+    // 离 nearPt 最近的桌面图标位置（没有桌面图标时退回 GridOrigin()）
     POINT AutoGridAnchor(POINT nearPt) const;
+
+    // 图标网格的**第一格左上角**（屏幕坐标）。
+    //
+    // 资源管理器的桌面网格不是从屏幕 (0,0) 起算的，它自己有一圈左上留白
+    // （随 DPI 变）。以前 FirstFreeCell 直接从 origin_ 扫，于是「保存文件到桌面」
+    // 这种由我们找空位摆的情况会把图标放到贴边的地方，和已有图标差半格。
+    // 这里从「左上角最靠前的那个真实图标」沿网格往左上倒退，退到不能再退，
+    // 就得到资源管理器网格的第一格；桌面上一个图标都没有时才退回一个小留白。
+    POINT GridOrigin() const;
 
     // 把「想要的左上角」吸附到网格格子（不做占位判断）
     POINT SnapCell(POINT want) const;

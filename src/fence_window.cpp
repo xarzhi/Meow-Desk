@@ -515,6 +515,13 @@ inline BYTE ArgbR(ARGB c) { return (BYTE)((c >> 16) & 0xFF); }
 inline BYTE ArgbG(ARGB c) { return (BYTE)((c >> 8) & 0xFF); }
 inline BYTE ArgbB(ARGB c) { return (BYTE)(c & 0xFF); }
 
+// ---- 行左端勾选框几何（唯一来源）----
+// 绘制（PaintTodoBody）和命中（TodoCheckRect）都从这里拿，别再各写一套：
+// 「点文字就勾掉」和「点勾选框才勾掉」的边界就差这几个像素，算错一次就点不准。
+const int kTodoBoxX = 10;        // 勾选框左边到行左边界
+const int kTodoBoxSz = 17;       // 勾选框边长（图形）
+const int kTodoCheckHit = 25;    // 点击区边长：17px 的方框太难点，放宽到 25
+
 // ---- 行右端按钮几何（唯一来源）----
 const int kTodoActRight = 8;    // × 距行右边界
 const int kTodoDelSz = 18;      // × 命中盒（图形 16px，命中放宽一点）
@@ -525,6 +532,14 @@ const int kTodoActGap = 4;      // 两个按钮之间的间隙
 const int kTodoActSpan = kTodoActRight + kTodoDelSz + kTodoActGap + kTodoDetSz + 6;
 
 int TodoDelCx(int rowRight) { return rowRight - kTodoActRight - kTodoDelSz / 2; }
+
+// 勾选框的点击区（客户端坐标）。以视觉方框中心为心、边长 kTodoCheckHit 的正方形。
+RECT TodoCheckRectOf(int rowLeft, int cy) {
+    const int bx = rowLeft + kTodoBoxX;
+    const int cx = bx + kTodoBoxSz / 2;
+    const int half = kTodoCheckHit / 2;
+    return RECT{cx - half, cy - half, cx + half, cy + half};
+}
 
 RECT TodoDetRectOf(int rowRight, int cy) {
     const int right = TodoDelCx(rowRight) - kTodoDelSz / 2 - kTodoActGap;
@@ -604,8 +619,8 @@ void PaintTodoBody(Graphics& g, const TodoPaintArgs& a) {
 
     const int rowPx = 13;   // 正文 13px：和资源管理器列表的字号一致
 
-    const int boxSize = 17;
-    const int boxX = a.rowLeft + 10;
+    const int boxSize = kTodoBoxSz;
+    const int boxX = a.rowLeft + kTodoBoxX;
     const int textX = boxX + boxSize + 10;
     // 右边留出「详情」图标 + 「×」删除两个按钮（宽度见 kTodoActSpan，
     // 和命中判定共用同一份，别在这里另算一套）。行太窄时只留 ×。
@@ -837,8 +852,24 @@ void FenceWindow::ClickTodoRow(int row) {
     StartTodoToggle(row);
 }
 
+// 第 row 行左端那个勾选框的点击区。**只有**落在这里面才切换完成状态
+// （用户要求：点文字不要顺手就把待办勾掉）。几何来自 TodoCheckRectOf，
+// 和 PaintTodoBody 画的方框共用同一套常量。
+RECT FenceWindow::TodoCheckRect(int row) const {
+    if (!isTodo() || row < 0) return RECT{0, 0, 0, 0};
+    const RECT r = TodoRowRect(row);
+    if (r.bottom <= r.top) return RECT{0, 0, 0, 0};
+    return TodoCheckRectOf(r.left, (r.top + r.bottom) / 2);
+}
+
+bool FenceWindow::TodoCheckHit(int row, POINT pt) const {
+    const RECT b = TodoCheckRect(row);
+    if (b.right <= b.left) return false;
+    return pt.x >= b.left && pt.x < b.right && pt.y >= b.top && pt.y < b.bottom;
+}
+
 // 第 row 行右边那颗「×」：圆心由 TodoDelCx 算（和绘制共用同一份几何）。
-// 中心和 PaintTodoBody 里画的那个椭圆**必须**一致 —— 两处各写一份的话
+// 中心和 PaintTodoBody 里画的那个椭圆**必须**一致 —— 两处各写一份的话，
 // 鼠标明明点在 × 上却判成「打勾」。
 RECT FenceWindow::TodoDeleteRect(int row) const {
     if (!isTodo() || row < 0) return RECT{0, 0, 0, 0};
@@ -2792,7 +2823,9 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             pressBody_ = false;
             // 连点行右端的「详情 / ×」不算「双击改文字」：这两个按钮在第一次松手时
             // 就已经各自生效了（打开详情 / 删除），再叠一层改名会莫名其妙。
-            if (row >= 0 && !TodoDeleteHit(row, pt) && !TodoDetailHit(row, pt))
+            // 勾选框同理 —— 双击它是在勾选/取消，不该顺手把名字编辑框弹出来。
+            if (row >= 0 && !TodoDeleteHit(row, pt) && !TodoDetailHit(row, pt) &&
+                !TodoCheckHit(row, pt))
                 EditTodoAt(row);
             return 0;
         }
@@ -2856,11 +2889,13 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     return TRUE;
                 }
             }
-            // 待办行右端那两个按钮（详情 / ×）也给手型：
-            // 它们和「点整行勾掉」只差几像素，没有手型很容易误点。
+            // 待办行上「真正可点」的三处给手型：勾选框 / 详情 / ×。
+            // 文字那一段不值得给 —— 点它没有任何动作（双击才是改名），
+            // 给了手型反而让人以为「点一下就能完成」。
             if (isTodo() && !collapsed_ && pt.y >= HeadH()) {
                 const int trow = HitTodoRow(pt);
-                if (trow >= 0 && (TodoDeleteHit(trow, pt) || TodoDetailHit(trow, pt))) {
+                if (trow >= 0 && (TodoCheckHit(trow, pt) || TodoDeleteHit(trow, pt) ||
+                                  TodoDetailHit(trow, pt))) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
                 }
@@ -3307,7 +3342,11 @@ LRESULT FenceWindow::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 ShowTodoDetail(todoRow);
                 return 0;
             }
-            ClickTodoRow(todoRow);
+            // 只有点在左端那个勾选框里才切换完成状态（用户要求）。
+            // 点文字不勾：想改内容就双击那一行进就地改名，想完成就点框。
+            if (TodoCheckHit(todoRow, upPt)) {
+                ClickTodoRow(todoRow);
+            }
             return 0;
         }
         if (item >= 0) {
