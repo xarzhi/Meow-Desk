@@ -145,6 +145,16 @@ public:
     // 一列排满再换右边一列，而不是各自「就近抢一个」格子撒得满屏都是。
     POINT FirstFreeCell(const std::vector<DesktopIconView*>& exclude) const;
 
+    // 右键「新建 / 粘贴」之后，把这次**新出现**的图标摆到右键点的那个格子。
+    //
+    // 不这么做的话，新文件总是跑到左上角第一个空位：新建是由真实桌面视图执行的，
+    // 它按自己的「插入点」决定位置，而我们盖在它上面，真实视图收不到这次点击，
+    // 插入点还停在上一次的地方。只能等它建完再把位置写回去（SetDesktopIconPositions）。
+    //
+    // before = 弹菜单之前的路径快照。菜单是模态的，返回时文件已落盘、
+    // onContextInvoked() 也重载过，所以直接比差集就知道新建了哪几个。
+    void PlaceFreshItemsAt(POINT screenPt, const std::vector<std::wstring>& before);
+
     // 桌面内拖放的落位：目标格空就直接用；被别的图标占了就和它交换
     // （资源管理器也是这个行为）。否则桌面排满时环形搜索会把图标甩到很远，
     // 观感就是「松手后图标跑掉了」。被挪走的图标通过 swapped 返回，调用方要写回位置。

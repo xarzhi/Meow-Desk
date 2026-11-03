@@ -4,6 +4,9 @@
 #include "file_drop.h"
 #include "shell_icons.h"
 #include "storage.h"
+// SetDesktopIconPositions：新建/粘贴后的图标要把位置写回真实桌面，
+// 否则下一次重载就被 Explorer 的旧坐标冲回左上角。
+#include "desktop_icons.h"
 
 #include <objidl.h>
 #include <ole2.h>
@@ -583,6 +586,42 @@ POINT DesktopSurface::FirstFreeCell(const std::vector<DesktopIconView*>& exclude
 
 POINT DesktopSurface::SnapToFreeCell(POINT want, const std::vector<DesktopIconView*>& exclude) const {
     return SnapToFreeCellAt(want, AutoGridAnchor(want), exclude);
+}
+
+void DesktopSurface::PlaceFreshItemsAt(POINT screenPt, const std::vector<std::wstring>& before) {
+    if (!icons_) return;
+
+    // 差集：重载之后才出现、弹菜单之前没有的项。
+    // 路径比对就够了 —— 新建/粘贴出来的一定是文件系统里的新路径。
+    std::vector<DesktopIconView*> pending;
+    for (auto* o : *icons_) {
+        if (!o || !o->OnDesktop() || o->path.empty() || !o->pidl) continue;
+        if (std::find(before.begin(), before.end(), o->path) == before.end())
+            pending.push_back(o);
+    }
+    if (pending.empty()) return;
+
+    const int ch = cellH_ > 0 ? cellH_ : 98;
+    // 从「右键点落下的那一格」开始摆；一次建出好几个（粘贴）就依次往下排。
+    POINT want = screenPt;
+    while (!pending.empty()) {
+        DesktopIconView* o = pending.front();
+        // exclude 传还没摆的那几个（含它自己）：免得它自己的**旧**位置把目标格判成占用。
+        // 已经摆好的不在 exclude 里，于是它们的新位置会正常挡住后面的。
+        const POINT cell = SnapToFreeCell(want, pending);
+        void* pidl = o->pidl;
+        const bool ok = SetDesktopIconPositions(1, &pidl, &cell);
+        if (TraceOn())
+            LogSurface("new item place %ls -> %ld,%ld %s", o->name.c_str(), cell.x, cell.y,
+                       ok ? "ok" : "FAIL");
+        // 写回失败也先把这一帧的内存位置改掉 —— 至少这次看到的是对的，
+        // 下次重载会被 Explorer 的旧坐标盖回去，但总比当场跳回左上角好。
+        o->pos = cell;
+        o->dragPos = cell;
+        pending.erase(pending.begin());
+        want = POINT{cell.x, cell.y + ch};
+    }
+    Redraw();
 }
 
 POINT DesktopSurface::SnapToFreeCellAt(POINT want, POINT anchor,
@@ -1177,6 +1216,10 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         POINT sp{origin_.x + pt.x, origin_.y + pt.y};
         if (TraceOn()) LogSurface("rbuttonup client=%ld,%ld screen=%ld,%ld", pt.x, pt.y, sp.x, sp.y);
         DesktopIconView* hit = HitTest(pt);
+        // 背景菜单要记「弹之前桌面上有什么」：关掉之后靠它认出新建/粘贴了哪几个，
+        // 再把它们摆到点击位置（见 PlaceFreshItemsAt）。
+        std::vector<std::wstring> before;
+        bool bgMenu = false;
         if (hit) {
             // 图标上：打开文件的右键菜单（打开方式 / 属性 / 删除 …）
             if (!hit->selected) SelectOnly(hit);
@@ -1195,10 +1238,18 @@ LRESULT DesktopSurface::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             ClearSelection();
             Redraw();
+            if (icons_) {
+                for (auto* o : *icons_)
+                    if (o && o->OnDesktop() && !o->path.empty()) before.push_back(o->path);
+            }
             ShowBackgroundMenu(h, sp);
+            bgMenu = true;
         }
         // 菜单里可能改了名字/删了东西，回来重新枚举一次
         if (onContextInvoked) onContextInvoked();
+        // 新建 / 粘贴出来的项摆到右键点的那个格子。
+        // **必须在重载之后**：新项要先进 icons_ 才有 pidl 可以写回去。
+        if (bgMenu) PlaceFreshItemsAt(sp, before);
         return 0;
     }
 
